@@ -1,0 +1,15 @@
+# Controller pod that runs the demo script against the StatefulSet workers
+apiVersion: v1
+kind: Pod
+metadata:
+  name: monarch-client-demo
+  namespace: monarch-tests
+  labels:
+    app: monarch-client
+spec:
+  containers:
+  - name: monarch
+    image: ghcr.io/meta-pytorch/monarch:2026-01-11-alpha
+    imagePullPolicy: IfNotPresent
+    command: ["sleep"]
+    args: ["infinity"]
