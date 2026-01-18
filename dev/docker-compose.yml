@@ -1,0 +1,87 @@
+# docker-compose.yml - CPU-only development environment (base configuration)
+#
+# This is the base compose file for CPU-only development. It does NOT require
+# NVIDIA GPUs and can run on any Linux machine.
+#
+# Usage:
+#   cd dev
+#   docker compose up -d                    # Build and start
+#   docker compose exec monarch-dev bash    # Enter container
+#   docker compose down                     # Stop
+#   docker compose build --no-cache         # Rebuild from scratch
+#
+# For CUDA/GPU support, use with the cuda overlay:
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d
+
+services:
+  monarch-dev:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile.dev
+      target: cpu-final
+      args:
+        UBUNTU_VERSION: "22.04"
+        RUST_TOOLCHAIN: "nightly-2025-09-14"
+        PYTHON_VERSION: "3.10"
+    image: monarch-dev:cpu
+    container_name: monarch-dev
+
+    # Mount source code for live development
+    volumes:
+      # Main source code (read-write)
+      - ..:/workspace:cached
+
+      # Persist cargo cache for faster rebuilds
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+
+      # Persist target directory for incremental builds
+      - cargo-target:/workspace/target
+
+      # Persist conda packages
+      - conda-pkgs:/opt/conda/pkgs
+
+    # Keep container running for interactive use
+    tty: true
+    stdin_open: true
+
+    # Working directory
+    working_dir: /workspace
+
+    # CPU-only environment
+    environment:
+      - USE_TENSOR_ENGINE=0
+      - RUSTFLAGS=--cfg tracing_unstable
+      - RUST_BACKTRACE=1
+      - CARGO_INCREMENTAL=1
+
+    # Network for potential multi-container setups
+    networks:
+      - monarch-net
+
+    # Shared memory size (important for PyTorch DataLoader)
+    shm_size: '8gb'
+
+    # Ulimits for better performance
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+# Named volumes for persistence
+volumes:
+  cargo-registry:
+    name: monarch-cargo-registry
+  cargo-git:
+    name: monarch-cargo-git
+  cargo-target:
+    name: monarch-cargo-target
+  conda-pkgs:
+    name: monarch-conda-pkgs
+
+networks:
+  monarch-net:
+    name: monarch-network

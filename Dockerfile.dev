@@ -1,0 +1,301 @@
+# Dockerfile.dev - Interactive development environment for Monarch
+#
+# This container provides a complete environment for:
+# - Building all Rust crates (with CUDA support)
+# - Running Rust tests with cargo nextest
+# - Running Python tests with pytest
+# - Interactive development with mounted source code
+#
+# Usage:
+#   # Build the image
+#   docker build -f Dockerfile.dev -t monarch-dev .
+#
+#   # Run interactively with source mounted
+#   docker run -it --gpus all -v $(pwd):/workspace monarch-dev
+#
+#   # Or use docker-compose
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml exec dev bash
+
+# =============================================================================
+# Base image with CUDA support
+# =============================================================================
+ARG CUDA_VERSION=12.6.0
+ARG UBUNTU_VERSION=22.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+SHELL ["/bin/bash", "-c"]
+
+# =============================================================================
+# System dependencies
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    clang \
+    cmake \
+    ninja-build \
+    pkg-config \
+    # Development tools
+    git \
+    curl \
+    wget \
+    vim \
+    htop \
+    tmux \
+    jq \
+    # Python build dependencies
+    python3.10 \
+    python3.10-dev \
+    python3.10-venv \
+    python3-pip \
+    # Libraries required for Monarch
+    libunwind-dev \
+    liblzma-dev \
+    libssl-dev \
+    libffi-dev \
+    # Protobuf (required for tracing-perfetto-sdk-schema crate)
+    protobuf-compiler \
+    libprotobuf-dev \
+    # RDMA libraries (required for tensor_engine)
+    libibverbs-dev \
+    librdmacm-dev \
+    rdma-core \
+    # rsync (required for code sync tests)
+    rsync \
+    # Useful utilities
+    less \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# =============================================================================
+# Install uv (fast Python package manager)
+# =============================================================================
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# =============================================================================
+# Install Rust nightly toolchain
+# =============================================================================
+ARG RUST_TOOLCHAIN=nightly-2025-09-14
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN}
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install cargo-nextest for running tests
+RUN cargo install cargo-nextest --locked
+
+# Verify Rust installation
+RUN rustc --version && cargo --version
+
+# =============================================================================
+# Download and setup libtorch (PyTorch C++ API)
+# =============================================================================
+ARG LIBTORCH_CUDA_VERSION=126
+WORKDIR /opt
+RUN wget -q "https://download.pytorch.org/libtorch/nightly/cu${LIBTORCH_CUDA_VERSION}/libtorch-cxx11-abi-shared-with-deps-latest.zip" \
+    && unzip -q libtorch-cxx11-abi-shared-with-deps-latest.zip \
+    && rm libtorch-cxx11-abi-shared-with-deps-latest.zip
+
+ENV LIBTORCH_ROOT="/opt/libtorch"
+ENV CMAKE_PREFIX_PATH="${LIBTORCH_ROOT}:${CMAKE_PREFIX_PATH}"
+
+# =============================================================================
+# Environment variables for building Monarch
+# =============================================================================
+# CUDA
+ENV CUDA_HOME="/usr/local/cuda"
+ENV CUDA_LIB_DIR="${CUDA_HOME}/lib64"
+
+# Library paths
+ENV LD_LIBRARY_PATH="${LIBTORCH_ROOT}/lib:${CUDA_LIB_DIR}:${LD_LIBRARY_PATH}"
+ENV LIBRARY_PATH="${CUDA_LIB_DIR}:/lib64:/usr/lib64:${LIBRARY_PATH}"
+
+# Rust build flags
+ENV RUSTFLAGS="--cfg tracing_unstable -L native=${CUDA_LIB_DIR}"
+
+# Python/PyO3
+ENV PYO3_PYTHON="/usr/bin/python3"
+
+# C++ ABI (matches libtorch build)
+ENV CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=1"
+ENV _GLIBCXX_USE_CXX11_ABI="1"
+
+# Monarch tensor engine
+ENV USE_TENSOR_ENGINE="1"
+ENV MONARCH_BUILD_MESH_ONLY="0"
+
+# Enable backtraces for debugging
+ENV RUST_BACKTRACE="1"
+
+# =============================================================================
+# Set up workspace
+# =============================================================================
+WORKDIR /workspace
+
+# Copy dependency files first for better layer caching
+COPY pyproject.toml setup.py rust-toolchain Cargo.toml Cargo.lock* ./
+COPY build-requirements.txt ./
+COPY python/tests/requirements.txt ./python/tests/
+
+# =============================================================================
+# Install Python dependencies
+# =============================================================================
+# Create virtual environment with uv
+RUN uv venv /opt/venv --python python3.10
+ENV VIRTUAL_ENV="/opt/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Install PyTorch with CUDA support
+RUN uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+
+# Install build requirements
+RUN uv pip install -r build-requirements.txt
+
+# Install test requirements
+RUN uv pip install -r python/tests/requirements.txt pytest-split
+
+# Install additional development tools
+RUN uv pip install \
+    ipython \
+    ipdb \
+    black \
+    flake8 \
+    mypy \
+    pyright
+
+# Update PYO3_PYTHON to use venv python
+ENV PYO3_PYTHON="${VIRTUAL_ENV}/bin/python"
+
+# Point to torch libs for linking
+RUN TORCH_PATH=$(python -c "import torch; print(torch.__path__[0])") && \
+    echo "LIBTORCH_LIB=${TORCH_PATH}/lib" >> /etc/environment && \
+    echo "LIBTORCH_INCLUDE=${TORCH_PATH}/include:${TORCH_PATH}/include/torch/csrc/api/include" >> /etc/environment
+
+# =============================================================================
+# Development conveniences
+# =============================================================================
+# Shell customization
+RUN echo 'PS1="\[\033[1;32m\][monarch-dev]\[\033[0m\] \w \$ "' >> /root/.bashrc && \
+    echo 'alias ll="ls -la"' >> /root/.bashrc && \
+    echo 'alias build="python setup.py develop"' >> /root/.bashrc && \
+    echo 'alias test-rust="cargo nextest run"' >> /root/.bashrc && \
+    echo 'alias test-python="pytest python/tests/ -v -m \"not oss_skip\""' >> /root/.bashrc && \
+    echo 'alias fmt="cargo fmt && flake8 python/"' >> /root/.bashrc
+
+# Create helpful scripts directory
+RUN mkdir -p /usr/local/bin/monarch-scripts
+
+# Quick build script
+RUN cat > /usr/local/bin/monarch-scripts/quick-build.sh << 'EOF'
+#!/bin/bash
+set -e
+echo "=== Building Monarch (development mode) ==="
+cd /workspace
+
+# Export environment from torch
+TORCH_PATH=$(python -c "import torch; print(torch.__path__[0])")
+export LIBTORCH_LIB="${TORCH_PATH}/lib"
+export LIBTORCH_INCLUDE="${TORCH_PATH}/include:${TORCH_PATH}/include/torch/csrc/api/include"
+export LD_LIBRARY_PATH="${LIBTORCH_LIB}:${LD_LIBRARY_PATH}"
+
+python setup.py develop
+echo "=== Build complete ==="
+EOF
+RUN chmod +x /usr/local/bin/monarch-scripts/quick-build.sh && \
+    ln -s /usr/local/bin/monarch-scripts/quick-build.sh /usr/local/bin/monarch-build
+
+# Full test script
+RUN cat > /usr/local/bin/monarch-scripts/run-tests.sh << 'EOF'
+#!/bin/bash
+set -e
+cd /workspace
+
+echo "=== Running Tests ==="
+echo ""
+
+# Parse arguments
+RUN_RUST=false
+RUN_PYTHON=false
+TEST_PATTERN=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --rust) RUN_RUST=true; shift ;;
+        --python) RUN_PYTHON=true; shift ;;
+        --all) RUN_RUST=true; RUN_PYTHON=true; shift ;;
+        *) TEST_PATTERN="$1"; shift ;;
+    esac
+done
+
+# Default to both if none specified
+if ! $RUN_RUST && ! $RUN_PYTHON; then
+    RUN_RUST=true
+    RUN_PYTHON=true
+fi
+
+if $RUN_RUST; then
+    echo "=== Running Rust tests ==="
+    if [ -n "$TEST_PATTERN" ]; then
+        cargo nextest run "$TEST_PATTERN"
+    else
+        cargo nextest run --workspace
+    fi
+    echo ""
+fi
+
+if $RUN_PYTHON; then
+    echo "=== Running Python tests ==="
+    if [ -n "$TEST_PATTERN" ]; then
+        pytest python/tests/ -v -m "not oss_skip" -k "$TEST_PATTERN"
+    else
+        pytest python/tests/ -v -m "not oss_skip"
+    fi
+fi
+
+echo ""
+echo "=== All tests complete ==="
+EOF
+RUN chmod +x /usr/local/bin/monarch-scripts/run-tests.sh && \
+    ln -s /usr/local/bin/monarch-scripts/run-tests.sh /usr/local/bin/monarch-test
+
+# Environment info script
+RUN cat > /usr/local/bin/monarch-scripts/env-info.sh << 'EOF'
+#!/bin/bash
+echo "=== Monarch Development Environment ==="
+echo ""
+echo "Python: $(python --version)"
+echo "Rust:   $(rustc --version)"
+echo "Cargo:  $(cargo --version)"
+echo "CUDA:   $(nvcc --version 2>/dev/null | grep release || echo 'Not available')"
+echo ""
+echo "PyTorch: $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'Not installed')"
+echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'N/A')"
+echo ""
+echo "Environment Variables:"
+echo "  CUDA_HOME:         ${CUDA_HOME:-not set}"
+echo "  LIBTORCH_ROOT:     ${LIBTORCH_ROOT:-not set}"
+echo "  USE_TENSOR_ENGINE: ${USE_TENSOR_ENGINE:-not set}"
+echo ""
+echo "Quick Commands:"
+echo "  monarch-build  - Build Monarch in development mode"
+echo "  monarch-test   - Run all tests (--rust, --python, --all, or test pattern)"
+echo "  cargo fmt      - Format Rust code"
+echo "  flake8 python/ - Lint Python code"
+EOF
+RUN chmod +x /usr/local/bin/monarch-scripts/env-info.sh && \
+    ln -s /usr/local/bin/monarch-scripts/env-info.sh /usr/local/bin/monarch-info
+
+# Show environment info on shell start
+RUN echo '/usr/local/bin/monarch-info' >> /root/.bashrc
+
+# =============================================================================
+# Default command
+# =============================================================================
+CMD ["/bin/bash"]

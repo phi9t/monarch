@@ -1,0 +1,55 @@
+# docker-compose.cuda.yml - CUDA overlay for GPU development
+#
+# This overlay adds NVIDIA GPU support to the base configuration.
+# Use together with docker-compose.yml:
+#
+# Usage:
+#   cd dev
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml exec monarch-dev bash
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml down
+#
+# Requirements:
+#   - NVIDIA GPU with CUDA support
+#   - nvidia-docker2 or nvidia-container-toolkit installed
+#   - Docker >= 19.03 with --gpus support
+
+services:
+  monarch-dev:
+    build:
+      target: cuda-final
+      args:
+        CUDA_VERSION: "12.6.0"
+        LIBTORCH_CUDA_VERSION: "126"
+    image: monarch-dev:cuda
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # CUDA environment overrides
+    environment:
+      - USE_TENSOR_ENGINE=1
+      - LIBTORCH_ROOT=/opt/libtorch
+      - CUDA_HOME=/usr/local/cuda
+      - RUSTFLAGS=--cfg tracing_unstable -L native=/usr/local/cuda/lib64
+      - RUST_BACKTRACE=1
+      - CARGO_INCREMENTAL=1
+      # Enable CUDA memory debugging (optional, uncomment if needed)
+      # - CUDA_LAUNCH_BLOCKING=1
+
+    # Larger shared memory for GPU operations
+    shm_size: '16gb'
+
+    # Additional volume for libtorch cache (optional)
+    volumes:
+      - libtorch-cache:/opt/libtorch-cache
+
+volumes:
+  libtorch-cache:
+    name: monarch-libtorch-cache

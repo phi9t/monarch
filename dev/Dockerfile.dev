@@ -1,0 +1,305 @@
+# Dockerfile.dev - Multi-stage development environment for Monarch
+#
+# This Dockerfile provides both CPU-only and CUDA development environments.
+# It supports building all 35 Rust crates, running examples, and Python tests.
+#
+# Targets:
+#   cpu-final  - CPU-only development (no CUDA/tensor_engine)
+#   cuda-final - Full CUDA development with tensor_engine support
+#
+# Usage with docker-compose (recommended):
+#   cd dev
+#   docker compose up -d                                    # CPU-only
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d  # CUDA
+
+# =============================================================================
+# ARG declarations (before any FROM for global scope)
+# =============================================================================
+ARG CUDA_VERSION=12.6.0
+ARG UBUNTU_VERSION=22.04
+ARG RUST_TOOLCHAIN=nightly-2025-09-14
+ARG LIBTORCH_CUDA_VERSION=126
+ARG PYTHON_VERSION=3.10
+
+# =============================================================================
+# Stage 1: Base System (common for both CPU and CUDA)
+# =============================================================================
+FROM ubuntu:${UBUNTU_VERSION} AS base-system
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+SHELL ["/bin/bash", "-c"]
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    clang \
+    libclang-dev \
+    cmake \
+    ninja-build \
+    pkg-config \
+    # Development tools
+    git \
+    curl \
+    wget \
+    vim \
+    htop \
+    tmux \
+    jq \
+    less \
+    # Python build dependencies
+    python3.10 \
+    python3.10-dev \
+    python3.10-venv \
+    python3-pip \
+    # Libraries required for Monarch
+    libunwind-dev \
+    liblzma-dev \
+    libssl-dev \
+    libffi-dev \
+    # Protobuf (required for tracing-perfetto-sdk-schema crate)
+    protobuf-compiler \
+    libprotobuf-dev \
+    # RDMA libraries (required for tensor_engine, but included in base for completeness)
+    libibverbs-dev \
+    librdmacm-dev \
+    rdma-core \
+    # rsync (required for code sync tests)
+    rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# =============================================================================
+# Stage 2: Rust Toolchain
+# =============================================================================
+FROM base-system AS rust-toolchain
+
+ARG RUST_TOOLCHAIN
+
+# Install Rust nightly toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN}
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install additional components
+RUN rustup component add rust-analyzer clippy rustfmt
+
+# Install cargo-nextest for test runner
+RUN cargo install cargo-nextest --locked
+
+# Verify Rust installation
+RUN rustc --version && cargo --version && cargo nextest --version
+
+# =============================================================================
+# Stage 3: Python/Conda Environment
+# =============================================================================
+FROM rust-toolchain AS python-base
+
+ARG PYTHON_VERSION
+
+# Install Miniconda
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+
+ENV PATH="/opt/conda/bin:${PATH}"
+
+# Create monarch environment
+RUN conda create -n monarch python=${PYTHON_VERSION} -y && \
+    conda run -n monarch pip install --upgrade pip
+
+# Install fmt library for C++ headers (required for PyTorch C++ API)
+RUN conda install -n monarch -y -c conda-forge fmt
+
+# Install build dependencies
+RUN conda run -n monarch pip install \
+    setuptools \
+    setuptools-rust \
+    wheel \
+    numpy
+
+# Install test dependencies
+RUN conda run -n monarch pip install \
+    pytest \
+    pytest-timeout \
+    pytest-asyncio \
+    pytest-xdist \
+    pytest-split \
+    pyright
+
+# Install development tools
+RUN conda run -n monarch pip install \
+    ipython \
+    ipdb \
+    black \
+    flake8 \
+    mypy
+
+# =============================================================================
+# Stage 4a: CUDA Target
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS cuda-base
+
+# Re-declare ARGs needed in this stage
+ARG RUST_TOOLCHAIN
+ARG LIBTORCH_CUDA_VERSION
+ARG PYTHON_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+SHELL ["/bin/bash", "-c"]
+
+# Copy system packages configuration and install
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    clang \
+    libclang-dev \
+    cmake \
+    ninja-build \
+    pkg-config \
+    git \
+    curl \
+    wget \
+    vim \
+    htop \
+    tmux \
+    jq \
+    less \
+    python3.10 \
+    python3.10-dev \
+    python3.10-venv \
+    python3-pip \
+    libunwind-dev \
+    liblzma-dev \
+    libssl-dev \
+    libffi-dev \
+    protobuf-compiler \
+    libprotobuf-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    rdma-core \
+    rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN}
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup component add rust-analyzer clippy rustfmt
+RUN cargo install cargo-nextest --locked
+
+# Install Miniconda
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+ENV PATH="/opt/conda/bin:${PATH}"
+
+# Create monarch environment with PyTorch CUDA
+RUN conda create -n monarch python=${PYTHON_VERSION} -y
+RUN conda install -n monarch -y -c conda-forge fmt
+RUN conda run -n monarch pip install --upgrade pip
+RUN conda run -n monarch pip install \
+    setuptools setuptools-rust wheel numpy \
+    pytest pytest-timeout pytest-asyncio pytest-xdist pytest-split pyright \
+    ipython ipdb black flake8 mypy
+
+# Install PyTorch with CUDA support
+RUN conda run -n monarch pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+
+# Download libtorch C++ headers
+WORKDIR /opt
+RUN wget -q "https://download.pytorch.org/libtorch/nightly/cu${LIBTORCH_CUDA_VERSION}/libtorch-cxx11-abi-shared-with-deps-latest.zip" && \
+    unzip -q libtorch-cxx11-abi-shared-with-deps-latest.zip && \
+    rm libtorch-cxx11-abi-shared-with-deps-latest.zip
+
+# CUDA environment variables
+ENV CUDA_HOME="/usr/local/cuda"
+ENV CUDA_LIB_DIR="${CUDA_HOME}/lib64"
+ENV LIBTORCH_ROOT="/opt/libtorch"
+ENV CMAKE_PREFIX_PATH="${LIBTORCH_ROOT}:${CMAKE_PREFIX_PATH}"
+ENV LD_LIBRARY_PATH="${LIBTORCH_ROOT}/lib:${CUDA_LIB_DIR}:/opt/conda/envs/monarch/lib:${LD_LIBRARY_PATH}"
+ENV LIBRARY_PATH="${CUDA_LIB_DIR}:/lib64:/usr/lib64:${LIBRARY_PATH}"
+
+# =============================================================================
+# Stage 4b: CPU Target (continues from python-base)
+# =============================================================================
+FROM python-base AS cpu-base
+
+# Install PyTorch CPU-only
+RUN conda run -n monarch pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+
+# CPU-specific environment
+ENV USE_TENSOR_ENGINE="0"
+
+# =============================================================================
+# Stage 5a: CUDA Final
+# =============================================================================
+FROM cuda-base AS cuda-final
+
+# Set environment variables for CUDA build
+ENV USE_TENSOR_ENGINE="1"
+ENV MONARCH_BUILD_MESH_ONLY="0"
+ENV RUSTFLAGS="--cfg tracing_unstable -L native=${CUDA_LIB_DIR}"
+ENV PYO3_PYTHON="/opt/conda/envs/monarch/bin/python"
+ENV CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=1"
+ENV _GLIBCXX_USE_CXX11_ABI="1"
+ENV RUST_BACKTRACE="1"
+
+# Set libtorch environment for Rust crates
+RUN TORCH_PATH=$(/opt/conda/envs/monarch/bin/python -c "import torch; print(torch.__path__[0])") && \
+    echo "export LIBTORCH_LIB=${TORCH_PATH}/lib" >> /etc/profile.d/monarch.sh && \
+    echo "export LIBTORCH_INCLUDE=${TORCH_PATH}/include:${TORCH_PATH}/include/torch/csrc/api/include" >> /etc/profile.d/monarch.sh && \
+    echo "export LD_LIBRARY_PATH=${TORCH_PATH}/lib:\${LD_LIBRARY_PATH}" >> /etc/profile.d/monarch.sh
+
+WORKDIR /workspace
+
+# Copy entrypoint
+COPY scripts/dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
+RUN chmod +x /usr/local/bin/dev-entrypoint.sh
+
+# Shell customization
+RUN echo 'PS1="\[\033[1;32m\][monarch-cuda]\[\033[0m\] \w \$ "' >> /root/.bashrc && \
+    echo 'source /opt/conda/etc/profile.d/conda.sh' >> /root/.bashrc && \
+    echo 'conda activate monarch' >> /root/.bashrc && \
+    echo 'source /etc/profile.d/monarch.sh 2>/dev/null || true' >> /root/.bashrc
+
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint.sh"]
+CMD ["/bin/bash"]
+
+# =============================================================================
+# Stage 5b: CPU Final
+# =============================================================================
+FROM cpu-base AS cpu-final
+
+# Set environment variables for CPU-only build
+ENV USE_TENSOR_ENGINE="0"
+ENV MONARCH_BUILD_MESH_ONLY="1"
+ENV RUSTFLAGS="--cfg tracing_unstable"
+ENV PYO3_PYTHON="/opt/conda/envs/monarch/bin/python"
+ENV CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=1"
+ENV _GLIBCXX_USE_CXX11_ABI="1"
+ENV RUST_BACKTRACE="1"
+ENV LD_LIBRARY_PATH="/opt/conda/envs/monarch/lib:${LD_LIBRARY_PATH}"
+
+WORKDIR /workspace
+
+# Copy entrypoint
+COPY scripts/dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
+RUN chmod +x /usr/local/bin/dev-entrypoint.sh
+
+# Shell customization
+RUN echo 'PS1="\[\033[1;34m\][monarch-cpu]\[\033[0m\] \w \$ "' >> /root/.bashrc && \
+    echo 'source /opt/conda/etc/profile.d/conda.sh' >> /root/.bashrc && \
+    echo 'conda activate monarch' >> /root/.bashrc
+
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint.sh"]
+CMD ["/bin/bash"]

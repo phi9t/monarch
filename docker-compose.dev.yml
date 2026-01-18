@@ -1,0 +1,100 @@
+# docker-compose.dev.yml - Development environment orchestration
+#
+# Usage:
+#   # Build and start the development container
+#   docker compose -f docker-compose.dev.yml up -d --build
+#
+#   # Enter the container
+#   docker compose -f docker-compose.dev.yml exec dev bash
+#
+#   # View logs
+#   docker compose -f docker-compose.dev.yml logs -f
+#
+#   # Stop the container
+#   docker compose -f docker-compose.dev.yml down
+#
+#   # Rebuild from scratch
+#   docker compose -f docker-compose.dev.yml build --no-cache
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        CUDA_VERSION: "12.6.0"
+        UBUNTU_VERSION: "22.04"
+        RUST_TOOLCHAIN: "nightly-2025-09-14"
+        LIBTORCH_CUDA_VERSION: "126"
+    image: monarch-dev:latest
+    container_name: monarch-dev
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount source code for live development
+    volumes:
+      # Main source code (read-write for development)
+      - .:/workspace:cached
+
+      # Persist cargo cache for faster rebuilds
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+
+      # Persist target directory for incremental builds
+      # Comment out if you want fresh builds each time
+      - cargo-target:/workspace/target
+
+      # Persist uv cache
+      - uv-cache:/root/.cache/uv
+
+    # Keep container running for interactive use
+    tty: true
+    stdin_open: true
+
+    # Working directory
+    working_dir: /workspace
+
+    # Environment overrides (optional)
+    environment:
+      - RUST_BACKTRACE=1
+      - CARGO_INCREMENTAL=1
+      # Uncomment to enable message logging
+      # - ENABLE_MESSAGE_LOGGING=1
+
+    # Network for potential multi-container setups
+    networks:
+      - monarch-net
+
+    # Shared memory size (important for PyTorch DataLoader)
+    shm_size: '16gb'
+
+    # Ulimits for better performance
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+# Named volumes for persistence
+volumes:
+  cargo-registry:
+    name: monarch-cargo-registry
+  cargo-git:
+    name: monarch-cargo-git
+  cargo-target:
+    name: monarch-cargo-target
+  uv-cache:
+    name: monarch-uv-cache
+
+networks:
+  monarch-net:
+    name: monarch-network
