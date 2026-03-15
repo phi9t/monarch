@@ -8,6 +8,9 @@
 - `examples/` and `docs/`: runnable demos and documentation sources.
 
 ## Build, Test, and Development Commands
+Only container build and launch actions are allowed to be done on the host.
+All other activitivies must be done within a container.
+
 - `uv sync`: dev setup with tensor engine (CUDA/RDMA required).
 - `USE_TENSOR_ENGINE=0 uv sync`: CPU-only setup (actors only).
 - `uv run python -c "from monarch import actor; print('ok')"`: sanity check install.
@@ -33,6 +36,24 @@
 - Complete the Meta CLA before contribution acceptance.
 
 ## Configuration & Tooling Notes
-- Rust nightly is pinned in `rust-toolchain`; Python 3.10+ is expected.
+- Rust nightly `nightly-2025-12-05` is pinned in `rust-toolchain`; Python 3.10+ is expected.
 - Default PyTorch index is `pytorch-cu128`; override via `[tool.uv.sources]` in `pyproject.toml` or `uv sync --extra-index-url ...`.
 - Set `USE_TENSOR_ENGINE=0` to avoid CUDA/RDMA dependencies during development.
+
+## Build Environment Gotchas (read before running cargo)
+
+**All builds must run inside the container** — host is for container launch only.
+
+**Spack toolchain conflict**: Spack's `cargo` 1.92.0 stable is earlier in `$PATH` than rustup's nightly. Always use `uv run cargo ...`. If `uv` is locked by another process, invoke nightly directly:
+```sh
+PROTOC=/mnt/data_infra/workspace/monarch/target/protoc/bin/protoc \
+  RUSTC=~/.rustup/toolchains/nightly-2025-12-05-x86_64-unknown-linux-gnu/bin/rustc \
+  ~/.rustup/toolchains/nightly-2025-12-05-x86_64-unknown-linux-gnu/bin/cargo <cmd>
+```
+
+**protoc**: Required by `tracing-perfetto-sdk-schema`. Pre-built at `target/protoc/bin/protoc` after first `uv sync`. Set `PROTOC` env var before any direct cargo invocation.
+
+**Verification before closing a task**:
+- Rust change: `uv run cargo clippy` + `uv run cargo nextest run`
+- Python change: `uv run flake8 python/` + `uv run pytest python/tests/ -v -m "not oss_skip"`
+- New binary: `uv run cargo build --bin <name>` + `uv run cargo run --bin <name>`

@@ -120,9 +120,24 @@ trainers.train.call(step=0).get()
 
 ## Required Toolchain
 
-- **Rust**: Nightly (2025-09-14) - specified in `rust-toolchain`
+- **Rust**: `nightly-2025-12-05` - pinned in `rust-toolchain`
 - **Python**: ≥3.10
 - **System deps** (full build): clang, libunwind, CUDA toolkit, RDMA libraries (libibverbs, rdma-core)
+
+### Build Environment Gotchas
+
+**Spack toolchain conflict**: Spack installs a `cargo`/`rustc` 1.92.0 stable that shadows the nightly in `$PATH`. Always use `uv run cargo ...` or invoke nightly directly:
+```sh
+PROTOC=/mnt/data_infra/workspace/monarch/target/protoc/bin/protoc \
+  RUSTC=~/.rustup/toolchains/nightly-2025-12-05-x86_64-unknown-linux-gnu/bin/rustc \
+  ~/.rustup/toolchains/nightly-2025-12-05-x86_64-unknown-linux-gnu/bin/cargo <cmd>
+```
+
+**protoc**: `tracing-perfetto-sdk-schema` requires protobuf compiler. It is pre-built at `target/protoc/bin/protoc` after the first `uv sync`. Set `PROTOC` before any cargo invocation outside of `uv run`.
+
+**`uv` lock contention**: If another `uv run` process is active, `uv run cargo` will block. Fall back to the direct nightly invocation above.
+
+**`Proc` mutability**: `Proc` must be declared `let mut proc` if `destroy_and_wait` is called.
 
 ## Test Markers
 
@@ -143,3 +158,20 @@ pip install -r requirements.txt
 make html
 # Output: docs/build/html/
 ```
+
+## Verification
+
+Done-conditions per task type:
+
+| Task | Done when |
+|------|-----------|
+| Rust change | `uv run cargo clippy` clean + `uv run cargo nextest run` passes |
+| Python change | `uv run flake8 python/` clean + `uv run pytest python/tests/ -v -m "not oss_skip"` passes |
+| New `[[bin]]` example | `uv run cargo build --bin <name>` succeeds + `uv run cargo run --bin <name>` exits 0 |
+| Formatting | `cargo fmt --check` and `flake8 python/` both clean |
+
+Never declare a task done without running the relevant verification command.
+
+## Compact Instructions
+
+Use `/compact` after: >15 turns on a single task, switching task domains, or when context pressure is evident. Before compacting, confirm current work is at a stable checkpoint (no half-edited files).

@@ -26,6 +26,18 @@ name = "hyperactor_example_stream"
 path = "example/stream.rs"
 
 [[bin]]
+name = "hyperactor_example_supervision"
+path = "example/supervision.rs"
+
+[[bin]]
+name = "hyperactor_example_actor_local"
+path = "example/actor_local.rs"
+
+[[bin]]
+name = "hyperactor_example_accumulator"
+path = "example/accumulator.rs"
+
+[[bin]]
 name = "hyperactor_host_test_bootstrap"
 path = "test/host_bootstrap.rs"
 
