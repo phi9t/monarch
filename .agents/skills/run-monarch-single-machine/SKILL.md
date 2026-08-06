@@ -1,0 +1,129 @@
+---
+name: run-monarch-single-machine
+description: Run Monarch on a single machine inside the hermetic bubblewrap (bwrap) rootfs, and build or maintain that rootfs. Use when the task is to build Monarch's Rust extension, run actors / proc meshes / control-plane tests, or execute any Monarch Python on one host, especially on Nix-provisioned or otherwise mismatched hosts where native cc/clang targets a different loader/glibc than the system. Also use when asked to build, rebuild, refresh, or debug the Monarch `scripts/rootfs/` bwrap sandbox.
+---
+
+# Run Monarch on a single machine (bwrap rootfs)
+
+Monarch's Rust extension must build against a toolchain whose `cc`/`clang`
+targets the same dynamic loader and glibc as the system loader `rustc` runs
+under. On Nix-provisioned or otherwise mismatched hosts, that invariant is
+violated and the build can fail during proc-macro loading or produce `.so`
+files with unresolved `__isoc23_*` symbols.
+
+For this skill, always run single-machine Monarch work through the bwrap rootfs:
+use `scripts/run_local_control_plane.sh --rootfs` for the control-plane suites
+and `scripts/rootfs/enter_rootfs.sh -- <command>` for ad hoc Python, cargo, or
+diagnostic commands. Do not fall back to the host toolchain unless the user
+explicitly asks to bypass the sandbox.
+
+## Repository
+
+This skill is written for the Monarch checkout at:
+
+```sh
+/data02/home/philip.yang/workspace/monarch
+```
+
+Run commands from that repo root unless the user gives a different checkout.
+
+## Host prerequisites
+
+The host outside the sandbox needs:
+
+- `bwrap` (bubblewrap) and `docker` on `PATH`.
+- The local NVIDIA driver userspace (`libcuda.so*`, `libnvidia-*.so*`,
+  `nvidia-smi`) and `/dev/nvidia*` device nodes for GPU work.
+
+Check quickly:
+
+```sh
+command -v bwrap docker
+nvidia-smi -L
+```
+
+## Run the control-plane suites
+
+The single entrypoint re-execs itself into the sandbox, builds `-e .`, and runs
+both the Python crash-recovery and Rust nextest control-plane suites:
+
+```sh
+scripts/run_local_control_plane.sh --rootfs
+```
+
+The rootfs is built automatically on first use if missing, so this is a single
+command from a clean checkout. Useful variants:
+
+```sh
+scripts/run_local_control_plane.sh --rootfs --rust-only
+scripts/run_local_control_plane.sh --rootfs --python-only
+scripts/run_local_control_plane.sh --rootfs --keep-going
+```
+
+Results:
+
+- Python JUnit: `control-plane-results/control-plane-python.xml`
+- Rust JUnit: `target/nextest/ci/junit.xml`
+
+## Run ad hoc Monarch commands
+
+`enter_rootfs.sh` enters the sandbox with the repo mounted at
+`/workspace/monarch`, local GPUs bound in, and the host NVIDIA driver userspace
+read-only bound into the rootfs. It auto-builds the rootfs if missing.
+
+```sh
+scripts/rootfs/enter_rootfs.sh
+scripts/rootfs/enter_rootfs.sh -- nvidia-smi -L
+scripts/rootfs/enter_rootfs.sh -- python -c 'import torch; print(torch.cuda.is_available())'
+```
+
+To build the extension and run custom single-machine Python, reuse the
+in-sandbox venv at `.venv-rootfs`:
+
+```sh
+scripts/rootfs/enter_rootfs.sh -- bash -lc '
+  cd /workspace/monarch
+  [ -x .venv-rootfs/bin/python ] || uv venv --python 3.12 --system-site-packages .venv-rootfs
+  source .venv-rootfs/bin/activate
+  uv pip install setuptools setuptools-rust wheel "numpy>=1.26"
+  uv pip install --no-build-isolation -e ".[test]"
+  python your_single_machine_script.py
+'
+```
+
+Everything should run on `this_host()` / local in-process meshes. Do not assume
+CI variables or remote execution. `CUDA_VISIBLE_DEVICES` is honored from the
+caller; an empty value hides all GPUs and the control-plane preflight should
+abort.
+
+## Build and maintain the rootfs
+
+Building is normally automatic, but explicit maintenance uses:
+
+```sh
+scripts/rootfs/build_rootfs.sh
+scripts/rootfs/build_rootfs.sh --rebuild
+```
+
+The rootfs directory (`scripts/rootfs/rootfs/`), intermediate rootfs stage dirs,
+export tarballs, and `.venv-rootfs` should stay gitignored. For image contents,
+CUDA `nvcc` assembly, version bumps, and troubleshooting, read
+[references/rootfs.md](references/rootfs.md).
+
+## Interpret results
+
+The Rust suite should be fully green. Under the full crash-recovery Python run,
+a small number of control-plane tests can fail from cross-test state in the
+unprivileged user namespace (transport-init leaks, orphan-proc timing, and the
+code-sync rsync daemon). Before treating such a failure as a rootfs regression,
+re-run the specific test in isolation inside the same rootfs:
+
+```sh
+scripts/rootfs/enter_rootfs.sh -- bash -lc '
+  cd /workspace/monarch && source .venv-rootfs/bin/activate
+  python -m pytest "python/tests/<file>::<test>" -q -m "control_plane and not oss_skip"
+'
+```
+
+If it passes alone, treat the full-run failure as pre-existing suite-ordering
+fragility rather than a bwrap rootfs regression.

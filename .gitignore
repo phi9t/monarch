@@ -47,3 +47,11 @@ disabled_tests.txt
 
 # whittle
 .whittle.json
+
+# Hermetic control-plane rootfs (scripts/rootfs/)
+scripts/rootfs/rootfs/
+scripts/rootfs/rootfs/**
+scripts/rootfs/.rootfs.stage.*
+scripts/rootfs/*.tar
+.venv-rootfs/
+.venv-rootfs/**
