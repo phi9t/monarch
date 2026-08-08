@@ -149,6 +149,48 @@ GPU, and aborts in preflight rather than skipping if any is missing. Flags:
 `--python-only`, `--rust-only`, `--gpus N`, `--keep-going`. Results land in
 `control-plane-results/`.
 
+For all-local-GPU tensor-engine capacity, use
+`scripts/run_local_8gpu_capacity.sh`. It reuses the same bwrap rootfs, builds
+the tensor-engine editable install in `.venv-rootfs`, requires exactly eight
+visible CUDA devices, runs an 8-rank distributed tensor smoke that fetches one
+rank shard per GPU, and then runs the local control-plane suites with all eight
+GPUs exposed.
+
+The 8-GPU verifier's acceptance ladder is explicit:
+
+- **Environment:** enter the rootfs, set default `CUDA_VISIBLE_DEVICES` to
+  `0,1,2,3,4,5,6,7` when unset or empty, reject explicit lists that do not have
+  exactly eight non-empty entries, require `CUDA_HOME`, `uv`, and `.venv-rootfs`.
+- **Build:** install Monarch editable with test dependencies and the tensor
+  engine enabled.
+- **Unit-level smoke:** require `has_tensor_engine()`, require
+  `torch.cuda.device_count() == 8`, spawn
+  `this_host().spawn_procs(per_host={"gpus": 8})`, fetch shards `gpus=0..7`, and require ranks
+  `[0, 1, 2, 3, 4, 5, 6, 7]`.
+- **Integration:** run the local control-plane Python crash-recovery suite and
+  Rust nextest coordination crates over the eight visible GPUs.
+- **Failure classification:** Rust nextest must be green. Python full-run
+  failures are acceptable only when every failed/error pytest node ID from
+  `control-plane-results/control-plane-python.xml` passes when rerun in
+  isolation inside the same rootfs. Otherwise, the verifier fails.
+
+The verifier exits zero only when the ladder's acceptance criteria pass, even
+when an intermediate Python full-suite command exits nonzero and is later
+classified as Suite-Ordering Fragility. Its Contract Artifacts are
+`control-plane-results/control-plane-python.xml`,
+`control-plane-results/control-plane-python-isolation.txt` when classification
+runs, and `target/nextest/ci/junit.xml`. Build caches, virtualenv contents, and
+logs are incidental artifacts.
+
+Local Run ownership is split deliberately: scripts own executable behavior,
+`AGENTS.md` owns repo-level policy, and repo-local skills under `.agents/skills/`
+own agent procedure. Future Capacity Verifiers should follow the same Local Run
+Ladder and emit machine-readable Contract Artifacts for any suite result that
+affects acceptance. Failure Classification is opt-in per verifier; the verifier
+must document the fragile suite, failed-node extraction, and identical isolation
+environment. The Hermetic Rootfs may be auto-built and reused rather than
+rebuilt on every run.
+
 **Hermetic rootfs (bubblewrap).** On hosts whose default `cc`/`clang` targets a
 different loader/glibc than the system loader (notably Nix-provisioned ones),
 the native build breaks proc-macro loading and yields `.so`s with unresolved

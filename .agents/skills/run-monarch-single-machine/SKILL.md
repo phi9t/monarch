@@ -65,6 +65,53 @@ Results:
 - Python JUnit: `control-plane-results/control-plane-python.xml`
 - Rust JUnit: `target/nextest/ci/junit.xml`
 
+## Verify all 8 local GPUs
+
+For capacity checks that must prove the tensor engine runs across all eight
+local GPUs, prefer the committed verifier:
+
+```sh
+scripts/run_local_8gpu_capacity.sh
+```
+
+It always re-enters through `scripts/rootfs/enter_rootfs.sh`, creates or reuses
+`.venv-rootfs`, installs Monarch editable with test dependencies, requires
+`torch.cuda.device_count() == 8`, and runs an 8-rank tensor smoke before running
+the control-plane suites with all eight GPUs exposed. If the caller sets
+`CUDA_VISIBLE_DEVICES`, it must name exactly eight devices and the verifier will
+preserve that explicit device list.
+
+Read the verifier output as a validation ladder:
+
+1. `environment`: rootfs entry, CUDA visibility, `CUDA_HOME`, `uv`, and
+   `.venv-rootfs`.
+2. `build`: editable tensor-engine install.
+3. `unit-level smoke`: `has_tensor_engine()`, exactly eight CUDA devices,
+   `this_host().spawn_procs(per_host={"gpus": 8})`, and fetched shard ranks
+   `[0, 1, 2, 3, 4, 5, 6, 7]`.
+4. `integration`: Python crash-recovery control-plane tests and Rust nextest
+   coordination crates over all eight GPUs.
+5. `failure classification`: Rust must be green. Python full-run failures are
+   treated as suite-ordering fragility only if every failed/error node ID from
+   `control-plane-results/control-plane-python.xml` passes in isolation inside
+   the same rootfs.
+
+The verifier's final exit code follows the ladder's acceptance criteria, not
+the raw status of each intermediate command. A nonzero Python full-suite exit
+can still yield a successful verifier result only after failure classification
+accepts every failed node. Contract Artifacts are
+`control-plane-results/control-plane-python.xml`,
+`control-plane-results/control-plane-python-isolation.txt` when classification
+runs, and `target/nextest/ci/junit.xml`; treat build caches and logs as
+incidental.
+
+For future Capacity Verifiers, keep behavior in scripts, repo policy in
+`AGENTS.md`, and agent procedure in this skill. Reuse the Local Run Ladder unless
+the verifier documents a narrower one. Failure Classification is not automatic:
+the verifier must explicitly name the fragile suite, parse failed nodes from a
+machine-readable artifact, and rerun them in an identical isolation environment.
+The Hermetic Rootfs may be auto-built and reused.
+
 ## Run ad hoc Monarch commands
 
 `enter_rootfs.sh` enters the sandbox with the repo mounted at
