@@ -1,6 +1,6 @@
 # Hermetic bwrap Execution Contract
 
-**Status:** Ready for implementation review
+**Status:** Approved
 
 **Date:** 2026-08-12
 
