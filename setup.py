@@ -376,12 +376,14 @@ class BuildRustWithProvenance(_build_rust):
 
         # Collect the native outputs of the current feature set: the Rust
         # bindings plus any configured C/C++ extensions that land in this
-        # package.
+        # package. build_rust has no get_ext_filename, so borrow the resolved
+        # build_ext command, which does.
+        build_ext_cmd = self.get_finalized_command("build_ext")
         outputs = set()
         for so in package_dir.glob("_rust_bindings*.so"):
             outputs.add(so.resolve())
         for ext in getattr(self.distribution, "ext_modules", None) or []:
-            ext_filename = self.get_ext_filename(ext.name)
+            ext_filename = build_ext_cmd.get_ext_filename(ext.name)
             so_path = Path(src_root, "python", ext_filename).resolve()
             if so_path.parent == package_dir.resolve() and so_path.exists():
                 outputs.add(so_path)
