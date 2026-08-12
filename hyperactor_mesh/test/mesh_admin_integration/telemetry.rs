@@ -130,18 +130,11 @@ pub async fn run_pyspy_dump_and_query() {
     let encoded = urlencoding::encode(&proc_ref);
     let pyspy_path = format!("/v1/pyspy_dump/{encoded}");
 
-    let mut dump_id = String::new();
-    let resp = fixture
-        .post(&pyspy_path, &serde_json::json!(null))
+    let result: PyspyDumpAndStoreResponse = fixture
+        .post_json(&pyspy_path, &serde_json::json!(null))
         .await
-        .expect("transport should succeed");
-    if resp.status().is_success() {
-        let body = resp.text().await.unwrap();
-        let result: PyspyDumpAndStoreResponse =
-            serde_json::from_str(&body).expect("should deserialize as PyspyDumpAndStoreResponse");
-        dump_id = result.dump_id;
-    }
-    assert!(!dump_id.is_empty(), "dump_id should be set");
+        .expect("py-spy dump should succeed and be stored");
+    let dump_id = result.dump_id;
 
     // 3. Verify the dump exists in the pyspy_dumps table via SQL.
     let resp: QueryResponse = fixture
@@ -149,7 +142,7 @@ pub async fn run_pyspy_dump_and_query() {
             "/v1/query",
             &QueryRequest {
                 sql: format!(
-                    "SELECT dump_id, proc_ref FROM pyspy_dumps WHERE dump_id = '{dump_id}'"
+                    "SELECT dump_id, proc_ref, warnings_json FROM pyspy_dumps WHERE dump_id = '{dump_id}'"
                 ),
             },
         )
@@ -165,6 +158,11 @@ pub async fn run_pyspy_dump_and_query() {
         proc_ref,
         "proc_ref should match the queried proc"
     );
+    let warnings_json = rows[0]["warnings_json"]
+        .as_str()
+        .expect("warnings_json should be a string");
+    let _: Vec<String> =
+        serde_json::from_str(warnings_json).expect("warnings_json should be a JSON string array");
 
     fixture.shutdown().await;
 }

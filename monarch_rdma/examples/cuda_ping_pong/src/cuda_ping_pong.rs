@@ -60,6 +60,7 @@ use async_trait::async_trait;
 use clap::Arg;
 use clap::Command as ClapCommand;
 use hyperactor::Actor;
+use hyperactor::ActorEnvironment;
 use hyperactor::ActorRef;
 use hyperactor::Context;
 use hyperactor::Endpoint as _;
@@ -71,7 +72,6 @@ use hyperactor::channel::ChannelAddr;
 use hyperactor::context::Mailbox;
 use hyperactor::id::Label;
 use hyperactor::supervision::ActorSupervisionEvent;
-use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::Bootstrap;
 use hyperactor_mesh::HostBootstrapReady;
@@ -86,6 +86,8 @@ use monarch_rdma::RdmaManagerMessageClient;
 use monarch_rdma::RdmaRemoteBuffer;
 use monarch_rdma::backend::ibverbs::device_selection::IbvDeviceTarget;
 use monarch_rdma::backend::ibverbs::manager_actor::RawQueuePair;
+use monarch_rdma::backend::ibverbs::memory_region::IbvRemoteMemoryRegionView;
+use monarch_rdma::backend::ibverbs::mlx_device::MlxDevice;
 use monarch_rdma::backend::ibverbs::primitives::IbvQpInfo;
 use monarch_rdma::backend::ibverbs::queue_pair::legacy::IbvQueuePair;
 use monarch_rdma::cu_check;
@@ -145,6 +147,15 @@ pub fn ping_pong(
     let result = unsafe { launchPingPong(params, iterations, initial_length, device_id) };
 
     if result == 0 { Ok(()) } else { Err(result) }
+}
+
+/// The NIC serving a buffer's first registration.
+fn first_device(buffers: &[IbvRemoteMemoryRegionView]) -> Result<String, anyhow::Error> {
+    Ok(buffers
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("buffer carries no ibverbs registration"))?
+        .device_name
+        .clone())
 }
 
 // HACK — `NoKeepalive` keeps nothing alive. The CUDA allocation
@@ -296,6 +307,9 @@ pub struct CudaRdmaActor {
     cu_ptr: usize,
     // RDMA buffer handle for the CUDA memory
     rdma_buffer_handle: Option<RdmaRemoteBuffer>,
+    // The registered CUDA memory. Held because the ping-pong addresses it
+    // through its local registration, which is the only place its `lkey` lives.
+    local_memory: Option<KeepaliveLocalMemory>,
     // Reference to the RDMA manager actor
     rdma_manager: ActorRef<RdmaManagerActor>,
     // Legacy queue pair for the GPU doorbell ping-pong, created via
@@ -323,7 +337,10 @@ impl Actor for CudaRdmaActor {
 impl RemoteSpawn for CudaRdmaActor {
     type Params = (ActorRef<RdmaManagerActor>, usize, usize);
 
-    async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(
+        params: Self::Params,
+        _environment: &ActorEnvironment,
+    ) -> Result<Self, anyhow::Error> {
         let (rdma_manager, device_id, buffer_size) = params;
         let cpu_buffer = vec![0u8; buffer_size].into_boxed_slice();
 
@@ -417,6 +434,7 @@ impl RemoteSpawn for CudaRdmaActor {
                 cpu_buffer,
                 cu_ptr: dptr as usize,
                 rdma_buffer_handle: None,
+                local_memory: None,
                 rdma_manager,
                 raw_qp: None,
             })
@@ -482,13 +500,14 @@ impl Handler<InitializeBuffer> for CudaRdmaActor {
             let addr = self.cu_ptr;
             let size = self.cpu_buffer.len();
             // See the module-level note on `NoKeepalive`.
-            let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive { addr, size }));
+            let local_memory = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive { addr, size }))?;
             let handle = self
                 .rdma_manager
                 .downcast_handle(cx)
                 .ok_or_else(|| anyhow::anyhow!("failed to get handle"))?;
-            let buffer_handle = handle.request_buffer(cx, local_memory).await?;
+            let buffer_handle = handle.request_buffer(cx, local_memory.clone()).await?;
             self.rdma_buffer_handle = Some(buffer_handle);
+            self.local_memory = Some(local_memory);
         }
 
         reply.post(cx, true);
@@ -553,7 +572,7 @@ impl Handler<CreateRawQp> for CudaRdmaActor {
         manager_handle.try_post(
             cx,
             RawQueuePair {
-                self_device: local_ctx.buffer.device_name.clone(),
+                self_device: first_device(&local_ctx.buffers)?,
                 reply: reply_handle,
             },
         )?;
@@ -614,14 +633,27 @@ impl Handler<PerformPingPong> for CudaRdmaActor {
         }
 
         // Resolve the local/remote buffer transport details for the ping-pong.
-        let local_ibv = local_buffer
-            .resolve_mlx()
-            .ok_or_else(|| anyhow::anyhow!("Mellanox backend not found for local buffer"))?
-            .buffer;
+        // The local side goes through the registration itself: the wire view a
+        // peer would get carries no `lkey`.
+        let local_device = first_device(
+            &local_buffer
+                .resolve_mlx()
+                .ok_or_else(|| anyhow::anyhow!("Mellanox backend not found for local buffer"))?
+                .buffers,
+        )?;
+        let local_ibv = self
+            .local_memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local buffer not registered"))?
+            .registered_mr::<MlxDevice>(&local_device)?
+            .ok_or_else(|| anyhow::anyhow!("local buffer has no registration on {local_device}"))?;
         let remote_ibv = remote_buffer
             .resolve_mlx()
             .ok_or_else(|| anyhow::anyhow!("Mellanox backend not found for remote buffer"))?
-            .buffer;
+            .buffers
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("remote buffer carries no registration"))?;
 
         // The queue pair was created by `CreateRawQp` and connected by
         // `ConnectRawQp` before this message; drive the doorbell on it.
@@ -640,7 +672,7 @@ impl Handler<PerformPingPong> for CudaRdmaActor {
             let dv_recv_cq = qp.dv_recv_cq as *mut rdmaxcel_sys::mlx5dv_cq;
             let mut params = rdma_params_t {
                 cu_ptr: self.cu_ptr,
-                laddr: local_ibv.addr,
+                laddr: local_ibv.rdma_addr,
                 lsize: local_ibv.size,
                 lkey: local_ibv.lkey,
                 raddr: remote_ibv.addr,

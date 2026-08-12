@@ -28,7 +28,8 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 
-use super::device_selection::get_cuda_device_to_ibv_device;
+use super::cq_pool::cq_entries_for;
+use super::device_selection::get_cuda_device_to_ibv_devices;
 use super::domain::IbvDomain;
 use super::domain::IbvDomainImpl;
 use super::domain::register_dmabuf_range;
@@ -40,6 +41,7 @@ use super::primitives::GidScope;
 use super::primitives::GidType;
 use super::primitives::IbvConfig;
 use super::primitives::IbvContext;
+use super::primitives::IbvCq;
 use super::primitives::IbvDeviceInfo;
 use super::primitives::IbvMr;
 use super::primitives::IbvPd;
@@ -47,8 +49,8 @@ use super::primitives::IbvQp;
 use super::queue_pair::connect;
 use super::queue_pair::get_qp_info;
 use crate::backend::ibverbs::mlx_device::MlxDevice;
+use crate::device_selection::MemoryLocation;
 use crate::local_memory::KeepaliveLocalMemory;
-use crate::local_memory::is_device_ptr;
 
 /// A single MR must be 2 MiB aligned and covers at most 4 GiB (one page
 /// under). Larger segments are split across multiple MRs bound to one key.
@@ -120,7 +122,7 @@ pub(super) trait MlxDomainOps: Send + Sync + 'static {
 
     /// CUDA ordinals whose optimal NIC is this domain's device; only segments
     /// on these ordinals are bound here.
-    fn assigned_cuda_devices(&self) -> Vec<i32>;
+    fn assigned_cuda_devices(&self) -> anyhow::Result<Vec<i32>>;
 
     /// Enumerate the currently-live CUDA segments.
     fn scan_segments(&self) -> Vec<ScannedSegment>;
@@ -212,16 +214,16 @@ impl MlxDomainOps for ProdMlxDomainOps {
         self.mlx5dv_enabled
     }
 
-    fn assigned_cuda_devices(&self) -> Vec<i32> {
-        get_cuda_device_to_ibv_device::<MlxDevice>()
-            .iter()
+    fn assigned_cuda_devices(&self) -> anyhow::Result<Vec<i32>> {
+        Ok(get_cuda_device_to_ibv_devices::<MlxDevice>()?
+            .into_iter()
             .enumerate()
-            .filter_map(|(ordinal, nic)| {
-                nic.as_ref()
-                    .filter(|n| n.name() == &self.device_name)
-                    .map(|_| ordinal as i32)
+            .filter_map(|(ordinal, nics)| {
+                nics.iter()
+                    .any(|nic| nic.name() == &self.device_name)
+                    .then_some(ordinal as i32)
             })
-            .collect()
+            .collect())
     }
 
     fn scan_segments(&self) -> Vec<ScannedSegment> {
@@ -244,10 +246,20 @@ impl MlxDomainOps for ProdMlxDomainOps {
         domain: &IbvDomain<MlxDomain>,
         config: &IbvConfig,
     ) -> anyhow::Result<IbvQp> {
-        // The `IbvQp` owns its completion queues and PD, so an early return or
-        // panic in the connect below still tears everything down in order.
-        // SAFETY: an `IbvDomain` holds a null-or-live context and PD.
-        let qp = unsafe { MlxQueuePair::create_ibv_qp(domain, config) }
+        // This QP is private to mkey binding and its completions are polled
+        // here, not by a `QueuePairActor`, so it gets its own completion queue
+        // rather than drawing on the device's pool -- sized to hold everything
+        // its one owner can have outstanding. One queue serves both sides, since
+        // it posts no receives.
+        let cq_entries = cq_entries_for(1, config.max_send_wr, domain.device_info().max_cqe())?;
+        // SAFETY: an `IbvDomain` holds a null-or-live context; `IbvCq::create`
+        // rejects a null context.
+        let cq = Arc::new(unsafe { IbvCq::create(domain.context().clone(), cq_entries) }?);
+        // The `IbvQp` holds a clone of the CQ and of the PD, so an early return
+        // or panic in the connect below still tears everything down in order.
+        // SAFETY: an `IbvDomain` holds a null-or-live context and PD, and the CQ
+        // was just created on that context.
+        let qp = unsafe { MlxQueuePair::create_ibv_qp(domain, config, Arc::clone(&cq), cq) }
             .context("could not create loopback QP for mkey binding")?;
         let context = qp.context().as_ptr();
         let access_flags = domain.access_flags();
@@ -414,6 +426,10 @@ struct RegisteredSegmentState {
     mkey: Option<Mlx5dvMkey>,
     /// Bytes currently covered by `mkey`.
     size: usize,
+    /// Bytes the most recent scan reported for this segment. Equal to `size`
+    /// while the key spans the whole segment, and larger once growth is refused
+    /// because the segment needs more MRs than one key can bind.
+    scanned_size: usize,
 }
 
 /// A CUDA segment bound to the device via an indirect mlx5dv key, covering
@@ -460,33 +476,73 @@ impl RegisteredSegment {
                 stale_mkeys: Vec::new(),
                 mkey: None,
                 size: 0,
+                scanned_size: 0,
             }),
         }
     }
 
     /// Bytes currently covered by the segment's MRs and bound to its key.
+    #[cfg(test)]
     fn size(&self) -> usize {
         self.state.lock().expect("segment state lock poisoned").size
     }
 
-    /// True when `[addr, addr + size)` lies entirely within this segment.
+    /// True when `[addr, addr + size)` lies entirely within the extent bound to
+    /// this segment's key.
     fn covers(&self, addr: usize, size: usize) -> bool {
-        let end = self.base_virtual_addr + self.size();
+        let state = self.state.lock().expect("segment state lock poisoned");
+        if state.mkey.is_none() {
+            return false;
+        }
+        let end = self.base_virtual_addr + state.size;
         addr >= self.base_virtual_addr && addr <= end && size <= end - addr
     }
 
-    /// Grow the segment to `scanned_seg.size` (must exceed its current size):
-    /// register the new tail — the whole range on the first call from
-    /// [`Self::empty`] — bind the existing + new MRs to a fresh key, and retire
-    /// the prior key to `stale_mkeys` (rather than rebinding the in-use key,
-    /// which could race in-flight ops); the initial null key is not retired. On
-    /// any failure the freshly-registered tail MRs are deregistered and the
-    /// segment is left unchanged.
+    /// Bytes the most recent scan reported for this segment.
+    fn scanned_size(&self) -> usize {
+        self.state
+            .lock()
+            .expect("segment state lock poisoned")
+            .scanned_size
+    }
+
+    /// True when both conditions are true:
+    /// 1. The scanned size of the segment is larger than the registered
+    ///    size, which occurs only when the mkey for this segment cannot
+    ///    grow anymore.
+    /// 2. [addr, addr + size) overlaps the unregistered part of the scanned
+    ///    segment.
+    fn in_unregistered_tail(&self, addr: usize, size: usize) -> bool {
+        let state = self.state.lock().expect("segment state lock poisoned");
+        let registered_end = self.base_virtual_addr + state.size;
+        let scanned_end = self.base_virtual_addr + state.scanned_size;
+        addr >= self.base_virtual_addr
+            && addr <= scanned_end
+            && size <= scanned_end - addr
+            && addr + size > registered_end
+    }
+
+    /// Grow the segment towards `scanned_seg.size` (must not be below its
+    /// current size): register the new tail — the whole range on the first call
+    /// from [`Self::empty`] — bind the existing + new MRs to a fresh key, and
+    /// retire the prior key to `stale_mkeys` (rather than rebinding the in-use
+    /// key, which could race in-flight ops); the initial null key is not
+    /// retired. On any failure, any freshly registered tail MRs will be cleaned
+    /// up. However, the segment's `scanned_size` remains at the updated value.
+    /// This is necessary to prevent future registrations from repeatedly triggering
+    /// an expensive rescan only to fail again inside this function.
+    ///
+    /// A key binds at most `mkey_max_entries` MRs. When the tail needs more than
+    /// the key has room for, as much of it as fits is registered and the rest is
+    /// left out, so the segment still covers its prefix; [`Self::covers`] then
+    /// reports what was bound and [`Self::in_unregistered_tail`] the remainder.
     ///
     /// # Safety
     ///
     /// If `pd` is non-null it must be a live protection domain and `qp` a valid
-    /// queue pair, both valid for this call.
+    /// queue pair, both valid for this call. Nothing else may poll `qp`'s send
+    /// completion queue meanwhile: binding posts a work request and polls that
+    /// queue until it completes.
     unsafe fn grow(
         &self,
         pd: &Arc<IbvPd>,
@@ -514,6 +570,36 @@ impl RegisteredSegment {
         if scanned_seg.size == state.size {
             return Ok(());
         }
+        state.scanned_size = scanned_seg.size;
+
+        // `register_range` splits the tail into `MAX_MR_SIZE` chunks, so how many
+        // MRs it needs is known before any of it is registered. Take only as many
+        // chunks as the key has room for.
+        let bound = state.mkey.as_ref().map_or(0, |k| k.mrs().len());
+        let room = self
+            .mkey_max_entries
+            .saturating_sub(bound)
+            .saturating_mul(MAX_MR_SIZE);
+        let grew = scanned_seg.size - state.size;
+        let tail = grew.min(room);
+
+        if tail < grew {
+            tracing::warn!(
+                "CUDA segment at 0x{:x} grew from {} bytes to {} bytes, \
+            but its mkey only has room for {tail} more bytes. This segment's tail \
+            will remain unregistered, and some tensors inside it may use the dmabuf \
+            fallback.",
+                self.base_virtual_addr,
+                state.size,
+                state.scanned_size
+            );
+        }
+
+        // The key is full: the segment keeps the prefix it already covers.
+        if tail == 0 {
+            return Ok(());
+        }
+
         // SAFETY: per this function's contract `pd` is null or a live PD and
         // `qp` a valid QP; the tail MRs registered here belong to this segment.
         let new_tail = unsafe {
@@ -522,7 +608,7 @@ impl RegisteredSegment {
                 pd,
                 access,
                 self.base_virtual_addr + state.size,
-                scanned_seg.size - state.size,
+                tail,
             )
         }?;
 
@@ -536,18 +622,12 @@ impl RegisteredSegment {
             .map(|k| k.mrs().clone())
             .unwrap_or_default();
         all.extend(new_tail);
-        // A single indirect key binds at most `mkey_max_entries` MRs; exceeding
-        // it would fault at transfer time. Fail here instead; the caller falls
-        // back to per-region dmabuf registration. The freshly-registered tail
-        // drops as `all` unwinds, leaving the segment unchanged.
-        if all.len() > self.mkey_max_entries {
-            anyhow::bail!(
-                "segment at 0x{:x} needs {} MRs, exceeding mkey max entries {}",
-                self.base_virtual_addr,
-                all.len(),
-                self.mkey_max_entries
-            );
-        }
+        debug_assert!(
+            all.len() <= self.mkey_max_entries,
+            "mkey max entries is {}, but got {} MRs",
+            self.mkey_max_entries,
+            all.len()
+        );
         // SAFETY: same contract; `all` are this segment's live MRs.
         let new_mkey = unsafe {
             self.ops
@@ -559,7 +639,7 @@ impl RegisteredSegment {
         if let Some(prior) = state.mkey.replace(new_mkey) {
             state.stale_mkeys.push(prior);
         }
-        state.size = scanned_seg.size;
+        state.size += tail;
         Ok(())
     }
 
@@ -648,9 +728,6 @@ pub struct MlxDomain {
     /// Config for the loopback binding QP.
     config: IbvConfig,
     mlx5dv_enabled: bool,
-    /// CUDA ordinals whose optimal NIC is this device. Only segments on
-    /// these ordinals are bound here.
-    cuda_ordinals: Vec<i32>,
     /// Caps the MRs bound to each segment's indirect key.
     mkey_max_entries: usize,
     /// Lazily-created loopback QP (an [`IbvQp`] owning its completion queues and
@@ -668,27 +745,23 @@ impl std::fmt::Debug for MlxDomain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MlxDomain")
             .field("mlx5dv_enabled", &self.mlx5dv_enabled)
-            .field("cuda_ordinals", &self.cuda_ordinals)
             .finish_non_exhaustive()
     }
 }
 
 impl MlxDomain {
-    /// Build a domain over the given ops, deriving mlx5dv support and the
-    /// served CUDA ordinals from them. `mkey_max_entries` caps the MRs bound to
-    /// every segment's indirect key.
+    /// Build a domain over the given ops, deriving mlx5dv support from them.
+    /// `mkey_max_entries` caps the MRs bound to every segment's indirect key.
     fn new_with_ops(
         ops: Arc<dyn MlxDomainOps>,
         config: IbvConfig,
         mkey_max_entries: usize,
     ) -> Self {
         let mlx5dv_enabled = ops.mlx5dv_enabled();
-        let cuda_ordinals = ops.assigned_cuda_devices();
         Self {
             ops,
             config,
             mlx5dv_enabled,
-            cuda_ordinals,
             mkey_max_entries,
             loopback: OnceLock::new(),
             segments: Mutex::new(HashMap::new()),
@@ -733,17 +806,26 @@ impl MlxDomain {
             .lock()
             .expect("mlx domain segments lock poisoned");
 
-        // Fast path: a current binding already covers the request.
-        if let Some(seg) = segments.values().find(|s| s.covers(addr, size)) {
-            return Ok(RegisteredSegment::view(seg, addr, size));
+        // Fast path: an existing scanned segment already fully covers the new
+        // range (`Ok` when the scanned segment's registered portion covers the
+        // range, `Err` when the range overlaps the segment's unregistered tail).
+        if let Some(result) = Self::lookup(&segments, addr, size) {
+            return result;
         }
+
+        // Which ordinals this NIC serves, resolved now rather than at domain
+        // construction: the caller holds a CUDA address, so CUDA is initialized
+        // and the ordinal → NIC map is resolvable. If this were instead called
+        // only once at construction, if CUDA were not already initialized,
+        // this domain would permanently have an empty list of ordinals.
+        let cuda_ordinals = self.ops.assigned_cuda_devices()?;
 
         // Pull live segments and keep only the ones on ordinals we serve.
         let scanned: Vec<ScannedSegment> = self
             .ops
             .scan_segments()
             .into_iter()
-            .filter(|s| self.cuda_ordinals.contains(&s.cuda_ordinal))
+            .filter(|s| cuda_ordinals.contains(&s.cuda_ordinal))
             .collect();
 
         let qp = self.loopback_qp_ptr(domain)?;
@@ -753,14 +835,20 @@ impl MlxDomain {
             let key = (scanned_seg.address, scanned_seg.cuda_ordinal);
             snapshot.insert(key);
             match segments.get(&key) {
-                // Already bound at this extent: nothing to do.
-                Some(seg) if seg.size() == scanned_seg.size => {}
+                // Already grown against this extent: nothing to do.
+                Some(seg) if seg.scanned_size() == scanned_seg.size => {}
                 // Grew: extend the existing segment in place (reuses its MRs,
                 // retires its prior key internally).
                 // SAFETY: `pd`/`qp` satisfy this function's contract (live PD or
-                // null; valid loopback QP) and are forwarded unchanged.
+                // null; valid loopback QP) and are forwarded unchanged. The
+                // segments lock held here serializes every use of the domain's
+                // one loopback QP, so nothing else polls its completion queue.
                 Some(seg) => unsafe { seg.grow(pd, qp, access, scanned_seg) }?,
-                // New: create an empty segment and grow it to the full range.
+                // New: create an empty segment and grow it towards the full
+                // range. It is kept even when the growth covers only part of
+                // that range, so the scanned extent is recorded and later
+                // requests past the covered prefix are answered without another
+                // scan.
                 None => {
                     let fresh = Arc::new(RegisteredSegment::empty(
                         self.ops.clone(),
@@ -780,18 +868,42 @@ impl MlxDomain {
         segments.retain(|key, _| snapshot.contains(key));
 
         // Serve the caller's view from a current segment that covers it.
-        segments
+        Self::lookup(&segments, addr, size).unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "CUDA address 0x{:x} + size {} is not covered by any scanned segment on the CUDA ordinals {:?} mapped to this NIC",
+                addr,
+                size,
+                cuda_ordinals,
+            ))
+        })
+    }
+
+    /// Look up how `[addr, addr + size)` relates to the already scanned
+    /// and registered segments. There are 3 possibilities:
+    /// 1. `[addr, addr + size)` does not fall within any scanned segment.
+    ///    Return `None`.
+    /// 2. `[addr, addr + size)` is fully covered by the registered portion
+    ///    of a scanned segment. Return `Some(Ok(IbvMemoryRegionView))`.
+    /// 3. `[addr, addr + size)` is fully covered by a scanned segment, but
+    ///    part of it extends into that scanned segment's unregistered tail.
+    ///    Return `Some(Err(anyhow::Error))`.
+    fn lookup(
+        segments: &HashMap<(usize, i32), Arc<RegisteredSegment>>,
+        addr: usize,
+        size: usize,
+    ) -> Option<anyhow::Result<IbvMemoryRegionView>> {
+        if let Some(seg) = segments.values().find(|s| s.covers(addr, size)) {
+            return Some(Ok(RegisteredSegment::view(seg, addr, size)));
+        }
+        let seg = segments
             .values()
-            .find(|s| s.covers(addr, size))
-            .map(|s| RegisteredSegment::view(s, addr, size))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "CUDA address 0x{:x} + size {} is not covered by any scanned segment on the CUDA ordinals {:?} mapped to this NIC",
-                    addr,
-                    size,
-                    self.cuda_ordinals,
-                )
-            })
+            .find(|s| s.in_unregistered_tail(addr, size))?;
+        Some(Err(anyhow::anyhow!(
+            "CUDA address 0x{:x} + size {} is in the unregistered tail of the segment at 0x{:x}, whose key has no more room",
+            addr,
+            size,
+            seg.base_virtual_addr,
+        )))
     }
 }
 
@@ -820,7 +932,7 @@ impl IbvDomainImpl for MlxDomain {
         mem: &KeepaliveLocalMemory,
     ) -> anyhow::Result<IbvMemoryRegionView> {
         let this = domain.domain_impl();
-        if this.mlx5dv_enabled && is_device_ptr(mem.addr()) {
+        if this.mlx5dv_enabled && matches!(mem.location(), MemoryLocation::Gpu(_)) {
             // SAFETY: `domain.as_ptr()` is null or a live PD, per this method's
             // contract.
             match unsafe { this.register_cuda_mlx5dv_mr(domain, mem.addr(), mem.size()) } {
@@ -935,8 +1047,8 @@ mod tests {
             self.lock().mlx5dv_enabled
         }
 
-        fn assigned_cuda_devices(&self) -> Vec<i32> {
-            self.lock().served_ordinals.clone()
+        fn assigned_cuda_devices(&self) -> anyhow::Result<Vec<i32>> {
+            Ok(self.lock().served_ordinals.clone())
         }
 
         fn scan_segments(&self) -> Vec<ScannedSegment> {
@@ -1001,7 +1113,12 @@ mod tests {
     /// (and, through it, its context) is null (no-op `Drop`). Drive the strategy
     /// via [`IbvDomain::domain_impl`].
     fn domain(mock: Arc<MockOps>) -> Arc<IbvDomain<MlxDomain>> {
-        let mlx = MlxDomain::new_with_ops(mock, IbvConfig::default(), TEST_MKEY_MAX_ENTRIES);
+        domain_with_cap(mock, TEST_MKEY_MAX_ENTRIES)
+    }
+
+    /// A [`domain`] whose segments cap their keys at `mkey_max_entries` MRs.
+    fn domain_with_cap(mock: Arc<MockOps>, mkey_max_entries: usize) -> Arc<IbvDomain<MlxDomain>> {
+        let mlx = MlxDomain::new_with_ops(mock, IbvConfig::default(), mkey_max_entries);
         // SAFETY: `IbvPd::null()` holds a null PD (and, through it, a null
         // context) whose `Drop`s are no-ops.
         unsafe {
@@ -1321,34 +1438,153 @@ mod tests {
     }
 
     #[test]
-    fn test_grow_exceeding_mkey_max_entries_errors() {
+    fn test_grow_past_mkey_max_entries_covers_the_prefix_that_fits() {
         let ops = MockOps::new(SERVED_NIC, true, &[0]);
         let base = 0x10_0000_0000;
-        // Cap at one MR; a two-chunk segment needs two, so grow must reject it
-        // rather than bind an over-capacity (and silently truncated) key.
+        // Cap at one MR against a two-chunk segment: the first chunk binds and
+        // the second is left out rather than pushing the key over its cap.
         let segment = RegisteredSegment::empty(dyn_ops(&ops), base, 1);
         // SAFETY: `MockOps` ignores the `pd`/`qp`; the nulls are never deref'd.
         let result =
             unsafe { segment.grow(&null_pd(), &null_qp(), 0, &seg(base, MAX_MR_SIZE + MIB2, 0)) };
-        assert!(
-            result.is_err(),
-            "grow must reject a segment needing more MRs than mkey max entries"
+        assert!(result.is_ok(), "grow binds the chunks that fit the cap");
+        assert_eq!(segment.size(), MAX_MR_SIZE, "one chunk is bound");
+        assert_eq!(
+            segment.scanned_size(),
+            MAX_MR_SIZE + MIB2,
+            "the whole scanned extent is recorded"
         );
-        assert_eq!(segment.size(), 0, "the segment is left unchanged");
         assert!(
-            ops.lock().bind_calls.is_empty(),
-            "no bind attempted past the cap"
+            segment.in_unregistered_tail(base + MAX_MR_SIZE, MIB2),
+            "the chunk left out is reported as unregistered tail"
+        );
+        let s = ops.lock();
+        assert_eq!(s.dmabuf_calls.len(), 1, "only the fitting chunk registers");
+        assert_eq!(s.bind_calls.len(), 1, "the key binds that one chunk");
+    }
+
+    #[test]
+    fn test_grow_with_a_full_key_leaves_the_segment_bound() {
+        let ops = MockOps::new(SERVED_NIC, true, &[0]);
+        let base = 0x10_0000_0000;
+        let segment = RegisteredSegment::empty(dyn_ops(&ops), base, 1);
+        // SAFETY: `MockOps` ignores the `pd`/`qp`; the nulls are never deref'd.
+        unsafe { segment.grow(&null_pd(), &null_qp(), 0, &seg(base, MAX_MR_SIZE, 0)) }
+            .expect("the first chunk fills the one-MR key");
+        let registered = ops.lock().dmabuf_calls.len();
+
+        // SAFETY: as above.
+        let result =
+            unsafe { segment.grow(&null_pd(), &null_qp(), 0, &seg(base, MAX_MR_SIZE + MIB2, 0)) };
+        assert!(result.is_ok(), "a full key is not an error");
+        assert_eq!(segment.size(), MAX_MR_SIZE, "the bound prefix is unchanged");
+        assert_eq!(
+            segment.scanned_size(),
+            MAX_MR_SIZE + MIB2,
+            "the new scanned extent is recorded"
+        );
+        assert_eq!(
+            ops.lock().dmabuf_calls.len(),
+            registered,
+            "nothing registers once the key is full"
+        );
+    }
+
+    #[test]
+    fn test_segment_too_large_for_one_key_still_covers_its_prefix() {
+        let ops = MockOps::new(SERVED_NIC, true, &[0]);
+        let base = 0x10_0000_0000;
+        // Two chunks against a one-MR cap: the first binds, the second is left
+        // out.
+        ops.lock().scan = vec![seg(base, MAX_MR_SIZE + MIB2, 0)];
+        let domain = domain_with_cap(ops.clone(), 1);
+
+        assert!(
+            register_cuda(&domain, base, MIB2).is_ok(),
+            "a request inside the bound prefix is served by the key"
+        );
+        let scans = ops.lock().scan_calls;
+
+        let tail = base + MAX_MR_SIZE;
+        assert!(
+            register_cuda(&domain, tail, MIB2).is_err(),
+            "a request in the chunk left out cannot use the key"
+        );
+        assert_eq!(
+            ops.lock().scan_calls,
+            scans,
+            "the unregistered tail does not trigger another scan"
+        );
+    }
+
+    #[test]
+    fn test_growth_past_the_cap_refuses_the_new_tail_without_rescanning() {
+        let ops = MockOps::new(SERVED_NIC, true, &[0]);
+        let base = 0x10_0000_0000;
+        // One chunk binds under a one-MR cap; a second would not.
+        ops.lock().scan = vec![seg(base, MAX_MR_SIZE, 0)];
+        let domain = domain_with_cap(ops.clone(), 1);
+        assert!(
+            register_cuda(&domain, base, MIB2).is_ok(),
+            "the first chunk fits the cap"
+        );
+
+        ops.lock().scan = vec![seg(base, MAX_MR_SIZE + MIB2, 0)];
+        let tail = base + MAX_MR_SIZE;
+        assert!(
+            register_cuda(&domain, tail, MIB2).is_err(),
+            "growing into a second chunk would exceed the cap"
+        );
+        let (scans, dmabufs) = {
+            let s = ops.lock();
+            (s.scan_calls, s.dmabuf_calls.len())
+        };
+
+        assert!(
+            register_cuda(&domain, tail, MIB2).is_err(),
+            "the tail stays unservable"
+        );
+        let s = ops.lock();
+        assert_eq!(s.scan_calls, scans, "no rescan for a known tail");
+        assert_eq!(
+            s.dmabuf_calls.len(),
+            dmabufs,
+            "no registration attempted for a refused tail"
         );
     }
 
     // ----- MlxDomain integration tests -----
 
     #[test]
-    fn test_cuda_ordinals_and_mlx5dv_enabled_derived_from_ops() {
+    fn test_mlx5dv_enabled_derived_from_ops() {
         let mock = MockOps::new(SERVED_NIC, true, &[0, 2]);
         let domain = domain(mock);
-        assert_eq!(domain.domain_impl().cuda_ordinals, vec![0, 2]);
         assert!(domain.domain_impl().mlx5dv_enabled);
+    }
+
+    #[test]
+    fn test_served_ordinals_resolved_per_use_not_at_construction() {
+        // A domain is normally opened by a host registration, before CUDA is
+        // initialized and so before any ordinal resolves to a NIC. Capturing the
+        // served set at construction would exclude every CUDA segment for the
+        // domain's lifetime, so it must be re-read per registration.
+        let base = 0x10_0000_0000;
+        let mock = MockOps::new(SERVED_NIC, true, &[]);
+        let domain = domain(mock.clone());
+        mock.lock().scan = vec![seg(base, MIB2, 0)];
+
+        assert!(
+            register_cuda(&domain, base, 4096).is_err(),
+            "ordinal 0 is not served yet, so its segment must not bind"
+        );
+
+        // CUDA comes up; ordinal 0 now resolves to this NIC.
+        mock.lock().served_ordinals = vec![0];
+
+        let view = register_cuda(&domain, base, 4096)
+            .expect("the segment must bind once its ordinal becomes served");
+        assert_eq!(view.size, 4096);
+        assert_eq!(mock.lock().bind_calls.len(), 1, "one segment bound");
     }
 
     #[test]

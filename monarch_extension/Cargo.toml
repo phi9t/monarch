@@ -15,37 +15,40 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bincode = { version = "2", features = ["serde"] }
 bytes = { version = "1.12.1", features = ["serde"] }
 fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 hyperactor = { version = "0.0.0", path = "../hyperactor" }
 hyperactor_mesh = { version = "0.0.0", path = "../hyperactor_mesh" }
 hyperactor_telemetry = { version = "0.0.0", path = "../hyperactor_telemetry" }
 libc = "0.2.186"
-monarch_cpp_static_libs = { path = "../monarch_cpp_static_libs", optional = true }
+monarch_cpp_static_libs = { version = "0.0.0", path = "../monarch_cpp_static_libs", optional = true }
 monarch_distributed_telemetry = { version = "0.0.0", path = "../monarch_distributed_telemetry", optional = true }
 monarch_gil = { version = "0.0.0", path = "../monarch_gil" }
 monarch_hyperactor = { version = "0.0.0", path = "../monarch_hyperactor" }
 monarch_introspection_snapshot = { version = "0.0.0", path = "../monarch_introspection_snapshot", optional = true }
 monarch_messages = { version = "0.0.0", path = "../monarch_messages", optional = true, default-features = false }
+monarch_perfetto_trace = { version = "0.0.0", path = "../monarch_perfetto_trace" }
 monarch_rdma_extension = { version = "0.0.0", path = "../monarch_rdma/extension", optional = true }
 monarch_tensor_worker = { version = "0.0.0", path = "../monarch_tensor_worker", optional = true, default-features = false }
-nccl-sys = { path = "../nccl-sys", optional = true }
+nccl-sys = { version = "0.0.0", path = "../nccl-sys", optional = true }
 ndslice = { version = "0.0.0", path = "../ndslice" }
 pyo3 = { version = "0.27", features = ["anyhow", "multiple-pymethods", "py-clone"] }
 pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
-rdmaxcel-sys = { path = "../rdmaxcel-sys", optional = true }
+rdmaxcel-sys = { version = "0.0.1", path = "../rdmaxcel-sys", optional = true }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+serde_multipart = { version = "0.0.0", path = "../serde_multipart" }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true, default-features = false }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
+typeuri = { version = "0.0.0", path = "../typeuri" }
 wirevalue = { version = "0.0.0", path = "../wirevalue" }
 
 [build-dependencies]
-build_utils = { path = "../build_utils" }
-monarch_cpp_static_libs = { path = "../monarch_cpp_static_libs", optional = true }
+build_utils = { version = "0.0.0", path = "../build_utils" }
+monarch_cpp_static_libs = { version = "0.0.0", path = "../monarch_cpp_static_libs", optional = true }
 
 [features]
 default = ["tensor_engine"]

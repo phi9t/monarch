@@ -96,6 +96,7 @@ class RemoteImpl(Generic[P, R]):
         kwargs: Dict[str, Any],
         port: "Optional[PortRef | OncePortRef]" = None,
         selection: Selection = "all",
+        correlation_id: int | None = None,
     ) -> None:
         ambient_mesh = device_mesh._active
         propagator = self._fetch_propagate
@@ -139,6 +140,7 @@ class RemoteImpl(Generic[P, R]):
                 args,
                 kwargs,
                 stream_ref,
+                correlation_id,
             ),
         )
         # we have to ask for status updates
@@ -248,7 +250,10 @@ remote_identity = Remote(RemoteImpl(None, lambda x: x))
 
 
 def call_on_shard_and_fetch(
-    remote: Endpoint[P, R], *args, shard: Dict[str, int] | None = None, **kwargs
+    remote: Remote[P, R] | Endpoint[P, R],
+    *args,
+    shard: Dict[str, int] | None = None,
+    **kwargs,
 ) -> Future[R]:
     # We have to flatten the tensors twice: first to discover
     # which mesh we are working on to shard it, and then again when doing the
@@ -274,7 +279,7 @@ def call_on_shard_and_fetch(
         selected_slice = checker.mesh._process(shard)
         shard_mesh = checker.mesh._new_with_shape(Shape(["_"], selected_slice))
         with shard_mesh.activate():
-            return remote.call_one(*args, **kwargs)
+            return cast("Future[R]", remote.call_one(*args, **kwargs))
 
 
 def _old_call_on_shard_and_fetch(
@@ -407,7 +412,6 @@ def _cached_propagation(_cache, rfunction: ResolvableFunction, args, kwargs):
         _miss += 1
         args_no_pg, kwargs_no_pg = tree_map(_mock_pgs, (args, kwargs))
         result_with_placeholders, output_pattern = call_on_shard_and_fetch(
-            # pyre-fixme[6]: Remote with concrete types doesn't match Endpoint[P, R] variance
             _propagate,
             function=rfunction,
             args=args_no_pg,

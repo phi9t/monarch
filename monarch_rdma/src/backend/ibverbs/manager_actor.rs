@@ -17,10 +17,7 @@
 //! - Device selection and PCI-to-RDMA device mapping
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -37,22 +34,24 @@ use hyperactor::Instance;
 use hyperactor::OncePortHandle;
 use hyperactor::OncePortRef;
 use hyperactor::PortHandle;
-use hyperactor::RefClient;
 use hyperactor::actor::Referable;
+use rand::seq::IteratorRandom;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
-use super::IbvBuffer;
 use super::IbvOp;
 use super::device::IbvDevice;
 use super::device::IbvDeviceImpl;
+use super::device_selection::PeerDeviceAffinityPolicy;
+use super::device_selection::configured_peer_device_affinity;
 use super::device_selection::resolve_target;
 use super::device_selection::select_optimal_ibv_devices;
 use super::domain::IbvDomain;
 use super::domain::IbvDomainImpl;
 use super::efa_device::EfaDevice;
 use super::memory_region::IbvMemoryRegionView;
+use super::memory_region::IbvRemoteMemoryRegionView;
 use super::mlx_device::MlxDevice;
 use super::primitives::IbvConfig;
 use super::primitives::IbvQpInfo;
@@ -62,15 +61,14 @@ use super::queue_pair::OpResult;
 use super::queue_pair::ProcessOps;
 use super::queue_pair::QpKey;
 use super::queue_pair::QueuePairActor;
+use super::queue_pair::QueuePairOp;
 use super::queue_pair::legacy;
 use crate::RdmaOp;
 use crate::RdmaTransportLevel;
 use crate::backend::RdmaBackend;
 use crate::backend::RdmaConfig;
 use crate::backend::ResolveRemoteBackendContext;
-use crate::device_selection::MemoryLocation;
 use crate::local_memory::KeepaliveLocalMemory;
-use crate::local_memory::is_device_ptr;
 use crate::rdma_components::RdmaRemoteBuffer;
 use crate::rdma_manager_actor::RdmaManagerActor;
 use crate::validate_execution_context;
@@ -98,11 +96,13 @@ wirevalue::register_type!(CreatePeerQueuePair<IbvManagerActor<EfaDevice>>);
 
 /// Local-only message: submit a batch of RDMA ops for end-to-end
 /// execution. The manager iterates the batch, resolves each op's
-/// local MR via [`IbvManagerActor::resolve_local_mr`], looks up
-/// (or spawns) the active-side [`QueuePairActor`] for the op's
-/// [`QpKey`], and immediately dispatches a one-item [`ProcessOps`]
-/// to that QP — so the QP can start posting op `i` while the
-/// manager resolves the MR for op `i+1`.
+/// local MRs via [`IbvManagerActor::resolve_local_mrs`], settles on the
+/// NIC pair to run it over with
+/// [`IbvManagerActor::pick_peer_pair`], looks up (or spawns) the
+/// active-side [`QueuePairActor`] for the op's [`QpKey`], and
+/// immediately dispatches a one-item [`ProcessOps`] to that QP — so
+/// the QP can start posting op `i` while the manager resolves the MRs
+/// for op `i+1`.
 ///
 /// Per-op completion notifications stream back on `reply` as
 /// [`OpResult`] values.
@@ -124,30 +124,20 @@ pub struct RawQueuePair {
     pub reply: OncePortHandle<Result<legacy::IbvQueuePair, String>>,
 }
 
-/// Cross-proc messages handled by [`IbvManagerActor`].
-#[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
-pub enum IbvManagerMessage {
-    /// Release a buffer registration by `remote_buf_id`. Fire-and-forget
-    /// (no reply port) to avoid blocking the caller during teardown.
-    ReleaseBuffer { remote_buf_id: usize },
-}
-wirevalue::register_type!(IbvManagerMessage);
-
 /// Local-only messages for [`IbvManagerActor`].
 #[derive(Handler, HandleClient, Debug)]
 pub enum IbvManagerLocalMessage {
-    /// Register a remote-facing buffer's MR and return its
-    /// [`IbvBuffer`]. Called by
+    /// Register `local`'s MRs and reply with one
+    /// [`IbvRemoteMemoryRegionView`] per registration. Called by
     /// [`crate::rdma_manager_actor::RdmaManagerActor::request_buffer`]
     /// at buffer-creation time.
     ///
-    /// The MR lives in [`IbvManagerActor::buffer_registrations`] and
-    /// is deregistered on [`IbvManagerMessage::ReleaseBuffer`].
+    /// The registrations live on `local` itself, so they stay in force for as
+    /// long as any holder of that handle does.
     RegisterRemoteBuffer {
-        remote_buf_id: usize,
         local: KeepaliveLocalMemory,
         #[reply]
-        reply: OncePortHandle<Result<IbvBuffer, String>>,
+        reply: OncePortHandle<Result<Vec<IbvRemoteMemoryRegionView>, String>>,
     },
 }
 
@@ -166,7 +156,6 @@ const DEFAULT_DOMAIN: &str = "default";
 #[derive(Debug)]
 #[hyperactor::export(
     handlers = [
-        IbvManagerMessage,
         CreatePeerQueuePair<IbvManagerActor<I>>,
     ],
 )]
@@ -194,19 +183,18 @@ pub struct IbvManagerActor<I: IbvDeviceImpl> {
     /// `Arc<IbvDomain>`.
     devices: HashMap<String, IbvDevice<I>>,
 
-    config: IbvConfig,
+    /// Which of a peer's NICs each of this manager's NICs may pair with, from
+    /// [`RDMA_PEER_DEVICE_AFFINITY`](crate::config::RDMA_PEER_DEVICE_AFFINITY).
+    /// Read once, when the manager starts.
+    peer_device_affinity: PeerDeviceAffinityPolicy,
 
-    /// Map from buffer_id to the registered MR view. The view keeps the MR (and
-    /// its PD) alive for the lifetime of the registration; `ReleaseBuffer` drops
-    /// the entry, and the FFI resources are released by the `Arc`s' `Drop`s once
-    /// no other holder of the view remains. The wire-facing [`IbvBuffer`] is
-    /// derived from the view on demand.
-    buffer_registrations: HashMap<usize, IbvMemoryRegionView>,
+    config: IbvConfig,
 }
 
 #[async_trait]
 impl<I: IbvDeviceImpl> Actor for IbvManagerActor<I> {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
+        this.set_system();
         let owner = if let Some(owner) = this.parent_handle() {
             owner
         } else {
@@ -240,9 +228,8 @@ impl<I: IbvDeviceImpl> Drop for IbvManagerActor<I> {
             let _ = handle.drain_and_stop("IbvManagerActor dropped");
         }
 
-        // The remaining fields (`peer_created_qps`,
-        // `buffer_registrations`, `devices`) free their FFI resources
-        // through their elements' `Drop`s when this struct is dropped.
+        // The remaining fields (`peer_created_qps`, `devices`) free their FFI
+        // resources through their elements' `Drop`s when this struct is dropped.
     }
 }
 
@@ -294,8 +281,8 @@ impl<I: IbvDeviceImpl> IbvManagerActor<I> {
             qp_handles: HashMap::new(),
             peer_created_qps: HashMap::new(),
             devices: HashMap::new(),
+            peer_device_affinity: configured_peer_device_affinity()?,
             config,
-            buffer_registrations: HashMap::new(),
         };
 
         Ok(actor)
@@ -307,115 +294,173 @@ impl<I: IbvDeviceImpl> IbvManagerActor<I> {
         &mut self,
         device_name: &str,
     ) -> Result<&IbvDomain<I::Domain>, anyhow::Error> {
+        self.get_or_create_device(device_name)?
+            .get_or_create_domain(DEFAULT_DOMAIN)
+    }
+
+    /// Get the named RDMA device, opening it on first use.
+    fn get_or_create_device(
+        &mut self,
+        device_name: &str,
+    ) -> Result<&mut IbvDevice<I>, anyhow::Error> {
         if !self.devices.contains_key(device_name) {
-            let device =
-                IbvDevice::<I>::open(device_name, self.config.clone()).ok_or_else(|| {
-                    anyhow::anyhow!("{} does not advertise {}", I::backend_name(), device_name,)
-                })?;
+            let device = IbvDevice::<I>::try_open(device_name, self.config.clone())?;
             // Print device info if MONARCH_DEBUG_RDMA=1 is set.
             crate::print_device_info_if_debug_enabled(device.context().as_ptr());
             self.devices.insert(device_name.to_string(), device);
         }
-        self.devices
+        Ok(self
+            .devices
             .get_mut(device_name)
-            .expect("device just inserted or already present")
-            .get_or_create_domain(DEFAULT_DOMAIN)
+            .expect("device just inserted or already present"))
     }
 
-    /// Resolve `mem` to an [`IbvMemoryRegionView`] using the slot shared by
-    /// every clone of `mem`. On a cold slot, picks the RDMA device (an explicit
-    /// `config.target` if set, else the CUDA-co-located NIC for device memory,
-    /// else a hash-assigned NIC for host memory) and registers the region
-    /// through that device's [`IbvDomainImpl`] strategy, installing the result;
-    /// on a warm slot, returns the cached view.
-    fn resolve_local_mr(
+    /// Chooses a set of NICs on which to register `mem`, then registers
+    /// `mem` on those NICs (caching the registrations inside the handle)
+    /// and returns the relevant [`IbvMemoryRegionView`]s. The call fails
+    /// only when there are no successful registrations.
+    ///
+    /// If an explicit `config.target` is set, then that is the NIC that is
+    /// chosen. Otherwise, NICs are chosen based on `pick_optimal_devices`.
+    ///
+    /// A region already registered on this backend keeps the NICs it has: the
+    /// set is chosen once, on the first call.
+    fn resolve_local_mrs(
         &mut self,
         mem: &KeepaliveLocalMemory,
-    ) -> Result<IbvMemoryRegionView, anyhow::Error> {
-        if let Some(mrv) = mem.mr_slot().get() {
-            return Ok(mrv.clone());
+    ) -> Result<Vec<IbvMemoryRegionView>, anyhow::Error> {
+        let already_serving = mem.registered_mrs::<I>();
+        if !already_serving.is_empty() {
+            return Ok(already_serving);
         }
-        let addr = mem.addr();
 
-        // Device selection, in priority order:
-        //   1. an explicit `config.target`, resolved to its NIC;
-        //   2. otherwise the CUDA-co-located NIC for device memory;
-        //   3. otherwise a host-memory NIC assigned by hashing (addr, size).
-        let device_name = if let Some(target) = &self.config.target {
-            resolve_target::<I>(target)
-                .ok_or_else(|| anyhow::anyhow!("configured device target {:?} not found", target))?
-                .name()
-                .clone()
-        } else {
-            let cuda_nic = if is_device_ptr(addr) {
-                let mut device_ordinal: i32 = -1;
-                // SAFETY: `addr` is a CUDA device pointer (per `is_device_ptr`);
-                // the FFI call writes the owning device ordinal through the
-                // out-pointer.
-                let err = unsafe {
-                    rdmaxcel_sys::rdmaxcel_cuPointerGetAttribute(
-                        &mut device_ordinal as *mut _ as *mut std::ffi::c_void,
-                        rdmaxcel_sys::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-                        addr as rdmaxcel_sys::CUdeviceptr,
-                    )
-                };
-                let ordinal = (err == rdmaxcel_sys::CUDA_SUCCESS)
-                    .then_some(device_ordinal)
+        let device_names = match &self.config.target {
+            Some(target) => vec![
+                resolve_target::<I>(target)?
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "could not get CUDA device ordinal for device memory at 0x{:x}: {}",
-                            addr,
-                            err
-                        )
-                    })?;
-                assert!(ordinal >= 0, "CUDA device ordinal must be non-negative");
-                Some(
-                    super::device_selection::get_cuda_device_to_ibv_device::<I>()
-                        .get(ordinal as usize)
-                        .and_then(|d| d.clone())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "no RDMA device found for CUDA device ordinal {}",
-                                ordinal
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
-            match cuda_nic {
-                Some(info) => info.name().clone(),
-                None => {
-                    // Host memory has no co-located GPU NIC. Rather than funnel
-                    // every host registration through a single device, spread them
-                    // across all NICs that tie for the best CPU path by hashing the
-                    // region's (addr, size); the NICs share the load for host
-                    // memory, increasing aggregate throughput.
-                    let devices = select_optimal_ibv_devices::<I>(MemoryLocation::Cpu(None));
-                    match devices.len() {
-                        0 => anyhow::bail!("no RDMA devices found"),
-                        n => {
-                            let mut hasher = DefaultHasher::new();
-                            (mem.addr(), mem.size()).hash(&mut hasher);
-                            devices[(hasher.finish() % n as u64) as usize]
-                                .name()
-                                .clone()
-                        }
-                    }
+                        anyhow::anyhow!("configured device target {:?} not found", target)
+                    })?
+                    .name()
+                    .clone(),
+            ],
+            None => self.pick_optimal_devices(mem)?,
+        };
+
+        let mut views = Vec::with_capacity(device_names.len());
+        let mut failure: Option<anyhow::Error> = None;
+        for device_name in &device_names {
+            match self.resolve_local_mr_on(mem, device_name) {
+                Ok(view) => views.push(view),
+                Err(error) => {
+                    tracing::warn!(
+                        "not serving [{:#x}, {:#x}) from {device_name}: {error:#}",
+                        mem.addr(),
+                        mem.addr() + mem.size(),
+                    );
+                    failure.get_or_insert(error);
                 }
             }
-        };
+        }
+        if views.is_empty() {
+            return Err(failure.expect("`device_names` is never empty, so one of them failed"));
+        }
+        Ok(views)
+    }
+
+    /// Resolve `mem` to its [`IbvMemoryRegionView`] on `device_name`,
+    /// registering the region there on first use.
+    ///
+    /// The registration lives on `mem` itself, shared by every clone of that
+    /// handle, so one handle registers a given device at most once. Nothing
+    /// deduplicates separate handles over the same region, though: each
+    /// carries its own registrations, so a region covered by two handles is
+    /// registered once per handle. A failure is recorded on `mem` too and
+    /// returned to later callers rather than retried.
+    fn resolve_local_mr_on(
+        &mut self,
+        mem: &KeepaliveLocalMemory,
+        device_name: &str,
+    ) -> Result<IbvMemoryRegionView, anyhow::Error> {
+        if let Some(mrv) = mem.registered_mr::<I>(device_name)? {
+            return Ok(mrv);
+        }
         tracing::debug!(
             "Using RDMA device: {} for memory at 0x{:x}",
             device_name,
-            addr
+            mem.addr()
         );
 
-        let domain = self.get_or_create_device_domain(&device_name)?;
         // The backend strategy handles host vs. device memory (standard MR,
         // dmabuf MR, or a device-specific segment binding).
-        let mrv = domain.register_mr(mem)?;
-        Ok(mem.mr_slot().get_or_init(|| mrv).clone())
+        let registered = self
+            .get_or_create_device_domain(device_name)
+            .and_then(|domain| domain.register_mr(mem));
+        match registered {
+            Ok(mrv) => mem.install_mr::<I>(mrv),
+            Err(error) => {
+                mem.record_mr_failure::<I>(device_name, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// The NICs of backend `I` to serve `mem` from: up to
+    /// [`RDMA_MAX_NICS_PER_BUFFER`](crate::config::RDMA_MAX_NICS_PER_BUFFER)
+    /// of the optimal NICs returned by [`select_optimal_ibv_devices`], chosen
+    /// using [`PeerDeviceAffinityPolicy::choose`].
+    fn pick_optimal_devices(
+        &self,
+        mem: &KeepaliveLocalMemory,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let location = mem.location();
+        let devices = select_optimal_ibv_devices::<I>(location)?;
+        anyhow::ensure!(
+            !devices.is_empty(),
+            "no {} RDMA device has a path to {location:?}",
+            I::backend_name(),
+        );
+        let names: Vec<String> = devices.iter().map(|device| device.name().clone()).collect();
+        let max = hyperactor_config::global::get(crate::config::RDMA_MAX_NICS_PER_BUFFER);
+        // `names` is passed in the order returned by `select_optimal_ibv_devices`, which is
+        // lexicographic. `PeerDeviceAffinityPolicy::choose` is sensitive to input order,
+        // so ensuring `names` has the same order across procs is important for consistency.
+        Ok(self
+            .peer_device_affinity
+            .choose(&names, max.map(hyperactor_config::NonZeroUsize::into_std)))
+    }
+
+    /// Given a list of local registrations and remote registrations, uses
+    /// [`Self::peer_device_affinity`] to decide on one local/remote pair
+    /// to use. Errors when the policy gives no valid pair.
+    fn pick_peer_pair<'a>(
+        &self,
+        local: &'a [IbvMemoryRegionView],
+        remote: &'a [IbvRemoteMemoryRegionView],
+    ) -> Result<(&'a IbvMemoryRegionView, &'a IbvRemoteMemoryRegionView), anyhow::Error> {
+        // Sort both sides by device name because `PeerDeviceAffinityPolicy::pairs` is
+        // sensitive to input order. This ensures that `pick_peer_pair`'s behavior is
+        // dependent only on the unordered set of local and remote devices, and it is
+        // therefore consistent across processes.
+        let mut local: Vec<&IbvMemoryRegionView> = local.iter().collect();
+        local.sort_by(|a, b| a.device_name.cmp(&b.device_name));
+        let mut remote: Vec<&IbvRemoteMemoryRegionView> = remote.iter().collect();
+        remote.sort_by(|a, b| a.device_name.cmp(&b.device_name));
+
+        let local_names: Vec<String> = local.iter().map(|mr| mr.device_name.clone()).collect();
+        let remote_names: Vec<String> = remote.iter().map(|mr| mr.device_name.clone()).collect();
+        self.peer_device_affinity
+            .pairs(&local_names, &remote_names)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, peer)| peer.map(|j| (local[i], remote[j])))
+            .choose(&mut rand::rng())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no NIC of {local_names:?} pairs with a peer NIC of {remote_names:?} under \
+                     {:?}",
+                    self.peer_device_affinity,
+                )
+            })
     }
 
     /// Build a passive-side mirror QP for `qp_key`, connect it to
@@ -431,11 +476,11 @@ impl<I: IbvDeviceImpl> IbvManagerActor<I> {
         if self.peer_created_qps.contains_key(qp_key) {
             anyhow::bail!("peer queue pair already exists for {qp_key:?}");
         }
-        let self_device = &qp_key.self_device;
+        let self_device = qp_key.self_device.clone();
         let config = self.config.clone();
-        let domain = self.get_or_create_device_domain(self_device)?;
-        let mut qp = domain
-            .create_queue_pair(&config)
+        let mut qp = self
+            .get_or_create_device(&self_device)?
+            .create_non_posting_queue_pair(DEFAULT_DOMAIN, &config)
             .map_err(|e| anyhow::anyhow!("could not create peer IbvQueuePair: {}", e))?;
         let local_info = qp
             .get_qp_info()
@@ -462,11 +507,11 @@ impl<I: IbvDeviceImpl> IbvManagerActor<I> {
         if let Some(h) = self.qp_handles.get(qp_key) {
             return Ok(h.clone());
         }
-        let self_device = &qp_key.self_device;
+        let self_device = qp_key.self_device.clone();
         let config = self.config.clone();
-        let domain = self.get_or_create_device_domain(self_device)?;
-        let qp = domain
-            .create_queue_pair(&config)
+        let (qp, cq_lease) = self
+            .get_or_create_device(&self_device)?
+            .create_queue_pair(DEFAULT_DOMAIN, &config)
             .map_err(|e| anyhow::anyhow!("could not create IbvQueuePair for {qp_key:?}: {}", e))?;
         let local_manager: ActorRef<Self> = cx.bind();
         let is_loopback = local_manager.actor_addr() == peer_manager.actor_addr()
@@ -476,41 +521,12 @@ impl<I: IbvDeviceImpl> IbvManagerActor<I> {
             local_manager,
             peer_manager,
             qp,
+            cq_lease,
             is_loopback,
             config.max_send_wr,
-            config.max_rd_atomic as u32,
         ));
         self.qp_handles.insert(qp_key.clone(), actor.clone());
         Ok(actor)
-    }
-}
-
-#[async_trait]
-impl<I: IbvDeviceImpl> IbvManagerMessageHandler for IbvManagerActor<I> {
-    async fn release_buffer(
-        &mut self,
-        _cx: &Context<Self>,
-        remote_buf_id: usize,
-    ) -> Result<(), anyhow::Error> {
-        // Dropping the entry releases the manager's `Arc` clones on
-        // the view's MR and PD; FFI cleanup happens via their `Drop`s
-        // once the last referencing view is gone.
-        self.buffer_registrations.remove(&remote_buf_id);
-        Ok(())
-    }
-}
-
-// `#[hyperactor::handle(IbvManagerMessage)]` would generate a
-// non-generic `impl Handler<...> for IbvManagerActor<I>` that
-// can't see `I`; we write the generic delegation by hand.
-#[async_trait]
-impl<I: IbvDeviceImpl> Handler<IbvManagerMessage> for IbvManagerActor<I> {
-    async fn handle(
-        &mut self,
-        cx: &Context<Self>,
-        message: IbvManagerMessage,
-    ) -> Result<(), anyhow::Error> {
-        <Self as IbvManagerMessageHandler>::handle(self, cx, message).await
     }
 }
 
@@ -520,12 +536,25 @@ impl<I: IbvDeviceImpl> Handler<SubmitOps<I>> for IbvManagerActor<I> {
         let SubmitOps { ops, reply } = msg;
 
         // Interleave MR resolution with QP dispatch: as soon as op `i`'s
-        // local MR is resolved and its QP actor is in place, ship a
+        // local MRs are resolved and its QP actor is in place, ship a
         // one-item `ProcessOps` to that QP. The QP can then post and
-        // poll op `i` while we run `resolve_local_mr` for op `i+1`.
+        // poll op `i` while we run `resolve_local_mrs` for op `i+1`.
         for (i, op) in ops.into_iter().enumerate() {
-            let mrv = match self.resolve_local_mr(&op.local_memory) {
-                Ok(mrv) => mrv,
+            let local_mrs = match self.resolve_local_mrs(&op.local_memory) {
+                Ok(mrs) => mrs,
+                Err(e) => {
+                    reply.try_post(
+                        cx,
+                        OpResult {
+                            op_idx: i,
+                            result: Err(e.to_string()),
+                        },
+                    )?;
+                    continue;
+                }
+            };
+            let (local, remote) = match self.pick_peer_pair(&local_mrs, &op.remote_buffers) {
+                Ok((local, remote)) => (local.clone(), remote.clone()),
                 Err(e) => {
                     reply.try_post(
                         cx,
@@ -538,12 +567,11 @@ impl<I: IbvDeviceImpl> Handler<SubmitOps<I>> for IbvManagerActor<I> {
                 }
             };
             let qp_key = QpKey {
-                self_device: mrv.device_name.clone(),
+                self_device: local.device_name.clone(),
                 other_id: op.remote_manager.actor_addr().id().clone(),
-                other_device: op.remote_buffer.device_name.clone(),
+                other_device: remote.device_name.clone(),
             };
-            let peer_manager = op.remote_manager.clone();
-            let handle = match self.ensure_qp_actor(cx, &qp_key, peer_manager) {
+            let handle = match self.ensure_qp_actor(cx, &qp_key, op.remote_manager) {
                 Ok(h) => h,
                 Err(e) => {
                     reply.try_post(
@@ -559,7 +587,13 @@ impl<I: IbvDeviceImpl> Handler<SubmitOps<I>> for IbvManagerActor<I> {
             handle.try_post(
                 cx,
                 ProcessOps {
-                    items: vec![(i, op, mrv)],
+                    items: vec![QueuePairOp {
+                        op_idx: i,
+                        op_type: op.op_type,
+                        local_memory: op.local_memory,
+                        local,
+                        remote,
+                    }],
                     reply: reply.clone(),
                 },
             )?;
@@ -616,28 +650,21 @@ impl<I: IbvDeviceImpl> IbvManagerLocalMessageHandler for IbvManagerActor<I> {
     async fn register_remote_buffer(
         &mut self,
         _cx: &Context<Self>,
-        remote_buf_id: usize,
         local: KeepaliveLocalMemory,
-    ) -> Result<Result<IbvBuffer, String>, anyhow::Error> {
-        if let Some(mrv) = self.buffer_registrations.get(&remote_buf_id) {
-            return Ok(Ok(IbvBuffer::from(mrv)));
-        }
-        // `resolve_local_mr` installs the view in `local`'s shared MR
-        // slot, so every clone of this handle — including the one the
-        // caller holds — reuses this registration instead of registering
-        // the same region again.
-        let mrv = match self.resolve_local_mr(&local) {
-            Ok(v) => v,
-            Err(e) => return Ok(Err(e.to_string())),
-        };
-        let buf = IbvBuffer::from(&mrv);
-        self.buffer_registrations.insert(remote_buf_id, mrv);
-        Ok(Ok(buf))
+    ) -> Result<Result<Vec<IbvRemoteMemoryRegionView>, String>, anyhow::Error> {
+        // The registration is installed on `local`'s shared map, so every clone
+        // of this handle — including the one the caller holds — reuses it rather
+        // than registering the same region on that device again.
+        Ok(self
+            .resolve_local_mrs(&local)
+            .map(|mrs| mrs.iter().map(IbvRemoteMemoryRegionView::from).collect())
+            .map_err(|error| format!("{error:#}")))
     }
 }
 
-// `#[hyperactor::handle(IbvManagerLocalMessage)]` analogue, written
-// generically; see the `IbvManagerMessage` block above.
+// `#[hyperactor::handle(IbvManagerLocalMessage)]` would generate a non-generic
+// `impl Handler<...> for IbvManagerActor<I>` that can't see `I`; we write the
+// generic delegation by hand.
 #[async_trait]
 impl<I: IbvDeviceImpl> Handler<IbvManagerLocalMessage> for IbvManagerActor<I> {
     async fn handle(
@@ -669,13 +696,14 @@ impl<I: IbvDeviceImpl> std::ops::Deref for IbvBackend<I> {
     }
 }
 
-/// Serializable per-buffer context for an ibverbs backend: the manager
-/// to route ops through and the wire description of the registered MR.
+/// Serializable per-buffer context for an ibverbs backend: the manager to route
+/// ops through and the wire description of every MR the buffer is registered
+/// under, one per NIC serving it.
 #[derive(Serialize, Deserialize, Named)]
 #[serde(bound = "")]
 pub struct IbvRemoteBackendContext<I: IbvDeviceImpl> {
     pub manager: ActorRef<IbvManagerActor<I>>,
-    pub buffer: IbvBuffer,
+    pub buffers: Vec<IbvRemoteMemoryRegionView>,
 }
 
 // `Clone` and `Debug` are hand-rolled to avoid the spurious `I: Clone`
@@ -685,7 +713,7 @@ impl<I: IbvDeviceImpl> Clone for IbvRemoteBackendContext<I> {
     fn clone(&self) -> Self {
         Self {
             manager: self.manager.clone(),
-            buffer: self.buffer.clone(),
+            buffers: self.buffers.clone(),
         }
     }
 }
@@ -694,7 +722,7 @@ impl<I: IbvDeviceImpl> std::fmt::Debug for IbvRemoteBackendContext<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IbvRemoteBackendContext")
             .field("manager", &self.manager)
-            .field("buffer", &self.buffer)
+            .field("buffers", &self.buffers)
             .finish()
     }
 }
@@ -740,26 +768,29 @@ where
     async fn register_remote_buffer(
         &self,
         cx: &(impl hyperactor::context::Actor + Send + Sync),
-        remote_buf_id: usize,
+        _remote_buf_id: usize,
         local: KeepaliveLocalMemory,
     ) -> Result<IbvRemoteBackendContext<I>> {
-        let buffer = self
+        let buffers = self
             .0
-            .register_remote_buffer(cx, remote_buf_id, local)
+            .register_remote_buffer(cx, local)
             .await?
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(IbvRemoteBackendContext {
             manager: self.0.bind(),
-            buffer,
+            buffers,
         })
     }
 
+    /// No-op: this backend holds no per-buffer state. A region's registrations
+    /// live on the [`KeepaliveLocalMemory`] they were made for, so a buffer is
+    /// released by its owner dropping that handle.
     async fn release_buffer(
         &self,
-        cx: &(impl hyperactor::context::Actor + Send + Sync),
-        remote_buf_id: usize,
+        _cx: &(impl hyperactor::context::Actor + Send + Sync),
+        _remote_buf_id: usize,
     ) -> Result<()> {
-        self.0.release_buffer(cx, remote_buf_id).await
+        Ok(())
     }
 
     /// Submit a batch of RDMA operations.
@@ -767,8 +798,8 @@ where
     /// Translates each op to an `IbvOp`, then ships the whole batch to
     /// [`IbvManagerActor`] via [`SubmitOps`]. The manager interleaves
     /// local-MR resolution with per-op dispatch: each op is sent to its
-    /// [`QueuePairActor`] as a one-item [`ProcessOps`] the moment its MR
-    /// is ready, so QP work on op `i` overlaps MR registration for op
+    /// [`QueuePairActor`] as a one-item [`ProcessOps`] the moment its MRs
+    /// are ready, so QP work on op `i` overlaps MR registration for op
     /// `i+1`.
     ///
     /// Always waits for exactly `ops.len()` per-op replies before
@@ -789,7 +820,7 @@ where
             ibv_ops.push(IbvOp {
                 op_type: op.op_type,
                 local_memory: op.local.clone(),
-                remote_buffer: ctx.buffer,
+                remote_buffers: ctx.buffers,
                 remote_manager: ctx.manager,
             });
         }
@@ -869,6 +900,7 @@ mod tests {
     //! allocations when the actor stops; [`TestEnv::shutdown`]
     //! explicitly drains both procs.
 
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -876,6 +908,7 @@ mod tests {
 
     use async_trait::async_trait;
     use hyperactor::Actor;
+    use hyperactor::ActorEnvironment;
     use hyperactor::ActorRef;
     use hyperactor::Context;
     use hyperactor::Handler;
@@ -889,7 +922,6 @@ mod tests {
     use hyperactor::actor::ActorError;
     use hyperactor::channel::ChannelAddr;
     use hyperactor::channel::ChannelTransport;
-    use hyperactor_config::Flattrs;
     use serde::Deserialize;
     use serde::Serialize;
     use typeuri::Named;
@@ -905,7 +937,11 @@ mod tests {
     use crate::backend::cuda_test_utils::CudaAllocator;
     use crate::backend::ibverbs::device::list_all_devices;
     use crate::backend::ibverbs::device_selection::IbvDeviceTarget;
+    use crate::backend::ibverbs::device_selection::resolve_target;
+    use crate::backend::ibverbs::device_selection::select_optimal_ibv_devices;
+    use crate::backend::ibverbs::mlx_device::MlxDevice;
     use crate::backend::ibverbs::primitives::IbvQpType;
+    use crate::device_selection::MemoryLocation;
     use crate::local_memory::KeepaliveLocalMemory;
 
     // ====================================================================
@@ -963,7 +999,7 @@ mod tests {
 
         async fn new(
             rdma_manager: ActorRef<RdmaManagerActor>,
-            _env: Flattrs,
+            _env: &ActorEnvironment,
         ) -> Result<Self, anyhow::Error> {
             Ok(Self {
                 rdma_manager,
@@ -1018,11 +1054,11 @@ mod tests {
             let local = match device {
                 BufferDevice::Cpu => {
                     let buf: Box<[u8]> = vec![pattern; size].into_boxed_slice();
-                    KeepaliveLocalMemory::new(Arc::new(buf))
+                    KeepaliveLocalMemory::try_new(Arc::new(buf))?
                 }
                 BufferDevice::Cuda(device_id) => {
                     let alloc = CudaAllocator::get().allocate(device_id, size, size);
-                    let local = KeepaliveLocalMemory::new(Arc::new(alloc.clone()));
+                    let local = KeepaliveLocalMemory::try_new(Arc::new(alloc.clone()))?;
                     self.cuda_allocs.push(alloc);
                     let fill = vec![pattern; size];
                     // SAFETY: `local` is freshly constructed; no other
@@ -1193,12 +1229,13 @@ mod tests {
             proc: &Proc,
             config: IbvConfig,
         ) -> Result<ActorRef<BufferHelperActor>, anyhow::Error> {
-            let rdma_actor = RdmaManagerActor::new(Some(config), Flattrs::default()).await?;
+            let rdma_actor =
+                RdmaManagerActor::new(Some(config), &ActorEnvironment::default()).await?;
             // Must match `RdmaManagerActor::local_handle`'s singleton lookup of "rdma_manager".
             let rdma_handle =
                 proc.spawn_with_uid(Uid::singleton(Label::strip("rdma_manager")), rdma_actor)?;
             let rdma: ActorRef<RdmaManagerActor> = rdma_handle.bind();
-            let helper_actor = BufferHelperActor::new(rdma, Flattrs::default()).await?;
+            let helper_actor = BufferHelperActor::new(rdma, &ActorEnvironment::default()).await?;
             let helper_handle = proc.spawn_with_label("helper", helper_actor);
             Ok(helper_handle.bind())
         }
@@ -1390,26 +1427,118 @@ mod tests {
     // Tests
     // ====================================================================
 
-    /// `register_remote_buffer` must populate the MR slot shared by
-    /// every clone of the `KeepaliveLocalMemory` it is handed, so that
-    /// later `resolve_local_mr` calls reuse the registered MR instead
-    /// of registering the same region again.
+    /// `register_remote_buffer` must record its registration on the
+    /// `KeepaliveLocalMemory` it is handed — under the name of the device it
+    /// registered on — so that later `resolve_local_mrs` calls for that device
+    /// reuse it instead of registering the same region again.
     #[timed_test::async_timed_test(timeout_secs = 60)]
-    async fn test_register_remote_buffer_fills_mr_slot() -> Result<(), anyhow::Error> {
+    async fn test_register_remote_buffer_records_its_registration() -> Result<(), anyhow::Error> {
         require_rdma();
-        let env = TestEnv::same_config(IbvConfig::targeting(IbvDeviceTarget::cpu(0))).await?;
+        let target = IbvDeviceTarget::cpu(0);
+        let device = resolve_target::<MlxDevice>(&target)?
+            .expect("cpu:0 should resolve to a NIC")
+            .name()
+            .clone();
+        let env = TestEnv::same_config(IbvConfig::targeting(target)).await?;
         let buf: Box<[u8]> = vec![0u8; 1024].into_boxed_slice();
-        let local = KeepaliveLocalMemory::new(Arc::new(buf));
+        let local = KeepaliveLocalMemory::try_new(Arc::new(buf))?;
         assert!(
-            local.mr_slot().get().is_none(),
-            "MR slot should be empty before registration",
+            local.registered_mr::<MlxDevice>(&device)?.is_none(),
+            "the region should have no registration before it is registered",
         );
         RdmaManagerActor::local_handle(&env.client)
             .request_buffer(&env.client, local.clone())
             .await?;
         assert!(
-            local.mr_slot().get().is_some(),
-            "registration should populate the MR slot",
+            local.registered_mr::<MlxDevice>(&device)?.is_some(),
+            "registration should be recorded under the pinned device {device}",
+        );
+        env.shutdown().await
+    }
+
+    /// With `rdma_max_nics_per_buffer` above 1, a buffer is registered on that
+    /// many of its tied-for-best NICs. Under the `match_name` policy, a remote
+    /// buffer must always be registered on the first N devices returned by
+    /// `select_optimal_ibv_devices` -- otherwise, a mismatch could make a transfer
+    /// impossible.
+    #[timed_test::async_timed_test(timeout_secs = 120)]
+    async fn test_match_name_nic_selection() -> Result<(), anyhow::Error> {
+        require_rdma();
+        const MAX_NICS: usize = 4;
+        let lock = hyperactor_config::global::lock();
+        let _max_guard = lock.override_key(
+            crate::config::RDMA_MAX_NICS_PER_BUFFER,
+            Some(hyperactor_config::NonZeroUsize::new(MAX_NICS).expect("MAX_NICS is 4")),
+        );
+        let _policy_guard = lock.override_key(
+            crate::config::RDMA_PEER_DEVICE_AFFINITY,
+            "match_name".to_string(),
+        );
+        let expected: BTreeSet<String> =
+            select_optimal_ibv_devices::<MlxDevice>(MemoryLocation::Cpu(None))?
+                .iter()
+                .take(MAX_NICS)
+                .map(|nic| nic.name().clone())
+                .collect();
+
+        let env = TestEnv::same_config(IbvConfig::default()).await?;
+        let buffer = env
+            .helper_a
+            .allocate(&env.client, 32, BufferDevice::Cpu, 0)
+            .await?;
+        let served_by: BTreeSet<String> = buffer
+            .resolve_mlx()
+            .expect("the buffer is registered on a Mellanox NIC")
+            .buffers
+            .iter()
+            .map(|mr| mr.device_name.clone())
+            .collect();
+        assert_eq!(served_by, expected);
+
+        for pattern in 0..2 * MAX_NICS as u8 {
+            run_cross_actor_write(&env, BufferDevice::Cpu, BufferDevice::Cpu, 32, pattern, 5)
+                .await?;
+        }
+        env.shutdown().await
+    }
+
+    /// Under `any` a buffer starts at a NIC drawn at random, so at one NIC per
+    /// buffer the buffers spread over the tied NICs instead of all landing on
+    /// the first.
+    #[timed_test::async_timed_test(timeout_secs = 60)]
+    async fn test_any_nic_selection() -> Result<(), anyhow::Error> {
+        require_rdma();
+        let lock = hyperactor_config::global::lock();
+        let _max_guard = lock.override_key(
+            crate::config::RDMA_MAX_NICS_PER_BUFFER,
+            Some(hyperactor_config::NonZeroUsize::MIN),
+        );
+        let _policy_guard =
+            lock.override_key(crate::config::RDMA_PEER_DEVICE_AFFINITY, "any".to_string());
+        let tied = select_optimal_ibv_devices::<MlxDevice>(MemoryLocation::Cpu(None))?.len();
+
+        let env = TestEnv::same_config(IbvConfig::default()).await?;
+        let mut served_by: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..16 {
+            let buffer = env
+                .helper_a
+                .allocate(&env.client, 32, BufferDevice::Cpu, 0)
+                .await?;
+            let registrations = buffer
+                .resolve_mlx()
+                .expect("the buffer is registered on a Mellanox NIC")
+                .buffers;
+            let [mr] = registrations.as_slice() else {
+                panic!("one NIC serves a buffer here, got {registrations:?}");
+            };
+            served_by.insert(mr.device_name.clone());
+        }
+        // Sixteen buffers all drawing the same one of several NICs would be a
+        // one-in-billions coincidence.
+        assert_eq!(
+            served_by.len() > 1,
+            tied > 1,
+            "{tied} NICs tie for host memory, but the buffers landed on {served_by:?}",
         );
         env.shutdown().await
     }
@@ -1903,14 +2032,14 @@ mod tests {
                 .backends
                 .mlx
                 .as_mut()
-                .map(|ctx| &mut ctx.buffer),
+                .map(|ctx| &mut ctx.buffers),
             bogus_remote
                 .backends
                 .efa
                 .as_mut()
-                .map(|ctx| &mut ctx.buffer),
+                .map(|ctx| &mut ctx.buffers),
         ];
-        for buf in bufs.into_iter().flatten() {
+        for buf in bufs.into_iter().flatten().flatten() {
             buf.rkey = 0xdead_beef;
             buf.addr = 0xdead_0000;
         }

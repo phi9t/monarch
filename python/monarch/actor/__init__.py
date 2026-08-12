@@ -10,6 +10,7 @@ Monarch Actor API - Public interface for actor functionality.
 """
 
 from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
+from monarch._rust_bindings.monarch_hyperactor.proc import ProcId, Uid
 from monarch._rust_bindings.monarch_hyperactor.shape import Extent
 from monarch._rust_bindings.monarch_hyperactor.supervision import MeshFailure
 from monarch._src.actor import config
@@ -41,13 +42,12 @@ from monarch._src.actor.future import Future
 from monarch._src.actor.host_mesh import (
     default_bootstrap_cmd,
     HostMesh,
-    hosts_from_config,
     this_host,
     this_proc,
 )
 from monarch._src.actor.proc_mesh import get_or_spawn_controller, ProcMesh
 from monarch._src.actor.supervision import unhandled_fault_hook
-from monarch._src.actor.telemetry import span, traced
+from monarch._src.actor.telemetry import get_meter, span, traced
 from monarch.actor.concurrent import concurrent_endpoint
 
 __all__ = [
@@ -63,6 +63,7 @@ __all__ = [
     "Future",
     "Point",
     "ProcMesh",
+    "ProcId",
     "Channel",
     "send",
     "shutdown_context",
@@ -74,7 +75,6 @@ __all__ = [
     "default_bootstrap_cmd",
     "HostMesh",
     "context",
-    "hosts_from_config",
     "Port",
     "PortReceiver",
     "Endpoint",
@@ -88,6 +88,8 @@ __all__ = [
     "unhandled_fault_hook",
     "MeshFailure",
     "config",
+    "get_meter",
     "span",
     "traced",
+    "Uid",
 ]

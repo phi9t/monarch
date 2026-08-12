@@ -18,6 +18,7 @@ use hyperactor::accum::Accumulator;
 use hyperactor::accum::CommReducer;
 use hyperactor::accum::ReducerFactory;
 use hyperactor::accum::ReducerSpec;
+use hyperactor::id::Label;
 use hyperactor::mailbox::OncePortReceiver;
 use hyperactor::mailbox::PortReceiver;
 use hyperactor_mesh::value_mesh::ValueOverlay;
@@ -56,9 +57,12 @@ use crate::metrics::ENDPOINT_CALL_THROUGHPUT;
 use crate::metrics::ENDPOINT_CHOOSE_ERROR;
 use crate::metrics::ENDPOINT_CHOOSE_LATENCY_US_HISTOGRAM;
 use crate::metrics::ENDPOINT_CHOOSE_THROUGHPUT;
+use crate::metrics::ENDPOINT_MESSAGE_SIZE_HISTOGRAM;
 use crate::metrics::ENDPOINT_STREAM_ERROR;
 use crate::metrics::ENDPOINT_STREAM_LATENCY_US_HISTOGRAM;
 use crate::metrics::ENDPOINT_STREAM_THROUGHPUT;
+use crate::metrics::EndpointAttrs;
+use crate::metrics::UNKNOWN;
 use crate::pickle::PendingMessage;
 use crate::pickle::PicklingState;
 use crate::pytokio::PyPythonTask;
@@ -93,6 +97,7 @@ pub(crate) enum EndpointAdverb {
     CallOne,
     Choose,
     Stream,
+    Broadcast,
 }
 
 impl EndpointAdverb {
@@ -102,6 +107,7 @@ impl EndpointAdverb {
             Self::CallOne => "call_one",
             Self::Choose => "choose",
             Self::Stream => "stream",
+            Self::Broadcast => "broadcast",
         }
     }
 }
@@ -112,22 +118,14 @@ impl EndpointAdverb {
 /// Call `mark_error()` before dropping to also record an error.
 pub struct RecordEndpointGuard {
     start: tokio::time::Instant,
-    method_name: String,
-    actor_count: usize,
+    attrs: Arc<EndpointAttrs>,
     adverb: EndpointAdverb,
     error_occurred: Cell<bool>,
 }
 
 impl RecordEndpointGuard {
-    fn new(
-        start: tokio::time::Instant,
-        method_name: String,
-        actor_count: usize,
-        adverb: EndpointAdverb,
-    ) -> Self {
-        let attributes = hyperactor_telemetry::kv_pairs!(
-            "method" => method_name.clone()
-        );
+    fn new(start: tokio::time::Instant, attrs: Arc<EndpointAttrs>, adverb: EndpointAdverb) -> Self {
+        let attributes = attrs.as_slice();
         match adverb {
             EndpointAdverb::Call => {
                 ENDPOINT_CALL_THROUGHPUT.add(1, attributes);
@@ -138,15 +136,14 @@ impl RecordEndpointGuard {
             EndpointAdverb::Choose => {
                 ENDPOINT_CHOOSE_THROUGHPUT.add(1, attributes);
             }
-            EndpointAdverb::Stream => {
-                // Throughput already recorded once at stream creation in py_stream_collector
+            EndpointAdverb::Stream | EndpointAdverb::Broadcast => {
+                // Throughput already recorded at the call site
             }
         }
 
         Self {
             start,
-            method_name,
-            actor_count,
+            attrs,
             adverb,
             error_occurred: Cell::new(false),
         }
@@ -159,12 +156,7 @@ impl RecordEndpointGuard {
 
 impl Drop for RecordEndpointGuard {
     fn drop(&mut self) {
-        let actor_count_str = self.actor_count.to_string();
-        let attributes = hyperactor_telemetry::kv_pairs!(
-            "method" => self.method_name.clone(),
-            "actor_count" => actor_count_str
-        );
-
+        let attributes = self.attrs.as_slice();
         let duration_us = self.start.elapsed().as_micros();
 
         match self.adverb {
@@ -180,6 +172,7 @@ impl Drop for RecordEndpointGuard {
             EndpointAdverb::Stream => {
                 ENDPOINT_STREAM_LATENCY_US_HISTOGRAM.record(duration_us as f64, attributes);
             }
+            EndpointAdverb::Broadcast => {}
         }
 
         if self.error_occurred.get() {
@@ -196,6 +189,7 @@ impl Drop for RecordEndpointGuard {
                 EndpointAdverb::Stream => {
                     ENDPOINT_STREAM_ERROR.add(1, attributes);
                 }
+                EndpointAdverb::Broadcast => {}
             }
         }
     }
@@ -212,7 +206,13 @@ pub(crate) struct SpanGuard {
 }
 
 impl SpanGuard {
-    fn actor_endpoint(name: &'static str, actor_id: &ActorAddr, mesh: &str, method: &str) -> Self {
+    fn actor_endpoint(
+        name: &'static str,
+        actor_id: &ActorAddr,
+        mesh: &str,
+        method: &str,
+        correlation_id: u64,
+    ) -> Self {
         Self {
             id: hyperactor_telemetry::start_user_span(
                 name,
@@ -232,12 +232,21 @@ impl SpanGuard {
                         "method",
                         hyperactor_telemetry::trace_dispatcher::FieldValue::Str(method.to_string()),
                     ),
+                    (
+                        "correlation_id",
+                        hyperactor_telemetry::trace_dispatcher::FieldValue::U64(correlation_id),
+                    ),
                 ],
             ),
         }
     }
 
-    fn remote(name: &'static str, actor_id: &ActorAddr, call_name: &str) -> Self {
+    fn remote(
+        name: &'static str,
+        actor_id: &ActorAddr,
+        call_name: &str,
+        correlation_id: u64,
+    ) -> Self {
         Self {
             id: hyperactor_telemetry::start_user_span(
                 name,
@@ -254,6 +263,10 @@ impl SpanGuard {
                         hyperactor_telemetry::trace_dispatcher::FieldValue::Str(
                             call_name.to_string(),
                         ),
+                    ),
+                    (
+                        "correlation_id",
+                        hyperactor_telemetry::trace_dispatcher::FieldValue::U64(correlation_id),
                     ),
                 ],
             ),
@@ -332,7 +345,9 @@ async fn collect_value(
                             refs.into_iter().map(Some).collect();
                         let mut state =
                             PicklingState::from_parts(message, VecDeque::new(), mesh_references);
-                        Err(PyErr::from_value(state.unpickle(py)?.into_bound(py)))
+                        Err(PyErr::from_value(
+                            state.unpickle_with_receiver(py, instance)?.into_bound(py),
+                        ))
                     })
                 }
                 other => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -355,7 +370,7 @@ async fn collect_value(
 async fn collect_valuemesh(
     extent: Extent,
     rx: OncePortReceiver<PythonMessage>,
-    method_name: String,
+    attrs: Arc<EndpointAttrs>,
     supervision_monitor: Option<Arc<dyn Supervisable>>,
     instance: &Instance<PythonActor>,
     qualified_endpoint_name: Option<String>,
@@ -364,12 +379,7 @@ async fn collect_valuemesh(
 
     let expected_count = extent.num_ranks();
 
-    let record_guard = RecordEndpointGuard::new(
-        start,
-        method_name.clone(),
-        expected_count,
-        EndpointAdverb::Call,
-    );
+    let record_guard = RecordEndpointGuard::new(start, attrs, EndpointAdverb::Call);
 
     enum RaceResult {
         Collected(Box<PythonMessage>),
@@ -443,7 +453,9 @@ async fn collect_valuemesh(
                             }
                             PythonResponseMessage::Exception { .. } => {
                                 record_guard.mark_error();
-                                return Err(PyErr::from_value(payload.decode(py)?.into_bound(py)));
+                                return Err(PyErr::from_value(
+                                    payload.decode(py, instance)?.into_bound(py),
+                                ));
                             }
                         }
                     }
@@ -457,12 +469,14 @@ async fn collect_valuemesh(
                 for (range, payload) in overlay.runs() {
                     match payload {
                         PythonResponseMessage::Result { .. } => {
-                            let obj = payload.decode(py)?;
+                            let obj = payload.decode(py, instance)?;
                             objects.extend(range.clone().map(|_| obj.clone_ref(py)));
                         }
                         PythonResponseMessage::Exception { .. } => {
                             record_guard.mark_error();
-                            return Err(PyErr::from_value(payload.decode(py)?.into_bound(py)));
+                            return Err(PyErr::from_value(
+                                payload.decode(py, instance)?.into_bound(py),
+                            ));
                         }
                     }
                 }
@@ -488,7 +502,7 @@ async fn collect_valuemesh(
 
 fn value_collector(
     mut receiver: PortReceiver<PythonMessage>,
-    method_name: String,
+    attrs: Arc<EndpointAttrs>,
     supervision_monitor: Option<Arc<dyn Supervisable>>,
     instance: Instance<PythonActor>,
     qualified_endpoint_name: Option<String>,
@@ -499,7 +513,7 @@ fn value_collector(
         let _span_guard = span_guard;
         let start = tokio::time::Instant::now();
 
-        let record_guard = RecordEndpointGuard::new(start, method_name, 1, adverb);
+        let record_guard = RecordEndpointGuard::new(start, attrs, adverb);
 
         match collect_value(
             &mut receiver,
@@ -514,7 +528,7 @@ fn value_collector(
                     refs.into_iter().map(Some).collect();
                 let mut state =
                     PicklingState::from_parts(message, VecDeque::new(), mesh_references);
-                state.unpickle(py)
+                state.unpickle_with_receiver(py, &instance)
             }),
             Err(e) => {
                 record_guard.mark_error();
@@ -539,10 +553,9 @@ pub struct PyValueStream {
     supervision_monitor: Option<Arc<dyn Supervisable>>,
     instance: Instance<PythonActor>,
     remaining: AtomicUsize,
-    method_name: String,
+    attrs: Arc<EndpointAttrs>,
     qualified_endpoint_name: Option<String>,
     start: tokio::time::Instant,
-    actor_count: usize,
     future_class: Py<PyAny>,
 }
 
@@ -564,12 +577,10 @@ impl PyValueStream {
         let instance = self.instance.clone_for_py();
         let qualified_endpoint_name = self.qualified_endpoint_name.clone();
         let start = self.start;
-        let method_name = self.method_name.clone();
-        let actor_count = self.actor_count;
+        let attrs = self.attrs.clone();
 
         let task: PyPythonTask = PythonTask::new(async move {
-            let record_guard =
-                RecordEndpointGuard::new(start, method_name, actor_count, EndpointAdverb::Stream);
+            let record_guard = RecordEndpointGuard::new(start, attrs, EndpointAdverb::Stream);
 
             let mut rx_guard = receiver.lock().await;
 
@@ -586,7 +597,7 @@ impl PyValueStream {
                         refs.into_iter().map(Some).collect();
                     let mut state =
                         PicklingState::from_parts(message, VecDeque::new(), mesh_references);
-                    state.unpickle(py)
+                    state.unpickle_with_receiver(py, &instance)
                 }),
                 Err(e) => {
                     record_guard.mark_error();
@@ -615,6 +626,11 @@ pub(crate) trait Endpoint {
     /// Get the method name for this endpoint.
     fn get_method_name(&self) -> &str;
 
+    /// The attributes every metric recorded for this endpoint carries. Built
+    /// once per endpoint; the adverbs hand a clone to the tasks that outlive
+    /// the borrow of `self`.
+    fn metric_attrs(&self) -> &Arc<EndpointAttrs>;
+
     /// Create and send a message with the given args/kwargs.
     fn send_message<'py>(
         &self,
@@ -624,6 +640,7 @@ pub(crate) trait Endpoint {
         port_ref: Option<EitherPortRef>,
         selection: AllOrChoose,
         instance: &Instance<PythonActor>,
+        correlation_id: Option<u64>,
     ) -> PyResult<()>;
 
     /// Like `send_message` but stamps `caller_headers` onto the
@@ -639,8 +656,17 @@ pub(crate) trait Endpoint {
         selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         _caller_headers: hyperactor_config::Flattrs,
+        correlation_id: Option<u64>,
     ) -> PyResult<()> {
-        self.send_message(py, args, kwargs, port_ref, selection, instance)
+        self.send_message(
+            py,
+            args,
+            kwargs,
+            port_ref,
+            selection,
+            instance,
+            correlation_id,
+        )
     }
 
     /// Build the operation-context envelope headers to stamp on an
@@ -652,12 +678,7 @@ pub(crate) trait Endpoint {
         &self,
         adverb: EndpointAdverb,
     ) -> hyperactor_config::Flattrs {
-        let adverb_str = match adverb {
-            EndpointAdverb::Call => "call",
-            EndpointAdverb::CallOne => "call_one",
-            EndpointAdverb::Choose => "choose",
-            EndpointAdverb::Stream => "stream",
-        };
+        let adverb_str = adverb.as_str();
         let attrs = crate::operation_context::build_operation_context_attrs(
             self.get_qualified_name(),
             Some(adverb_str),
@@ -679,7 +700,12 @@ pub(crate) trait Endpoint {
     /// for Remote) and route the slice to an actor-specific track. The adverb is the span name,
     /// so no formatting happens at the call site and the sink formats only when
     /// it renders the slice.
-    fn enter_endpoint_span(&self, adverb: EndpointAdverb, actor_id: &ActorAddr) -> SpanGuard;
+    fn enter_endpoint_span(
+        &self,
+        adverb: EndpointAdverb,
+        actor_id: &ActorAddr,
+        correlation_id: u64,
+    ) -> SpanGuard;
 
     fn get_current_instance(&self, py: Python<'_>) -> PyResult<Instance<PythonActor>> {
         let context = get_context(py).call0()?;
@@ -714,10 +740,12 @@ pub(crate) trait Endpoint {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let instance = self.get_current_instance(py)?;
-        let span_guard = self.enter_endpoint_span(EndpointAdverb::Call, instance.self_addr());
+        let correlation_id: u64 = fastrand::u64(..);
+        let span_guard =
+            self.enter_endpoint_span(EndpointAdverb::Call, instance.self_addr(), correlation_id);
 
         let extent = self.get_extent(py)?;
-        let method_name = self.get_method_name().to_string();
+        let attrs = self.metric_attrs().clone();
         let (port_ref, receiver) = self.open_reduce_response_port(&instance);
 
         let supervision_monitor = self.get_supervision_monitor();
@@ -732,6 +760,7 @@ pub(crate) trait Endpoint {
             AllOrChoose::All,
             &instance,
             caller_headers,
+            Some(correlation_id),
         )?;
 
         let instance_for_task = instance.clone_for_py();
@@ -740,7 +769,7 @@ pub(crate) trait Endpoint {
             collect_valuemesh(
                 extent,
                 receiver,
-                method_name,
+                attrs,
                 supervision_monitor,
                 &instance_for_task,
                 qualified_endpoint_name,
@@ -752,7 +781,11 @@ pub(crate) trait Endpoint {
         wrap_in_future(py, task)
     }
 
-    /// Load balanced sends a message to one chosen actor and awaits a result.
+    /// Sends a message to a randomly selected actor and waits for its result.
+    ///
+    /// Each call independently selects an actor uniformly at random. Selection does
+    /// not account for actor load, so calls are balanced only across many calls. Use
+    /// `call_one` on a slice of the mesh when placement must be deterministic.
     fn choose<'py>(
         &self,
         py: Python<'py>,
@@ -760,7 +793,9 @@ pub(crate) trait Endpoint {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let instance = self.get_current_instance(py)?;
-        let span_guard = self.enter_endpoint_span(EndpointAdverb::Choose, instance.self_addr());
+        let correlation_id: u64 = fastrand::u64(..);
+        let span_guard =
+            self.enter_endpoint_span(EndpointAdverb::Choose, instance.self_addr(), correlation_id);
         let (port_ref, receiver) = self.open_response_port(&instance);
 
         let caller_headers = self.build_operation_context_headers(EndpointAdverb::Choose);
@@ -772,11 +807,12 @@ pub(crate) trait Endpoint {
             AllOrChoose::Choose,
             &instance,
             caller_headers,
+            Some(correlation_id),
         )?;
 
         let task = value_collector(
             receiver,
-            self.get_method_name().to_string(),
+            self.metric_attrs().clone(),
             self.get_supervision_monitor(),
             instance.clone_for_py(),
             self.get_qualified_name(),
@@ -804,7 +840,12 @@ pub(crate) trait Endpoint {
         }
 
         let instance = self.get_current_instance(py)?;
-        let span_guard = self.enter_endpoint_span(EndpointAdverb::CallOne, instance.self_addr());
+        let correlation_id: u64 = fastrand::u64(..);
+        let span_guard = self.enter_endpoint_span(
+            EndpointAdverb::CallOne,
+            instance.self_addr(),
+            correlation_id,
+        );
         let (port_ref, receiver) = self.open_response_port(&instance);
 
         let caller_headers = self.build_operation_context_headers(EndpointAdverb::CallOne);
@@ -816,11 +857,12 @@ pub(crate) trait Endpoint {
             AllOrChoose::All,
             &instance,
             caller_headers,
+            Some(correlation_id),
         )?;
 
         let task = value_collector(
             receiver,
-            self.get_method_name().to_string(),
+            self.metric_attrs().clone(),
             self.get_supervision_monitor(),
             instance.clone_for_py(),
             self.get_qualified_name(),
@@ -839,11 +881,15 @@ pub(crate) trait Endpoint {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let extent = self.get_extent(py)?;
-        let method_name = self.get_method_name().to_string();
 
         let instance = self.get_current_instance(py)?;
         let (port_ref, receiver) = self.open_response_port(&instance);
 
+        let correlation_id: u64 = fastrand::u64(..);
+        // Send-time caller span so the correlation id has a sender for the flow
+        // arrow; without it the receiver spans are the only ones carrying the id.
+        let _span_guard =
+            self.enter_endpoint_span(EndpointAdverb::Stream, instance.self_addr(), correlation_id);
         let caller_headers = self.build_operation_context_headers(EndpointAdverb::Stream);
         self.send_message_with_headers(
             py,
@@ -853,6 +899,7 @@ pub(crate) trait Endpoint {
             AllOrChoose::All,
             &instance,
             caller_headers,
+            Some(correlation_id),
         )?;
 
         let actor_count = extent.num_ranks();
@@ -861,20 +908,16 @@ pub(crate) trait Endpoint {
         let qualified_endpoint_name = self.get_qualified_name();
         let future_class = make_future(py).unbind();
 
-        let attributes = hyperactor_telemetry::kv_pairs!(
-            "method" => method_name.clone()
-        );
-        ENDPOINT_STREAM_THROUGHPUT.add(1, attributes);
+        ENDPOINT_STREAM_THROUGHPUT.add(1, self.metric_attrs().as_slice());
 
         let stream = PyValueStream {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             supervision_monitor,
             instance: instance.clone_for_py(),
             remaining: AtomicUsize::new(actor_count),
-            method_name,
+            attrs: self.metric_attrs().clone(),
             qualified_endpoint_name,
             start,
-            actor_count,
             future_class,
         };
 
@@ -889,12 +932,23 @@ pub(crate) trait Endpoint {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<()> {
         let instance = self.get_current_instance(py)?;
-        let method_name = self.get_method_name();
-        let attributes = hyperactor_telemetry::kv_pairs!(
-            "method" => method_name.to_string()
+        let correlation_id: u64 = fastrand::u64(..);
+        let _span_guard = self.enter_endpoint_span(
+            EndpointAdverb::Broadcast,
+            instance.self_addr(),
+            correlation_id,
         );
+        let attributes = self.metric_attrs().as_slice();
 
-        match self.send_message(py, args, kwargs, None, AllOrChoose::All, &instance) {
+        match self.send_message(
+            py,
+            args,
+            kwargs,
+            None,
+            AllOrChoose::All,
+            &instance,
+            Some(correlation_id),
+        ) {
             Ok(()) => {
                 ENDPOINT_BROADCAST_THROUGHPUT.add(1, attributes);
                 Ok(())
@@ -919,6 +973,9 @@ pub struct ActorEndpoint {
     signature: Option<Py<PyAny>>,
     proc_mesh: Option<Py<PyAny>>,
     propagator: Option<Py<PyAny>>,
+    /// An endpoint outlives every invocation on it, so building its attributes
+    /// once here keeps the per-invocation metrics allocation-free.
+    attrs: Arc<EndpointAttrs>,
 }
 
 impl ActorEndpoint {
@@ -928,6 +985,7 @@ impl ActorEndpoint {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
         port_ref: Option<EitherPortRef>,
+        correlation_id: Option<u64>,
     ) -> PyResult<PendingMessage> {
         let port_ref_py: Py<PyAny> = match port_ref {
             Some(pr) => pr.clone().into_pyobject(py)?.unbind(),
@@ -947,9 +1005,14 @@ impl ActorEndpoint {
             self.proc_mesh
                 .as_ref()
                 .map_or_else(|| py.None(), |p| p.clone_ref(py)),
+            correlation_id,
         ))?;
         let mut pending: PyRefMut<'_, PendingMessage> = result.extract()?;
-        pending.take()
+        let message = pending.take()?;
+
+        ENDPOINT_MESSAGE_SIZE_HISTOGRAM.record(message.payload_len() as f64, self.attrs.as_slice());
+
+        Ok(message)
     }
 }
 
@@ -962,6 +1025,10 @@ impl Endpoint for ActorEndpoint {
         self.method.name()
     }
 
+    fn metric_attrs(&self) -> &Arc<EndpointAttrs> {
+        &self.attrs
+    }
+
     fn send_message<'py>(
         &self,
         py: Python<'py>,
@@ -970,8 +1037,9 @@ impl Endpoint for ActorEndpoint {
         port_ref: Option<EitherPortRef>,
         selection: AllOrChoose,
         instance: &Instance<PythonActor>,
+        correlation_id: Option<u64>,
     ) -> PyResult<()> {
-        let message = self.create_message(py, args, kwargs, port_ref)?;
+        let message = self.create_message(py, args, kwargs, port_ref, correlation_id)?;
         self.inner.cast_unresolved(message, selection, instance)
     }
 
@@ -984,8 +1052,9 @@ impl Endpoint for ActorEndpoint {
         selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         caller_headers: hyperactor_config::Flattrs,
+        correlation_id: Option<u64>,
     ) -> PyResult<()> {
-        let message = self.create_message(py, args, kwargs, port_ref)?;
+        let message = self.create_message(py, args, kwargs, port_ref, correlation_id)?;
         self.inner
             .cast_unresolved_with_headers(message, selection, instance, caller_headers)
     }
@@ -998,10 +1067,15 @@ impl Endpoint for ActorEndpoint {
         Some(format!("{}.{}()", self.mesh_name, self.method.name()))
     }
 
-    fn enter_endpoint_span(&self, adverb: EndpointAdverb, actor_id: &ActorAddr) -> SpanGuard {
+    fn enter_endpoint_span(
+        &self,
+        adverb: EndpointAdverb,
+        actor_id: &ActorAddr,
+        correlation_id: u64,
+    ) -> SpanGuard {
         let mesh = self.mesh_name.as_str();
-        let method = self.method.name();
-        SpanGuard::actor_endpoint(adverb.as_str(), actor_id, mesh, method)
+        let method = self.get_method_name();
+        SpanGuard::actor_endpoint(adverb.as_str(), actor_id, mesh, method, correlation_id)
     }
 }
 
@@ -1019,6 +1093,12 @@ impl ActorEndpoint {
         proc_mesh: Option<Py<PyAny>>,
         propagator: Option<Py<PyAny>>,
     ) -> Self {
+        // `mesh_name` is the raw name Python spawned the mesh under, so it takes
+        // the same stripping that produced the actors' own label. Only the
+        // metric is canonicalized; `mesh_name` keeps the user's spelling for
+        // error messages and spans.
+        let actor = Label::strip(&mesh_name);
+        let attrs = Arc::new(EndpointAttrs::new(method.name(), Some(&actor)));
         Self {
             inner: actor_mesh.get_inner(),
             shape: shape.get_inner().clone(),
@@ -1027,6 +1107,7 @@ impl ActorEndpoint {
             signature,
             proc_mesh,
             propagator,
+            attrs,
         }
     }
 
@@ -1142,7 +1223,11 @@ impl ActorEndpoint {
         self.call(py, args, kwargs)
     }
 
-    /// Load balanced sends a message to one chosen actor and awaits a result.
+    /// Sends a message to a randomly selected actor and waits for its result.
+    ///
+    /// Each call independently selects an actor uniformly at random. Selection does
+    /// not account for actor load, so calls are balanced only across many calls. Use
+    /// `call_one` on a slice of the mesh when placement must be deterministic.
     #[pyo3(signature = (*args, **kwargs), name = "choose")]
     fn py_choose<'py>(
         &self,
@@ -1197,7 +1282,24 @@ impl ActorEndpoint {
     ) -> PyResult<()> {
         let instance = self.get_current_instance(py)?;
         let sel = to_all_or_choose(selection)?;
-        self.send_message(py, args, Some(kwargs), port, sel, &instance)
+        let correlation_id: u64 = fastrand::u64(..);
+        tracing::info!(
+            target: hyperactor_telemetry::sinks::perfetto::ENDPOINT_TELEMETRY_TARGET,
+            actor_id = %instance.self_addr(),
+            mesh = self.mesh_name.as_str(),
+            method = self.get_method_name(),
+            correlation_id,
+            "send"
+        );
+        self.send_message(
+            py,
+            args,
+            Some(kwargs),
+            port,
+            sel,
+            &instance,
+            Some(correlation_id),
+        )
     }
 }
 
@@ -1212,6 +1314,7 @@ impl ActorEndpoint {
 pub struct Remote {
     /// The wrapped Python RemoteImpl object
     inner: Py<PyAny>,
+    attrs: Arc<EndpointAttrs>,
 }
 
 impl Endpoint for Remote {
@@ -1221,7 +1324,11 @@ impl Endpoint for Remote {
     }
 
     fn get_method_name(&self) -> &str {
-        "unknown"
+        UNKNOWN
+    }
+
+    fn metric_attrs(&self) -> &Arc<EndpointAttrs> {
+        &self.attrs
     }
 
     fn send_message<'py>(
@@ -1232,6 +1339,7 @@ impl Endpoint for Remote {
         port_ref: Option<EitherPortRef>,
         selection: AllOrChoose,
         _instance: &Instance<PythonActor>,
+        correlation_id: Option<u64>,
     ) -> PyResult<()> {
         let send_kwargs = PyDict::new(py);
         match port_ref {
@@ -1240,6 +1348,7 @@ impl Endpoint for Remote {
         }
 
         send_kwargs.set_item("selection", selection.as_str())?;
+        send_kwargs.set_item("correlation_id", correlation_id)?;
 
         let kwargs_dict = kwargs.map_or_else(|| PyDict::new(py), |d| d.clone());
         self.inner
@@ -1256,7 +1365,12 @@ impl Endpoint for Remote {
         None // Remote endpoints don't have qualified names
     }
 
-    fn enter_endpoint_span(&self, adverb: EndpointAdverb, actor_id: &ActorAddr) -> SpanGuard {
+    fn enter_endpoint_span(
+        &self,
+        adverb: EndpointAdverb,
+        actor_id: &ActorAddr,
+        correlation_id: u64,
+    ) -> SpanGuard {
         let call_name = monarch_with_gil_blocking(GilSite::DisplayName, |py| {
             self.inner
                 .call_method0(py, "_call_name")
@@ -1264,7 +1378,7 @@ impl Endpoint for Remote {
                 .and_then(|v| v.extract::<String>(py).ok())
         });
         let call_name = call_name.as_deref().unwrap_or("");
-        SpanGuard::remote(adverb.as_str(), actor_id, call_name)
+        SpanGuard::remote(adverb.as_str(), actor_id, call_name, correlation_id)
     }
 }
 
@@ -1273,7 +1387,11 @@ impl Remote {
     /// Create a new Remote wrapping a Python RemoteImpl object.
     #[new]
     fn new(remote: Py<PyAny>) -> Self {
-        Self { inner: remote }
+        let attrs = Arc::new(EndpointAttrs::new(UNKNOWN, None));
+        Self {
+            inner: remote,
+            attrs,
+        }
     }
 
     /// Call the endpoint on all actors and collect all responses into a ValueMesh.
@@ -1287,7 +1405,11 @@ impl Remote {
         self.call(py, args, kwargs)
     }
 
-    /// Load balanced sends a message to one chosen actor and awaits a result.
+    /// Sends a message to a randomly selected actor and waits for its result.
+    ///
+    /// Each call independently selects an actor uniformly at random. Selection does
+    /// not account for actor load, so calls are balanced only across many calls. Use
+    /// `call_one` on a slice of the mesh when placement must be deterministic.
     #[pyo3(signature = (*args, **kwargs), name = "choose")]
     fn py_choose<'py>(
         &self,
@@ -1527,6 +1649,9 @@ mod tests {
         fn get_method_name(&self) -> &str {
             unreachable!()
         }
+        fn metric_attrs(&self) -> &Arc<EndpointAttrs> {
+            unreachable!()
+        }
         fn send_message<'py>(
             &self,
             _py: Python<'py>,
@@ -1535,6 +1660,7 @@ mod tests {
             _port_ref: Option<EitherPortRef>,
             _selection: AllOrChoose,
             _instance: &Instance<PythonActor>,
+            _correlation_id: Option<u64>,
         ) -> PyResult<()> {
             unreachable!()
         }
@@ -1544,7 +1670,12 @@ mod tests {
         fn get_qualified_name(&self) -> Option<String> {
             self.qualified_name.clone()
         }
-        fn enter_endpoint_span(&self, _adverb: EndpointAdverb, _actor_id: &ActorAddr) -> SpanGuard {
+        fn enter_endpoint_span(
+            &self,
+            _adverb: EndpointAdverb,
+            _actor_id: &ActorAddr,
+            _correlation_id: u64,
+        ) -> SpanGuard {
             unreachable!()
         }
     }

@@ -23,6 +23,8 @@ mod tensor_worker;
 
 mod blocking;
 #[cfg(target_os = "linux")]
+mod chain_broadcast;
+#[cfg(target_os = "linux")]
 mod chunked_fuse;
 mod panic;
 #[cfg(target_os = "linux")]
@@ -237,6 +239,12 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
 
     #[cfg(target_os = "linux")]
+    crate::chain_broadcast::register_python_bindings(&get_or_add_new_module(
+        module,
+        "monarch_extension.chain_broadcast",
+    )?)?;
+
+    #[cfg(target_os = "linux")]
     crate::chunked_fuse::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_extension.chunked_fuse",
@@ -251,11 +259,6 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
     monarch_hyperactor::logging::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_hyperactor.logging",
-    )?)?;
-
-    monarch_hyperactor::proc_launcher_probe::register_python_bindings(&get_or_add_new_module(
-        module,
-        "monarch_hyperactor.proc_launcher_probe",
     )?)?;
 
     crate::trace::register_python_bindings(&get_or_add_new_module(

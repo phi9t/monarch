@@ -7,6 +7,7 @@
  */
 
 use super::*;
+use crate::backend::ibverbs::cq_pool::cq_entries_for;
 use crate::backend::ibverbs::primitives::IbvPd;
 
 /// An RDMA Queue Pair (QP) for communication between two endpoints.
@@ -144,11 +145,15 @@ impl IbvQueuePair {
                 Some(GidType::RoCEv2),
             )?
         };
+        // This queue pair builds its own completion queues rather than drawing
+        // on the device's pool, so size them the way a pooled queue is sized:
+        // to hold everything its one owner can have outstanding.
+        let cq_entries = cq_entries_for(1, config.max_send_wr, domain.device_info().max_cqe())?;
         unsafe {
             let qp = rdmaxcel_sys::rdmaxcel_qp_create(
                 context,
                 pd,
-                config.cq_entries,
+                cq_entries,
                 config.max_send_wr.try_into().unwrap(),
                 config.max_recv_wr.try_into().unwrap(),
                 config.max_send_sge.try_into().unwrap(),
@@ -325,7 +330,11 @@ impl IbvQueuePair {
         Ok(())
     }
 
-    pub fn recv(&mut self, lhandle: IbvBuffer, rhandle: IbvBuffer) -> Result<u64, anyhow::Error> {
+    pub fn recv(
+        &mut self,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
+    ) -> Result<u64, anyhow::Error> {
         unsafe {
             let qp = self.qp as *mut rdmaxcel_sys::rdmaxcel_qp;
             let idx = rdmaxcel_sys::rdmaxcel_qp_fetch_add_recv_wqe_idx(qp);
@@ -347,14 +356,14 @@ impl IbvQueuePair {
 
     pub fn put_with_recv(
         &mut self,
-        lhandle: IbvBuffer,
-        rhandle: IbvBuffer,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
     ) -> Result<Vec<u64>, anyhow::Error> {
         unsafe {
             let qp = self.qp as *mut rdmaxcel_sys::rdmaxcel_qp;
             let idx = rdmaxcel_sys::rdmaxcel_qp_fetch_add_send_wqe_idx(qp);
             self.post_op(
-                lhandle.addr,
+                lhandle.rdma_addr,
                 lhandle.lkey,
                 lhandle.size,
                 idx,
@@ -371,8 +380,8 @@ impl IbvQueuePair {
 
     pub fn put(
         &mut self,
-        lhandle: IbvBuffer,
-        rhandle: IbvBuffer,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
     ) -> Result<Vec<u64>, anyhow::Error> {
         let total_size = lhandle.size;
         if rhandle.size < total_size {
@@ -395,7 +404,7 @@ impl IbvQueuePair {
             };
             wr_ids.push(idx);
             self.post_op(
-                lhandle.addr + offset,
+                lhandle.rdma_addr + offset,
                 lhandle.lkey,
                 chunk_size,
                 idx,
@@ -450,8 +459,8 @@ impl IbvQueuePair {
     /// Enqueues a put operation without ringing the doorbell.
     pub fn enqueue_put(
         &mut self,
-        lhandle: IbvBuffer,
-        rhandle: IbvBuffer,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
     ) -> Result<Vec<u64>, anyhow::Error> {
         let idx = unsafe {
             rdmaxcel_sys::rdmaxcel_qp_fetch_add_send_wqe_idx(
@@ -460,7 +469,7 @@ impl IbvQueuePair {
         };
 
         self.send_wqe(
-            lhandle.addr,
+            lhandle.rdma_addr,
             lhandle.lkey,
             lhandle.size,
             idx,
@@ -475,8 +484,8 @@ impl IbvQueuePair {
     /// Enqueues a put-with-receive operation without ringing the doorbell.
     pub fn enqueue_put_with_recv(
         &mut self,
-        lhandle: IbvBuffer,
-        rhandle: IbvBuffer,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
     ) -> Result<Vec<u64>, anyhow::Error> {
         let idx = unsafe {
             rdmaxcel_sys::rdmaxcel_qp_fetch_add_send_wqe_idx(
@@ -485,7 +494,7 @@ impl IbvQueuePair {
         };
 
         self.send_wqe(
-            lhandle.addr,
+            lhandle.rdma_addr,
             lhandle.lkey,
             lhandle.size,
             idx,
@@ -500,8 +509,8 @@ impl IbvQueuePair {
     /// Enqueues a get operation without ringing the doorbell.
     pub fn enqueue_get(
         &mut self,
-        lhandle: IbvBuffer,
-        rhandle: IbvBuffer,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
     ) -> Result<Vec<u64>, anyhow::Error> {
         let idx = unsafe {
             rdmaxcel_sys::rdmaxcel_qp_fetch_add_send_wqe_idx(
@@ -510,7 +519,7 @@ impl IbvQueuePair {
         };
 
         self.send_wqe(
-            lhandle.addr,
+            lhandle.rdma_addr,
             lhandle.lkey,
             lhandle.size,
             idx,
@@ -524,8 +533,8 @@ impl IbvQueuePair {
 
     pub fn get(
         &mut self,
-        lhandle: IbvBuffer,
-        rhandle: IbvBuffer,
+        lhandle: IbvMemoryRegionView,
+        rhandle: IbvRemoteMemoryRegionView,
     ) -> Result<Vec<u64>, anyhow::Error> {
         let total_size = rhandle.size;
         if rhandle.size > lhandle.size {
@@ -550,7 +559,7 @@ impl IbvQueuePair {
             wr_ids.push(idx);
 
             self.post_op(
-                lhandle.addr + offset,
+                lhandle.rdma_addr + offset,
                 lhandle.lkey,
                 chunk_size,
                 idx,
@@ -799,6 +808,9 @@ impl IbvQueuePair {
         &mut self,
         target: PollTarget,
     ) -> Result<Option<Result<IbvWc, WorkRequestError>>, PollCompletionError> {
+        // SAFETY: this queue pair created and owns both completion queues, and
+        // `&mut self` excludes another poll through it, so no other thread is
+        // polling the one selected below.
         unsafe {
             let (cq, cq_type) = match target {
                 PollTarget::Send => (self.send_cq as *mut rdmaxcel_sys::ibv_cq, "send"),

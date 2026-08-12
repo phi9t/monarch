@@ -20,6 +20,7 @@ use std::fs::OpenOptions;
 use std::future;
 use std::io;
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -33,6 +34,7 @@ use std::time::SystemTime;
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::prelude::*;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream;
 use humantime::format_duration;
@@ -81,6 +83,7 @@ use crate::host::SingleTerminate;
 use crate::host::TerminateError;
 use crate::host::TerminateSummary;
 use crate::host::WaitError;
+use crate::host::legacy_service_proc_id;
 use crate::host_mesh::host_agent::HOST_MESH_AGENT_ACTOR_NAME;
 use crate::host_mesh::host_agent::HostAgent;
 use crate::logging::OutputTarget;
@@ -299,7 +302,9 @@ impl DrainedHostShutdown {
 /// - `shutdown_handle` joins the host's accept loop and runs the
 ///   drain protocol; see [`HostShutdownHandle`].
 ///
-/// - `addr`: the listening address of the host; this is used for the frontend server.
+/// - `addr`: the service proc identity and direct host frontend listening
+///   address. The gateway remints the proc's final location after binding and
+///   optional `via` attachment; a source-routed input location is rejected.
 /// - `command`: optional bootstrap command to spawn procs, otherwise [`BootstrapProcManager::current`].
 /// - `config`: optional runtime config overlay.
 /// - `exit_on_shutdown`: if true, [`HostShutdownHandle::join`] will call `process::exit` after draining.
@@ -311,7 +316,7 @@ impl DrainedHostShutdown {
 ///   before any ref is minted — so refs advertise the routable `Via`
 ///   location (used by out-of-cluster clients).
 pub async fn host(
-    addr: ChannelAddr,
+    addr: ProcAddr,
     command: Option<BootstrapCommand>,
     config: Option<Attrs>,
     exit_on_shutdown: bool,
@@ -590,9 +595,9 @@ impl Bootstrap {
                 let (serve_addr, _) = local_proc_addr(&socket_dir_path, proc_id.id())?;
 
                 // The following is a modified host::spawn_proc to support direct
-                // dialing between local procs: 1) we bind each proc to a deterministic
-                // address in socket_dir_path; 2) we use LocalProcDialer to dial these
-                // addresses for local procs.
+                // dialing between spawned sibling procs: 1) we bind each proc to a
+                // deterministic address in socket_dir_path; 2) we use LocalProcDialer
+                // to dial those addresses directly.
                 let proc_sender = mailbox::LocalProcDialer::new(
                     local_addr.clone(),
                     socket_dir_path,
@@ -636,7 +641,7 @@ impl Bootstrap {
                 exit_on_shutdown,
             } => {
                 let (_agent_handle, shutdown) = host(
-                    addr,
+                    ProcAddr::new(legacy_service_proc_id(), addr.into()),
                     command,
                     config,
                     exit_on_shutdown,
@@ -1542,6 +1547,8 @@ pub struct BootstrapCommand {
     pub program: PathBuf,
     pub arg0: Option<String>,
     pub args: Vec<String>,
+    /// The complete environment for the child process. No variables are
+    /// inherited from the spawning process.
     pub env: HashMap<String, String>,
 }
 wirevalue::register_type!(BootstrapCommand);
@@ -1593,6 +1600,9 @@ impl BootstrapCommand {
         for arg in &self.args {
             cmd.arg(arg);
         }
+        // `env` is authoritative, so disable `Command`'s implicit
+        // parent-environment inheritance before applying it.
+        cmd.env_clear();
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -1612,7 +1622,7 @@ impl BootstrapCommand {
             program: crate::testresource::get("monarch/hyperactor_mesh/bootstrap"),
             arg0: None,
             args: vec![],
-            env: HashMap::new(),
+            env: std::env::vars().collect(),
         }
     }
 }
@@ -1624,7 +1634,7 @@ impl<T: Into<PathBuf>> From<T> for BootstrapCommand {
             program: s.into(),
             arg0: None,
             args: vec![],
-            env: HashMap::new(),
+            env: std::env::vars().collect(),
         }
     }
 }
@@ -1995,6 +2005,32 @@ pub struct BootstrapProcConfig {
     pub bootstrap_command: Option<BootstrapCommand>,
 }
 
+struct LaunchCleanup {
+    launcher: Arc<dyn ProcLauncher>,
+    proc_id: Option<ProcAddr>,
+}
+
+impl LaunchCleanup {
+    fn disarm(mut self) {
+        self.proc_id = None;
+    }
+}
+
+impl Drop for LaunchCleanup {
+    fn drop(&mut self) {
+        let Some(proc_id) = self.proc_id.take() else {
+            return;
+        };
+        let launcher = Arc::clone(&self.launcher);
+
+        tokio::spawn(async move {
+            if let Err(error) = launcher.kill(&proc_id).await {
+                tracing::warn!(%proc_id, %error, "failed to clean up interrupted proc launch");
+            }
+        });
+    }
+}
+
 #[async_trait]
 impl ProcManager for BootstrapProcManager {
     type Handle = BootstrapProcHandle;
@@ -2089,21 +2125,34 @@ impl ProcManager for BootstrapProcManager {
         // Launch via the configured launcher backend.
         tracing::info!(proc_id = %proc_id, "launching proc with opts={opts:?}");
         let ref_proc_id: ProcAddr = proc_id.clone();
-        let launch_result = self
-            .launcher()
-            .launch(&ref_proc_id, opts.clone())
+        let launcher = Arc::clone(self.launcher());
+        let launch_result = match AssertUnwindSafe(launcher.launch(&ref_proc_id, opts.clone()))
+            .catch_unwind()
             .await
-            .map_err(|e| {
-                let io_err = match e {
+        {
+            Ok(Ok(launch_result)) => launch_result,
+            Ok(Err(error)) => {
+                let io_err = match error {
                     ProcLauncherError::Launch(io_err) => io_err,
                     other => std::io::Error::other(other.to_string()),
                 };
-                HostError::ProcessSpawnFailure(
+                return Err(HostError::ProcessSpawnFailure(
                     proc_id.clone(),
                     format!("{:?}", opts.command),
                     io_err,
-                )
-            })?;
+                ));
+            }
+            Err(panic) => {
+                if let Err(error) = launcher.kill(&ref_proc_id).await {
+                    tracing::warn!(proc_id = %ref_proc_id, %error, "failed to clean up panicked proc launch");
+                }
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let cleanup = LaunchCleanup {
+            launcher,
+            proc_id: Some(proc_id.clone()),
+        };
 
         // Wire up StreamFwders if stdio was captured.
         let (out_fwder, err_fwder) = match launch_result.stdio {
@@ -2184,6 +2233,7 @@ impl ProcManager for BootstrapProcManager {
         });
 
         // Callers do `handle.read().await` for mesh readiness.
+        cleanup.disarm();
         Ok(handle)
     }
 }
@@ -2454,6 +2504,8 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
+    use futures::FutureExt;
+    use hyperactor::ActorEnvironment;
     use hyperactor::Location;
     use hyperactor::PortHandle;
     use hyperactor::ProcId;
@@ -2466,9 +2518,161 @@ mod tests {
     use hyperactor::mailbox::Undeliverable;
     use hyperactor::testing::ids::test_proc_id;
     use hyperactor::testing::ids::test_proc_id_with_addr;
-    use hyperactor_config::Flattrs;
+    use timed_test::async_timed_test;
 
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum CleanupLaunchBehavior {
+        Succeed,
+        Panic,
+    }
+
+    struct CleanupLauncher {
+        behavior: CleanupLaunchBehavior,
+        killed: tokio::sync::mpsc::UnboundedSender<ProcAddr>,
+    }
+
+    #[async_trait]
+    impl ProcLauncher for CleanupLauncher {
+        async fn launch(
+            &self,
+            _proc_id: &ProcAddr,
+            _opts: LaunchOptions,
+        ) -> Result<crate::proc_launcher::LaunchResult, ProcLauncherError> {
+            match self.behavior {
+                CleanupLaunchBehavior::Succeed => {
+                    let (_exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+                    Ok(LaunchResult {
+                        pid: None,
+                        started_at: std::time::SystemTime::now(),
+                        stdio: StdioHandling::ManagedByLauncher,
+                        exit_rx,
+                    })
+                }
+                CleanupLaunchBehavior::Panic => panic!("test launcher panic"),
+            }
+        }
+
+        async fn terminate(
+            &self,
+            _proc_id: &ProcAddr,
+            _timeout: Duration,
+        ) -> Result<(), ProcLauncherError> {
+            unreachable!("cleanup guard test does not terminate a proc")
+        }
+
+        async fn kill(&self, proc_id: &ProcAddr) -> Result<(), ProcLauncherError> {
+            let _ = self.killed.send(proc_id.clone());
+            Ok(())
+        }
+    }
+
+    fn manager_with_cleanup_launcher(
+        behavior: CleanupLaunchBehavior,
+    ) -> (
+        BootstrapProcManager,
+        tokio::sync::mpsc::UnboundedReceiver<ProcAddr>,
+    ) {
+        let (killed, killed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let manager = BootstrapProcManager::new(BootstrapCommand::default())
+            .expect("bootstrap proc manager should be created");
+
+        manager
+            .set_launcher(Arc::new(CleanupLauncher { behavior, killed }))
+            .expect("test launcher should be installed");
+
+        (manager, killed_rx)
+    }
+
+    fn cleanup_test_config() -> BootstrapProcConfig {
+        BootstrapProcConfig {
+            create_rank: 0,
+            client_config_override: Attrs::new(),
+            proc_bind: None,
+            bootstrap_command: None,
+        }
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn cancelled_bootstrap_spawn_kills_launched_proc_before_registration() {
+        let (manager, mut killed_rx) =
+            manager_with_cleanup_launcher(CleanupLaunchBehavior::Succeed);
+
+        let proc_id = test_proc_id("cancelled-bootstrap-spawn");
+        // Hold the registry lock at the ownership handoff. The spawn can launch
+        // the proc and arm LaunchCleanup, but it cannot register the handle.
+        // Cancelling here must kill the proc and leave no registry entry.
+        let _children_guard = manager.children.lock().await;
+        let mut spawn = Box::pin(manager.spawn(
+            proc_id.clone(),
+            ChannelAddr::any(ChannelTransport::Unix),
+            cleanup_test_config(),
+        ));
+
+        assert!(
+            futures::poll!(&mut spawn).is_pending(),
+            "spawn should wait to register the launched proc",
+        );
+        drop(spawn);
+
+        assert_eq!(
+            killed_rx
+                .recv()
+                .await
+                .expect("cancelled spawn should kill the launched proc"),
+            proc_id,
+        );
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn panicked_bootstrap_spawn_kills_proc_and_resumes_unwind() {
+        let (manager, mut killed_rx) = manager_with_cleanup_launcher(CleanupLaunchBehavior::Panic);
+        let proc_id = test_proc_id("panicked-bootstrap-spawn");
+
+        let result = AssertUnwindSafe(manager.spawn(
+            proc_id.clone(),
+            ChannelAddr::any(ChannelTransport::Unix),
+            cleanup_test_config(),
+        ))
+        .catch_unwind()
+        .await;
+
+        assert!(result.is_err(), "launcher panic should resume unwinding");
+        assert_eq!(
+            killed_rx
+                .recv()
+                .await
+                .expect("panicked spawn should kill the launched proc"),
+            proc_id,
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_command_uses_exact_environment() {
+        assert!(
+            std::env::var_os("PATH").is_some(),
+            "test runner should set PATH"
+        );
+
+        let output = BootstrapCommand {
+            program: PathBuf::from("/usr/bin/env"),
+            env: HashMap::from([("BOOTSTRAP_COMMAND_TEST".to_string(), "present".to_string())]),
+            ..Default::default()
+        }
+        .new()
+        .output()
+        .await
+        .expect("run env with the configured environment");
+        let stdout = String::from_utf8(output.stdout).expect("env output should be UTF-8");
+
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            ["BOOTSTRAP_COMMAND_TEST=present"],
+            "bootstrap command should use only its configured environment"
+        );
+    }
 
     struct ShutdownFlushProbe {
         gateway: Gateway,
@@ -2807,15 +3011,18 @@ mod tests {
 
         // Spawn the log client and disable aggregation (immediate
         // print + tap push).
-        let log_client_actor = LogClientActor::new((), Flattrs::default()).await.unwrap();
+        let log_client_actor = LogClientActor::new((), &ActorEnvironment::default())
+            .await
+            .unwrap();
         let log_client: ActorRef<LogClientActor> = proc.spawn(log_client_actor).bind();
         log_client.set_aggregate(&client, None).await.unwrap();
 
         // Spawn the forwarder in this proc (it will serve
         // BOOTSTRAP_LOG_CHANNEL).
-        let log_forwarder_actor = LogForwardActor::new(log_client.clone(), Flattrs::default())
-            .await
-            .unwrap();
+        let log_forwarder_actor =
+            LogForwardActor::new(log_client.clone(), &ActorEnvironment::default())
+                .await
+                .unwrap();
         let _log_forwarder: ActorRef<LogForwardActor> = proc.spawn(log_forwarder_actor).bind();
 
         // Dial the channel but don't post until we know the forwarder
@@ -3455,7 +3662,10 @@ mod tests {
         let temp_instance = temp_proc.client("temp");
 
         let handle = host(
-            ChannelAddr::any(ChannelTransport::Unix),
+            ProcAddr::new(
+                legacy_service_proc_id(),
+                ChannelAddr::any(ChannelTransport::Unix).into(),
+            ),
             Some(BootstrapCommand::test()),
             None,
             false,

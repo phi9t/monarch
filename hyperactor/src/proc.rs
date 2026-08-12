@@ -221,12 +221,6 @@ tokio::task_local! {
     static CURRENT_TASK_PROC: Proc;
 }
 
-/// Legacy singleton proc name used for host-local client actors.
-///
-/// This is not a true singleton: every host may have a `local` proc, so local
-/// delivery must compare both proc id and location for this id.
-pub const LEGACY_LOCAL_PROC_NAME: &str = "local";
-
 /// Legacy singleton proc name used for host system actors.
 ///
 /// This is not a true singleton: every host may have a `service` proc, so
@@ -466,8 +460,8 @@ struct ProcState {
     /// All actor instances in this proc.
     instances: DashMap<ActorId, WeakInstanceCell>,
 
-    /// Root actor ids in this proc, tracked independently from uid shape.
-    root_actors: DashSet<ActorId>,
+    /// Root actor instances in this proc.
+    root_instances: DashMap<ActorId, WeakInstanceCell>,
 
     /// Proc-level queue-pressure accounting (PD-6 through PD-9).
     /// Runtime-driven — updated from `account_enqueue` /
@@ -813,7 +807,7 @@ impl Proc {
                 reserved_roots: DashSet::new(),
                 reserved_child_uids: DashSet::new(),
                 instances: DashMap::new(),
-                root_actors: DashSet::new(),
+                root_instances: DashMap::new(),
                 queue_stats: Arc::new(ProcQueueStats::new()),
                 terminated_snapshots: DashMap::new(),
                 actor_tombstones: DashMap::new(),
@@ -883,12 +877,6 @@ impl Proc {
         Self::from_parts_unchecked(proc_id, gateway)
     }
 
-    /// Create the legacy host-local client proc pseudo-singleton on
-    /// a fresh gateway whose forwarder is `forwarder`.
-    pub fn legacy_local_pseudo_singleton(addr: ChannelAddr, forwarder: BoxedMailboxSender) -> Self {
-        Self::legacy_local_pseudo_singleton_on_gateway(Gateway::configured(addr.into(), forwarder))
-    }
-
     /// Create the legacy host system proc pseudo-singleton on a
     /// fresh gateway whose forwarder is `forwarder`.
     pub fn legacy_service_pseudo_singleton(
@@ -899,12 +887,6 @@ impl Proc {
             addr.into(),
             forwarder,
         ))
-    }
-
-    /// Create the legacy host-local client proc pseudo-singleton on
-    /// the provided shared gateway.
-    pub fn legacy_local_pseudo_singleton_on_gateway(gateway: Gateway) -> Self {
-        Self::legacy_pseudo_singleton_on_gateway(LEGACY_LOCAL_PROC_NAME, gateway)
     }
 
     /// Create the legacy host system proc pseudo-singleton on the
@@ -1313,10 +1295,8 @@ impl Proc {
     where
         F: FnMut(&InstanceCell, usize),
     {
-        for entry in self.state().root_actors.iter() {
-            if let Some(cell) = self.get_instance_by_id(entry.key()) {
-                cell.traverse(f);
-            }
+        for cell in self.root_instances() {
+            cell.traverse(f);
         }
     }
 
@@ -1348,15 +1328,12 @@ impl Proc {
             .and_then(|cell| cell.upgrade())
     }
 
-    /// Returns the ActorAddrs of all root actors in this proc.
-    pub fn root_actor_ids(&self) -> Vec<ActorAddr> {
+    /// Live root instances in this proc.
+    fn root_instances(&self) -> Vec<InstanceCell> {
         self.state()
-            .root_actors
+            .root_instances
             .iter()
-            .filter_map(|entry| {
-                self.get_instance_by_id(entry.key())
-                    .map(|cell| cell.actor_addr().clone())
-            })
+            .filter_map(|entry| entry.value().upgrade())
             .collect()
     }
 
@@ -1567,10 +1544,8 @@ impl Proc {
         // (which must stay alive to receive stop events from the others).
         let mut statuses = HashMap::new();
         for actor_id in self
-            .state()
-            .root_actors
-            .iter()
-            .filter_map(|entry| self.get_instance_by_id(entry.key()))
+            .root_instances()
+            .into_iter()
             .filter(|cell| !matches!(*cell.status().borrow(), ActorStatus::Client))
             .map(|cell| cell.actor_addr().clone())
             .collect::<Vec<_>>()
@@ -1838,10 +1813,9 @@ impl Proc {
 
 fn requires_location_for_local_delivery_identity(proc_id: &ProcId) -> bool {
     // Temporary hyperactor_mesh compatibility hack: host bootstrap
-    // still creates a `service` proc and a `local` proc in every host
-    // process, so those proc ids are not globally unique. Until those
-    // construction paths are assigned instance ids, local delivery for
-    // those two ids also compares the terminal channel address.
+    // still creates a `service` proc in every host process, so that proc id
+    // is not globally unique. Until all construction paths assign it an
+    // instance id, local delivery also compares the terminal channel address.
     is_legacy_pseudo_singleton_proc_id(proc_id)
 }
 
@@ -1882,10 +1856,7 @@ fn is_legacy_pseudo_singleton_proc_id(proc_id: &ProcId) -> bool {
 }
 
 fn is_legacy_pseudo_singleton_label(label: &Label) -> bool {
-    matches!(
-        label.as_str(),
-        LEGACY_SERVICE_PROC_NAME | LEGACY_LOCAL_PROC_NAME
-    )
+    label.as_str() == LEGACY_SERVICE_PROC_NAME
 }
 
 #[async_trait]
@@ -3642,8 +3613,7 @@ impl<A: Actor> Instance<A> {
     /// Spawn a registered actor as this instance's child using an explicit uid.
     ///
     /// The actor type is resolved through the remote spawn registry. The child
-    /// inherits this instance's environment (AENV-2). No transient constructor
-    /// headers are supplied on this local path.
+    /// inherits this instance's environment unchanged (AENV-2).
     pub async fn gspawn_uid(
         &self,
         actor_type: &str,
@@ -3657,7 +3627,6 @@ impl<A: Actor> Instance<A> {
                 actor_type,
                 uid,
                 params,
-                Flattrs::new(),
             )
             .await
     }
@@ -3683,7 +3652,6 @@ impl<A: Actor> Instance<A> {
                 uid,
                 params,
                 environment,
-                Flattrs::new(),
             )
             .await
     }
@@ -3770,7 +3738,7 @@ impl<A: Actor> Instance<A> {
 
     /// Return a handle to this instance's parent actor, if it has one.
     pub fn parent_handle<P: Actor>(&self) -> Option<ActorHandle<P>> {
-        let parent_cell = self.inner.cell.inner.parent.upgrade()?;
+        let parent_cell = self.inner.cell.parent()?;
         let ports = if let Ok(ports) = parent_cell.inner.ports.clone().downcast() {
             ports
         } else {
@@ -4207,7 +4175,7 @@ impl InstanceCell {
             Box<dyn Fn() -> crate::ordering::OrderingSnapshot + Send + Sync>,
         >,
     ) -> Self {
-        let is_root = parent.is_none();
+        let is_root_instance = parent.is_none();
         let _ais = actor_id.to_string();
         let cell = Self {
             inner: Arc::new(InstanceCellState {
@@ -4245,8 +4213,10 @@ impl InstanceCell {
         proc.inner
             .instances
             .insert(actor_id.id().clone(), cell.downgrade());
-        if is_root {
-            proc.inner.root_actors.insert(actor_id.id().clone());
+        if is_root_instance {
+            proc.inner
+                .root_instances
+                .insert(actor_id.id().clone(), cell.downgrade());
         }
         cell
     }
@@ -4841,7 +4811,7 @@ impl Drop for InstanceCellState {
         {
             tracing::error!("instance {} was dropped but not in proc", self.actor_id);
         }
-        self.proc.inner.root_actors.remove(self.actor_id.id());
+        self.proc.inner.root_instances.remove(self.actor_id.id());
     }
 }
 
@@ -4852,15 +4822,9 @@ pub struct WeakInstanceCell {
     inner: Weak<InstanceCellState>,
 }
 
-impl Default for WeakInstanceCell {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WeakInstanceCell {
-    /// Create a new weak instance cell that is never upgradeable.
-    pub fn new() -> Self {
+    /// Create a weak instance cell that is never upgradeable.
+    fn new() -> Self {
         Self { inner: Weak::new() }
     }
 
@@ -5438,16 +5402,16 @@ mod tests {
         let child = proc.spawn_child(parent.cell().clone(), TestActor);
 
         assert!(parent.actor_addr().uid().is_instance());
-        let roots = proc.root_actor_ids();
         assert!(
-            roots
-                .iter()
-                .any(|root| root.id() == parent.actor_addr().id())
+            proc.state()
+                .root_instances
+                .contains_key(parent.actor_addr().id())
         );
         assert!(
-            !roots
-                .iter()
-                .any(|root| root.id() == child.actor_addr().id())
+            !proc
+                .state()
+                .root_instances
+                .contains_key(child.actor_addr().id())
         );
 
         let mut traversed = Vec::new();
@@ -5883,26 +5847,18 @@ mod tests {
     }
 
     #[test]
-    fn test_local_delivery_service_and_local_compare_full_proc_addr() {
-        for name in [LEGACY_SERVICE_PROC_NAME, LEGACY_LOCAL_PROC_NAME] {
-            let local = ProcAddr::singleton(ChannelAddr::Local(1), name);
-            let same_id_other_location = ProcAddr::singleton(ChannelAddr::Local(2), name);
-            let proc = match name {
-                LEGACY_SERVICE_PROC_NAME => Proc::legacy_service_pseudo_singleton(
-                    ChannelAddr::Local(1),
-                    BoxedMailboxSender::new(PanickingMailboxSender),
-                ),
-                LEGACY_LOCAL_PROC_NAME => Proc::legacy_local_pseudo_singleton(
-                    ChannelAddr::Local(1),
-                    BoxedMailboxSender::new(PanickingMailboxSender),
-                ),
-                _ => unreachable!("test only covers legacy pseudo-singletons"),
-            };
+    fn test_local_delivery_legacy_service_compares_full_proc_addr() {
+        let local = ProcAddr::singleton(ChannelAddr::Local(1), LEGACY_SERVICE_PROC_NAME);
+        let same_id_other_location =
+            ProcAddr::singleton(ChannelAddr::Local(2), LEGACY_SERVICE_PROC_NAME);
+        let proc = Proc::legacy_service_pseudo_singleton(
+            ChannelAddr::Local(1),
+            BoxedMailboxSender::new(PanickingMailboxSender),
+        );
 
-            assert_eq!(local.id(), same_id_other_location.id());
-            assert!(proc.is_local_delivery_target(&local));
-            assert!(!proc.is_local_delivery_target(&same_id_other_location));
-        }
+        assert_eq!(local.id(), same_id_other_location.id());
+        assert!(proc.is_local_delivery_target(&local));
+        assert!(!proc.is_local_delivery_target(&same_id_other_location));
 
         let shared = ProcAddr::singleton(ChannelAddr::Local(1), "shared");
         let shared_other_location = ProcAddr::singleton(ChannelAddr::Local(2), "shared");
@@ -5923,16 +5879,14 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_pseudo_singletons_use_dedicated_constructors() {
-        for name in [LEGACY_SERVICE_PROC_NAME, LEGACY_LOCAL_PROC_NAME] {
-            let result = std::panic::catch_unwind(|| {
-                Proc::configured(
-                    ProcAddr::singleton(ChannelAddr::Local(1), name),
-                    BoxedMailboxSender::new(PanickingMailboxSender),
-                );
-            });
-            assert!(result.is_err());
-        }
+    fn test_legacy_service_pseudo_singleton_uses_dedicated_constructor() {
+        let result = std::panic::catch_unwind(|| {
+            Proc::configured(
+                ProcAddr::singleton(ChannelAddr::Local(1), LEGACY_SERVICE_PROC_NAME),
+                BoxedMailboxSender::new(PanickingMailboxSender),
+            );
+        });
+        assert!(result.is_err());
 
         let service = Proc::legacy_service_pseudo_singleton(
             ChannelAddr::Local(1),
@@ -5941,15 +5895,6 @@ mod tests {
         assert_eq!(
             service.proc_addr().id().uid().to_string(),
             LEGACY_SERVICE_PROC_NAME
-        );
-
-        let local = Proc::legacy_local_pseudo_singleton(
-            ChannelAddr::Local(2),
-            BoxedMailboxSender::new(PanickingMailboxSender),
-        );
-        assert_eq!(
-            local.proc_addr().id().uid().to_string(),
-            LEGACY_LOCAL_PROC_NAME
         );
     }
 
@@ -6420,10 +6365,7 @@ mod tests {
             child.actor_addr().proc_addr(),
             parent.actor_addr().proc_addr()
         );
-        assert_eq!(
-            child.inner.parent.upgrade().unwrap().actor_addr(),
-            parent.actor_addr()
-        );
+        assert_eq!(child.parent().unwrap().actor_addr(), parent.actor_addr());
         assert_matches!(
             parent.inner.children.get(child.uid()),
             Some(node) if node.actor_addr() == child.actor_addr()
@@ -6481,7 +6423,7 @@ mod tests {
         // Supervision tree is constructed correctly.
         validate_link(third.cell(), second.cell());
         validate_link(second.cell(), first.cell());
-        assert!(first.cell().inner.parent.upgrade().is_none());
+        assert!(first.cell().parent().is_none());
 
         // Supervision tree is torn down correctly.
         // Once each actor is stopped, it should have no linked children.
@@ -6489,6 +6431,11 @@ mod tests {
         third.drain_and_stop("test").unwrap();
         third.await;
         assert!(third_cell.inner.children.is_empty());
+        assert_eq!(
+            third_cell.parent().unwrap().actor_addr(),
+            second.actor_addr()
+        );
+        assert!(second.cell().get_child(third_cell.uid()).is_none());
         drop(third_cell);
         validate_link(second.cell(), first.cell());
 
@@ -6502,6 +6449,46 @@ mod tests {
         first.drain_and_stop("test").unwrap();
         first.await;
         assert!(first_cell.inner.children.is_empty());
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn expired_parent_link_is_not_a_root() {
+        let proc = Proc::isolated();
+        let client = proc.client("client");
+
+        let parent = proc.spawn_with_label::<TestActor>("parent", TestActor);
+        let child = TestActor::spawn_child(&client, &parent).await;
+        let child_cell = child.cell().clone();
+        let child_addr = child_cell.actor_addr().clone();
+
+        assert!(
+            proc.state()
+                .root_instances
+                .contains_key(parent.actor_addr().id())
+        );
+        assert!(!proc.state().root_instances.contains_key(child_addr.id()));
+
+        parent.drain_and_stop("test").unwrap();
+        parent.await;
+        drop(child);
+
+        for i in 0..1000 {
+            if child_cell.parent().is_none() {
+                break;
+            }
+            if i < 50 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        assert!(
+            child_cell.parent().is_none(),
+            "parent cell should be released once the parent stops"
+        );
+
+        // An expired parent does not implicitly promote the child to a root.
+        assert!(!proc.state().root_instances.contains_key(child_addr.id()));
     }
 
     #[async_timed_test(timeout_secs = 30)]
@@ -8529,7 +8516,7 @@ mod tests {
     impl crate::RemoteSpawn for EnvProbe {
         type Params = PortRef<u64>;
 
-        async fn new(reply: PortRef<u64>, _environment: Flattrs) -> anyhow::Result<Self> {
+        async fn new(reply: PortRef<u64>, _environment: &ActorEnvironment) -> anyhow::Result<Self> {
             Ok(Self { reply })
         }
     }

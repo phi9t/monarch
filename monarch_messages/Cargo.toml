@@ -9,7 +9,7 @@ license = "BSD-3-Clause"
 
 [dependencies]
 anyhow = "1.0.104"
-derive_more = { version = "1.0.0", features = ["full"] }
+derive_more = { version = "2.1.1", features = ["full"] }
 enum-as-inner = "0.6.1"
 hyperactor = { version = "0.0.0", path = "../hyperactor" }
 monarch_gil = { version = "0.0.0", path = "../monarch_gil" }
@@ -18,7 +18,7 @@ ndslice = { version = "0.0.0", path = "../ndslice" }
 pyo3 = { version = "0.27", features = ["anyhow", "multiple-pymethods", "py-clone"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_bytes = "0.11"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true, default-features = false }
 torch-sys2 = { version = "0.0.0", path = "../torch-sys2" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
@@ -26,7 +26,7 @@ typeuri = { version = "0.0.0", path = "../typeuri" }
 wirevalue = { version = "0.0.0", path = "../wirevalue" }
 
 [build-dependencies]
-build_utils = { path = "../build_utils" }
+build_utils = { version = "0.0.0", path = "../build_utils" }
 
 [features]
 cuda = ["dep:torch-sys-cuda"]

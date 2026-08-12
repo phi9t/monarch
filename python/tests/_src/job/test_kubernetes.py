@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import pickle
 import unittest
 from tempfile import NamedTemporaryFile
 from unittest.mock import MagicMock, patch
@@ -32,6 +33,11 @@ from monarch._src.job.kubernetes import (
     ImageSpec,
     KubeConfig,
     KubernetesJob,
+)
+from monarch._src.job.service_identity import (
+    serialize_service_proc_ids,
+    SERVICE_PROC_IDS_ENV,
+    SERVICE_PROC_RANK_ENV,
 )
 
 
@@ -155,9 +161,12 @@ class TestAddMesh(unittest.TestCase):
 
     def test_image_marks_provisioned(self) -> None:
         job = self._make_job()
-        job.add_mesh("workers", num_replicas=2, image_spec=ImageSpec("myimage:latest"))
+        image_spec = ImageSpec("myimage:latest")
+        job.add_mesh("workers", num_replicas=2, image_spec=image_spec)
         self.assertTrue(job._meshes["workers"]["provisioned"])
-        self.assertIn("pod_template", job._meshes["workers"])
+        self.assertEqual(job._meshes["workers"]["image_spec"], image_spec)
+        self.assertNotIn("pod_template", job._meshes["workers"])
+        self.assertEqual(job._service_proc_ids, {})
 
     def test_pod_template_marks_provisioned(self) -> None:
         job = self._make_job()
@@ -322,6 +331,14 @@ class TestCreate(unittest.TestCase):
 
         job._create(None)
 
+        service_proc_ids = job._service_proc_ids["workers"]
+        self.assertEqual(len(service_proc_ids), 3)
+        self.assertEqual(len(set(service_proc_ids)), 3)
+        pod_template = mock_api_client.sanitize_for_serialization.call_args.args[0]
+        self.assertEqual(
+            pod_template.spec.containers[0].env[2].value,
+            serialize_service_proc_ids(service_proc_ids),
+        )
         mock_api.create_namespaced_custom_object.assert_called_once()
         call_kwargs = mock_api.create_namespaced_custom_object.call_args
         self.assertEqual(call_kwargs.kwargs["group"], _MONARCHMESH_GROUP)
@@ -529,8 +546,11 @@ class TestBuildWorkerPodTemplate(unittest.TestCase):
     """Tests for KubernetesJob._build_worker_pod_template."""
 
     def test_basic_pod_template(self) -> None:
+        service_proc_ids = KubernetesJob._allocate_service_proc_ids(1)
         template = KubernetesJob._build_worker_pod_template(
-            ImageSpec("myimage:latest"), port=26600
+            ImageSpec("myimage:latest"),
+            port=26600,
+            service_proc_ids=service_proc_ids,
         )
         self.assertEqual(len(template.spec.containers), 1)
         container = template.spec.containers[0]
@@ -539,13 +559,24 @@ class TestBuildWorkerPodTemplate(unittest.TestCase):
         self.assertEqual(
             container.command, ["python", "-u", "-c", _WORKER_BOOTSTRAP_SCRIPT]
         )
-        self.assertEqual(len(container.env), 1)
-        self.assertEqual(container.env[0].name, "MONARCH_PORT")
-        self.assertEqual(container.env[0].value, "26600")
+        env = {entry.name: entry for entry in container.env}
+        self.assertEqual(env["MONARCH_PORT"].value, "26600")
+        self.assertEqual(
+            env[SERVICE_PROC_RANK_ENV].value_from.field_ref.field_path,
+            "metadata.labels['apps.kubernetes.io/pod-index']",
+        )
+        self.assertEqual(
+            env[SERVICE_PROC_IDS_ENV].value,
+            serialize_service_proc_ids(service_proc_ids),
+        )
         self.assertIsNone(container.resources)
 
     def test_custom_port_in_env(self) -> None:
-        template = KubernetesJob._build_worker_pod_template(ImageSpec("img"), port=9999)
+        template = KubernetesJob._build_worker_pod_template(
+            ImageSpec("img"),
+            port=9999,
+            service_proc_ids=KubernetesJob._allocate_service_proc_ids(1),
+        )
         self.assertEqual(template.spec.containers[0].env[0].value, "9999")
 
     def test_resources_set(self) -> None:
@@ -555,6 +586,7 @@ class TestBuildWorkerPodTemplate(unittest.TestCase):
                 resources={"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": 2},
             ),
             port=26600,
+            service_proc_ids=KubernetesJob._allocate_service_proc_ids(1),
         )
         container = template.spec.containers[0]
         expected = {"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": "2"}
@@ -977,8 +1009,13 @@ class TestKill(unittest.TestCase):
     def test_kill_attach_only_raises_not_implemented(self) -> None:
         job = self._make_job()
         job.add_mesh("workers", num_replicas=1)
+        job._client_attached_to = "tcp://127.0.0.1:45678"
         with self.assertRaises(NotImplementedError):
             job._kill()
+        self.assertEqual(
+            job._client_attached_to,
+            "tcp://127.0.0.1:45678",
+        )
 
     @patch("monarch._src.job.kubernetes.client.CustomObjectsApi")
     @patch("monarch._src.job.kubernetes.config.load_incluster_config")
@@ -1105,6 +1142,27 @@ class TestCanRun(unittest.TestCase):
         spec = self._make_job()
         spec.add_mesh("workers", num_replicas=1)
         self.assertTrue(job.can_run(spec))
+
+    @patch.object(KubernetesJob, "_wait_for_ready_pods", return_value=[])
+    def test_matching_provisioned_job_reuses_cached_service_proc_ids(
+        self,
+        mock_wait_for_ready_pods: MagicMock,
+    ) -> None:
+        cached = self._make_job()
+        cached.add_mesh("workers", 2, image_spec=ImageSpec("image"))
+        service_proc_ids = KubernetesJob._allocate_service_proc_ids(2)
+        cached._service_proc_ids["workers"] = service_proc_ids
+        cached._status = "running"
+        restored = pickle.loads(pickle.dumps(cached))
+
+        spec = self._make_job()
+        spec.add_mesh("workers", 2, image_spec=ImageSpec("image"))
+
+        self.assertTrue(restored.can_run(spec))
+        self.assertEqual(
+            restored._service_proc_ids["workers"],
+            service_proc_ids,
+        )
 
     @patch(
         "monarch._src.job.kubernetes.config.load_incluster_config",
@@ -1252,7 +1310,7 @@ class TestStateOutOfCluster(unittest.TestCase):
         ]
 
     @patch("monarch._src.job.kubernetes.attach_to_workers")
-    @patch("monarch._src.job.kubernetes.attach")
+    @patch("monarch._src.job.job.attach")
     @patch("monarch._src.job.kubernetes.KubernetesJob._port_forward_to_pod")
     @patch("monarch._src.job.kubernetes.watch.Watch")
     @patch("monarch._src.job.kubernetes.client.CoreV1Api")
@@ -1292,7 +1350,7 @@ class TestStateOutOfCluster(unittest.TestCase):
         mock_attach.assert_called_once_with("tcp://127.0.0.1:45678")
 
     @patch("monarch._src.job.kubernetes.attach_to_workers")
-    @patch("monarch._src.job.kubernetes.attach")
+    @patch("monarch._src.job.job.attach")
     @patch("monarch._src.job.kubernetes.KubernetesJob._port_forward_to_pod")
     @patch("monarch._src.job.kubernetes.watch.Watch")
     @patch("monarch._src.job.kubernetes.client.CoreV1Api")
@@ -1311,6 +1369,8 @@ class TestStateOutOfCluster(unittest.TestCase):
         job.add_mesh(
             "mesh1", 2, image_spec=ImageSpec("ghcr.io/meta-pytorch/monarch:latest")
         )
+        service_proc_ids = KubernetesJob._allocate_service_proc_ids(2)
+        job._service_proc_ids["mesh1"] = service_proc_ids
 
         self._mock_watch_for_pods(
             mock_watch_cls,
@@ -1331,9 +1391,16 @@ class TestStateOutOfCluster(unittest.TestCase):
         forwarded_pod = mock_port_forward.call_args[0][0]
         self.assertEqual(forwarded_pod.name, "mesh1-0")
         mock_attach.assert_called_once_with("tcp://127.0.0.1:55555")
+        self.assertEqual(
+            mock_attach_to_workers.call_args.kwargs["workers"],
+            [
+                f"{service_proc_ids[0]}@tcp://10.0.0.1:26600",
+                f"{service_proc_ids[1]}@tcp://10.0.0.2:26600",
+            ],
+        )
 
     @patch("monarch._src.job.kubernetes.attach_to_workers")
-    @patch("monarch._src.job.kubernetes.attach")
+    @patch("monarch._src.job.job.attach")
     @patch("monarch._src.job.kubernetes.KubernetesJob._port_forward_to_pod")
     @patch("monarch._src.job.kubernetes.watch.Watch")
     @patch("monarch._src.job.kubernetes.client.CoreV1Api")
@@ -1363,6 +1430,53 @@ class TestStateOutOfCluster(unittest.TestCase):
 
         mock_port_forward.assert_not_called()
         mock_attach.assert_called_once_with("tcp://127.0.0.1:34000")
+
+    def test_components_bootstrap_before_host_mesh_materialization(self) -> None:
+        job = self._make_job()
+        job._status = "running"
+        job._apply_id = "apply"
+        raw_host = MagicMock()
+        raw_state = MagicMock()
+        raw_state._hosts = {"mesh1": raw_host}
+        events = []
+
+        def prepare_client_gateway() -> None:
+            events.append("prepare")
+            job._client_attached_to = "tcp://127.0.0.1:45678"
+
+        def materialize_state() -> MagicMock:
+            events.append("state")
+            return raw_state
+
+        job._components = MagicMock()
+        job._components.needs_sidecar.return_value = True
+        job._components.before_connect.side_effect = lambda _job: events.append(
+            "before_connect"
+        )
+        job._components.connect.side_effect = (
+            lambda _job, host_meshes: events.append("connect") or host_meshes
+        )
+
+        with (
+            patch.object(
+                job,
+                "_prepare_client_gateway",
+                side_effect=prepare_client_gateway,
+            ),
+            patch.object(job, "_state", side_effect=materialize_state),
+            patch(
+                "monarch._src.job.job.create_job_sidecar",
+                side_effect=lambda *_args, **_kwargs: events.append("sidecar"),
+            ),
+        ):
+            host_meshes = job._connect_host_meshes(job)
+
+        self.assertEqual(
+            events,
+            ["prepare", "sidecar", "before_connect", "state", "connect"],
+        )
+        self.assertEqual(host_meshes, {"mesh1": raw_host})
+        self.assertEqual(job._sidecar_attach_to(), "tcp://127.0.0.1:45678")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
+use hyperactor_config::NonZeroUsize;
 use hyperactor_config::attrs::declare_attrs;
 
 declare_attrs! {
@@ -90,4 +91,77 @@ declare_attrs! {
         Some("rdma_ibverbs_target".to_string()),
     ))
     pub attr RDMA_IBVERBS_TARGET: String = String::new();
+
+    /// Which peer NICs each local NIC may pair with for a transfer.
+    ///
+    /// Accepted forms are `any`, `match_name`, and `groups:` followed by any
+    /// number of `|`-separated groups, each naming any number of devices,
+    /// comma-separated — `groups:mlx5_0,mlx5_1|mlx5_2,mlx5_3|mlx5_4,mlx5_5` and
+    /// `groups:mlx5_0` are both valid. Groups must be disjoint. Parsed into a
+    /// [`PeerDeviceAffinityPolicy`](crate::backend::ibverbs::device_selection::PeerDeviceAffinityPolicy).
+    /// The empty default means `any`, since a `String` attribute cannot default
+    /// to anything else. Value syntax is validated when the RDMA manager starts.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("MONARCH_RDMA_PEER_DEVICE_AFFINITY".to_string()),
+        Some("rdma_peer_device_affinity".to_string()),
+    ))
+    pub attr RDMA_PEER_DEVICE_AFFINITY: String = String::new();
+
+    /// How many NICs a buffer is registered on, at most. `None`, which an
+    /// empty environment value parses to, sets no limit: every equally good
+    /// NIC serves the buffer.
+    ///
+    /// Depending on where in memory a buffer lives, there may be many
+    /// NICs that would be equally good for serving it. Registering the
+    /// buffer on each NIC improves flexibility and provides performance
+    /// optimization opportunities, but comes at the cost of an expensive
+    /// memory registration per NIC. This config attribute lets the user
+    /// tune this tradeoff.
+    ///
+    /// When multiple optimal NICs are available for a buffer, selecting
+    /// among them depends on [`RDMA_PEER_DEVICE_AFFINITY`]:
+    /// - `any`: first chosen at random, then the rest are taken
+    ///    lexicographically starting from the first.
+    /// - `match_name`: taken lexicographically.
+    /// - `groups`: round robin across groups, taken lexicographically
+    ///    within each group (so `groups:nic0,nic1|nic2,nic3`
+    ///    with `RDMA_MAX_NICS_PER_BUFFER = 2` would choose
+    ///    `nic0` and `nic2`).
+    ///
+    /// A manager pinned to one device by [`RDMA_IBVERBS_TARGET`] registers
+    /// there and ignores this.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("MONARCH_RDMA_MAX_NICS_PER_BUFFER".to_string()),
+        Some("rdma_max_nics_per_buffer".to_string()),
+    ))
+    pub attr RDMA_MAX_NICS_PER_BUFFER: Option<NonZeroUsize> =
+        Some(NonZeroUsize::new(1).expect("1 is non-zero"));
+
+    /// How many queue pairs share one completion queue.
+    ///
+    /// Sharing is what lets one poller reap for several queue pairs. Each
+    /// completion queue is sized to hold every sharer's work requests at once
+    /// (`rdma_qps_per_cq * max_send_wr` entries), so raising this trades
+    /// completion-queue memory for fewer completion queues to poll. Opening a
+    /// device fails outright if it cannot hold a completion queue that large.
+    ///
+    /// Only 1 is accepted for now: each queue pair polls its own completion
+    /// queue, so sharing one would give it several pollers.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("MONARCH_RDMA_QPS_PER_CQ".to_string()),
+        Some("rdma_qps_per_cq".to_string()),
+    ))
+    pub attr RDMA_QPS_PER_CQ: NonZeroUsize =
+        NonZeroUsize::new(1).expect("1 is non-zero");
+
+    /// Worker-thread count for the shared rdma data-plane runtime, which
+    /// every `QueuePairActor` poll loop runs on.
+    ///
+    /// The runtime is built once, lazily, so this value is latched at the
+    /// first RDMA use in a process and later changes have no effect.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("MONARCH_RDMA_RUNTIME_WORKER_THREADS".to_string()),
+        Some("rdma_runtime_worker_threads".to_string()),
+    ))
+    pub attr RDMA_RUNTIME_WORKER_THREADS: usize = 16;
 }

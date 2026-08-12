@@ -85,6 +85,14 @@ impl Gid {
         self.index
     }
 
+    /// Builds a GID at table index `index` from `addr`, for tests that need a
+    /// concrete GID without a device. The RoCE type is left `Unknown`, matching
+    /// what a non-RoCE fabric reports.
+    #[cfg(test)]
+    pub(super) fn for_test(addr: Ipv6Addr, index: u8) -> Self {
+        Self::new(addr, GidType::Unknown, index)
+    }
+
     /// The GID's address scope.
     fn scope(&self) -> GidScope {
         self.scope
@@ -259,11 +267,8 @@ pub fn resolve_qp_type(qp_type: IbvQpType) -> u32 {
 pub struct IbvConfig {
     /// `target` - An explicit RDMA device target, resolved to a concrete
     /// device via [`resolve_target`]. When `None`, the consumer picks the
-    /// device itself (the co-located NIC for GPU memory, or a hash-assigned
-    /// NIC for host memory).
+    /// devices itself.
     pub target: Option<IbvDeviceTarget>,
-    /// `cq_entries` - The number of completion queue entries.
-    pub cq_entries: i32,
     /// `port_num` - The physical port number on the device.
     pub port_num: u8,
     /// `max_send_wr` - The maximum number of outstanding send work requests.
@@ -314,7 +319,6 @@ impl Default for IbvConfig {
     fn default() -> Self {
         Self {
             target: None,
-            cq_entries: 1024,
             port_num: 1,
             max_send_wr: 512,
             max_recv_wr: 512,
@@ -410,6 +414,8 @@ pub struct IbvDeviceInfo {
     max_qp: i32,
     /// `max_cq` - Maximum number of completion queues supported.
     max_cq: i32,
+    /// `max_cqe` - Maximum number of entries in a single completion queue.
+    max_cqe: i32,
     /// `max_mr` - Maximum number of memory regions supported.
     max_mr: i32,
     /// `max_pd` - Maximum number of protection domains supported.
@@ -513,8 +519,8 @@ impl IbvDeviceInfo {
     }
 
     /// Aggregate bandwidth (MB/s) of the device's fastest active port,
-    /// derived from its IB `active_speed` / `active_width`. 0 if no port
-    /// is active, which ranks the device at the worst case.
+    /// derived from its IB `active_speed` / `active_width`. 0 if no port is
+    /// active.
     pub fn port_speed_mbytes_per_sec(&self) -> u32 {
         self.ports
             .iter()
@@ -534,6 +540,12 @@ impl IbvDeviceInfo {
     /// Returns the maximum number of completion queues supported by the RDMA device.
     pub fn max_cq(&self) -> i32 {
         self.max_cq
+    }
+
+    /// Maximum number of entries a single completion queue on this device can
+    /// hold.
+    pub fn max_cqe(&self) -> i32 {
+        self.max_cqe
     }
 
     /// Returns the maximum number of memory regions supported by the RDMA device.
@@ -565,7 +577,15 @@ impl IbvDeviceInfo {
         reason = "generic over the backend impl, so it cannot be the parameterless Default::default"
     )]
     pub fn default<I: IbvDeviceImpl>() -> Self {
+        // A CPU location never consults the CUDA driver, so the error arm is
+        // unreachable here; it is surfaced rather than swallowed all the same.
         resolve_target::<I>(&IbvDeviceTarget::MemoryLocation(MemoryLocation::Cpu(None)))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "resolving the default RDMA device for backend {}: {error:#}",
+                    I::backend_name()
+                )
+            })
             .unwrap_or_else(|| panic!("no RDMA device for backend {}", I::backend_name()))
     }
 
@@ -584,6 +604,7 @@ impl IbvDeviceInfo {
             ports: Vec::new(),
             max_qp: 0,
             max_cq: 0,
+            max_cqe: 0,
             max_mr: 0,
             max_pd: 0,
             max_qp_wr: 0,
@@ -869,6 +890,7 @@ pub(super) unsafe fn query_device_info(
         ports: Vec::new(),
         max_qp: device_attr.max_qp,
         max_cq: device_attr.max_cq,
+        max_cqe: device_attr.max_cqe,
         max_mr: device_attr.max_mr,
         max_pd: device_attr.max_pd,
         max_qp_wr: device_attr.max_qp_wr,
@@ -1140,19 +1162,21 @@ impl IbvWc {
 /// destroying the CQ on drop (a no-op if null) before releasing the context.
 /// Holding the context keeps it open across `ibv_destroy_cq`.
 #[derive(Debug)]
-pub(super) struct IbvCq {
+pub struct IbvCq {
     cq: *mut rdmaxcel_sys::ibv_cq,
     /// Keeps the context open until after `ibv_destroy_cq`. Never read.
     _context: Arc<IbvContext>,
 }
 
-// SAFETY: the only raw member is the `ibv_cq` pointer. The ibverbs CQ it names is
-// not thread-affine — it may be created on one thread and used or destroyed on
-// another (`Send`) — and `IbvCq` exposes no operation that mutates the CQ through
-// a shared `&` (`as_ptr` only hands back the pointer value), so sharing a
-// `&IbvCq` cannot race (`Sync`).
+// SAFETY: the only raw member is the `ibv_cq` pointer, and the ibverbs CQ it
+// names is not thread-affine: it may be created on one thread and used or
+// destroyed on another.
 unsafe impl Send for IbvCq {}
-// SAFETY: as for `Send` above.
+// SAFETY: nothing reachable from a `&IbvCq` touches the queue. `as_ptr` hands
+// back a pointer value, and no other operation takes `&self`, so concurrent
+// holders cannot race. Whether the returned `*mut ibv_cq` may be used from
+// several threads at once is a separate question, answered by the safety
+// contract of the unsafe code that uses it.
 unsafe impl Sync for IbvCq {}
 
 impl IbvCq {
@@ -1229,14 +1253,16 @@ impl Drop for IbvCq {
 
 /// Owns an `ibv_qp` together with the resources it is built against: its two
 /// completion queues and the protection domain. The QP is destroyed on drop (a
-/// no-op if null) before the CQs and PD, so the destruction order is correct by
-/// construction and holders need not track the CQs or PD separately.
+/// no-op if null), and holding the CQs and PD here keeps them alive for at
+/// least the QP's lifetime, so holders need not track them separately.
+///
+/// The completion queues are shared (`Arc`) because one queue can back many
+/// QPs; all that matters is that every `IbvCq` outlives the QPs built on it.
 #[derive(Debug)]
 pub(super) struct IbvQp {
     qp: *mut rdmaxcel_sys::ibv_qp,
-    /// Declared after `qp` so the QP is destroyed before its completion queues.
-    send_cq: IbvCq,
-    recv_cq: IbvCq,
+    send_cq: Arc<IbvCq>,
+    recv_cq: Arc<IbvCq>,
     /// Keeps the PD alive for the QP's lifetime and is the source of the QP's
     /// device context (via [`IbvPd::context`]).
     pd: Arc<IbvPd>,
@@ -1262,8 +1288,8 @@ impl IbvQp {
     /// `send_cq`/`recv_cq` as its completion queues.
     pub(super) unsafe fn from_raw(
         qp: *mut rdmaxcel_sys::ibv_qp,
-        send_cq: IbvCq,
-        recv_cq: IbvCq,
+        send_cq: Arc<IbvCq>,
+        recv_cq: Arc<IbvCq>,
         pd: Arc<IbvPd>,
     ) -> Self {
         Self {
@@ -1289,6 +1315,12 @@ impl IbvQp {
         &self.recv_cq
     }
 
+    /// The protection domain this QP was created against, shareable as a
+    /// keepalive by resources built on the same PD.
+    pub(super) fn pd(&self) -> &Arc<IbvPd> {
+        &self.pd
+    }
+
     /// The device context this QP was created on, sourced from its PD.
     pub(super) fn context(&self) -> &IbvContext {
         self.pd.context()
@@ -1300,8 +1332,8 @@ impl IbvQp {
     pub(super) fn null() -> Self {
         Self {
             qp: std::ptr::null_mut(),
-            send_cq: IbvCq::null(),
-            recv_cq: IbvCq::null(),
+            send_cq: Arc::new(IbvCq::null()),
+            recv_cq: Arc::new(IbvCq::null()),
             pd: Arc::new(IbvPd::null()),
         }
     }
@@ -1528,6 +1560,78 @@ impl Drop for IbvMr {
     }
 }
 
+/// Owns an `ibv_ah` together with the `Arc<IbvPd>` it was created against,
+/// destroying the address handle on drop before releasing the PD. Holding the PD
+/// keeps it (and, through it, the context) alive across `ibv_destroy_ah`.
+///
+/// Unlike the other handles here there is no null placeholder: [`Self::create`]
+/// is the only constructor and it rejects a null result, so the pointer is
+/// always live.
+#[derive(Debug)]
+pub(super) struct IbvAh {
+    ah: *mut rdmaxcel_sys::ibv_ah,
+    /// Keeps the PD open until after `ibv_destroy_ah`. Never read.
+    _pd: Arc<IbvPd>,
+}
+
+// SAFETY: the only raw member is the `ibv_ah` pointer. The ibverbs AH it names is
+// not thread-affine — it may be created on one thread and used or destroyed on
+// another (`Send`) — and `IbvAh` exposes no operation that mutates the AH through
+// a shared `&` (`as_ptr` only hands back the pointer value), so sharing an
+// `&IbvAh` cannot race (`Sync`).
+unsafe impl Send for IbvAh {}
+// SAFETY: as for `Send` above.
+unsafe impl Sync for IbvAh {}
+
+impl IbvAh {
+    /// Creates an address handle on `pd` from `attr`.
+    ///
+    /// # Safety
+    ///
+    /// `pd` must hold a live protection domain; a null PD yields `Err`.
+    pub(super) unsafe fn create(
+        pd: Arc<IbvPd>,
+        attr: &mut rdmaxcel_sys::ibv_ah_attr,
+    ) -> Result<Self, anyhow::Error> {
+        if pd.as_ptr().is_null() {
+            anyhow::bail!("cannot create an address handle on a null protection domain");
+        }
+        // SAFETY: `pd.as_ptr()` is non-null (checked above) and, per this
+        // function's contract, a live protection domain; `attr` is a valid,
+        // fully initialized `ibv_ah_attr` that outlives the call.
+        // `ibv_create_ah` returns null on failure.
+        let ah = unsafe { rdmaxcel_sys::ibv_create_ah(pd.as_ptr(), attr) };
+        if ah.is_null() {
+            anyhow::bail!(
+                "failed to create address handle: {}",
+                Error::last_os_error()
+            );
+        }
+        Ok(Self { ah, _pd: pd })
+    }
+
+    /// The raw `ibv_ah`, always live.
+    pub(super) fn as_ptr(&self) -> *mut rdmaxcel_sys::ibv_ah {
+        self.ah
+    }
+}
+
+impl Drop for IbvAh {
+    fn drop(&mut self) {
+        // SAFETY: `self.ah` was returned non-null by `ibv_create_ah` and, since
+        // `IbvAh` is not `Clone`, is destroyed exactly once. `_pd` drops only
+        // after this returns, so the PD is still alive.
+        let ret = unsafe { rdmaxcel_sys::ibv_destroy_ah(self.ah) };
+        if ret != 0 {
+            tracing::error!(
+                "failed to destroy address handle {:p}: error code {}",
+                self.ah,
+                ret
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1668,6 +1772,7 @@ mod tests {
                 ports,
                 max_qp: 0,
                 max_cq: 0,
+                max_cqe: 0,
                 max_mr: 0,
                 max_pd: 0,
                 max_qp_wr: 0,

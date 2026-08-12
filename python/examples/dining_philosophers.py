@@ -189,26 +189,13 @@ async def async_main(
         state = job.state(cached_path=None)
         host = state.hosts
 
-        admin_url = state.admin_url
-        assert admin_url is not None
-        mtls_flags = (
-            "--cacert /var/facebook/rootcanal/ca.pem "
-            "--cert /var/facebook/x509_identities/server.pem "
-            "--key /var/facebook/x509_identities/server.pem "
-            if admin_url.startswith("https")
-            else ""
-        )
-        print(f"\nMesh admin server listening on {admin_url}")
-        print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
-        print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
-        print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
-        print(
-            f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
-        )
         print("\nPress Ctrl+C to stop.\n", flush=True)
 
         # Spawn philosopher processes and actors.
-        procs = host.spawn_procs(per_host={"replica": NUM_PHILOSOPHERS})
+        procs = host.spawn_procs(
+            name="philosopher",
+            per_host={"replica": NUM_PHILOSOPHERS},
+        )
 
         # Spawn waiter on its own proc mesh so it appears in the dashboard hierarchy.
         waiter_proc = host.spawn_procs(name="waiter")

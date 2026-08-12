@@ -17,13 +17,13 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use hyperactor::Actor;
+use hyperactor::ActorEnvironment;
 use hyperactor::ActorRef;
 use hyperactor::Context;
 use hyperactor::Handler;
 use hyperactor::OncePortRef;
 use hyperactor::RefClient;
 use hyperactor::RemoteSpawn;
-use hyperactor_config::Flattrs;
 
 use crate::RdmaManagerActor;
 use crate::RdmaManagerMessageClient;
@@ -143,7 +143,7 @@ impl CudaAllocation {
             let mut prop: rdmaxcel_sys::CUmemAllocationProp = std::mem::zeroed();
             prop.type_ = rdmaxcel_sys::CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type_ = rdmaxcel_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = self.inner.device;
+            rdmaxcel_sys::rdmaxcel_set_mem_location_id(&mut prop.location, self.inner.device);
             prop.allocFlags.gpuDirectRDMACapable = 1;
             prop.requestedHandleTypes = rdmaxcel_sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
@@ -167,7 +167,7 @@ impl CudaAllocation {
 
             let mut access: rdmaxcel_sys::CUmemAccessDesc = std::mem::zeroed();
             access.location.type_ = rdmaxcel_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-            access.location.id = self.inner.device;
+            rdmaxcel_sys::rdmaxcel_set_mem_location_id(&mut access.location, self.inner.device);
             access.flags = rdmaxcel_sys::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             let r = rdmaxcel_sys::rdmaxcel_cuMemSetAccess(
                 chunk_addr as rdmaxcel_sys::CUdeviceptr,
@@ -195,18 +195,20 @@ impl CudaAllocation {
     /// `[ptr + offset, ptr + offset + size)` of this allocation. The handle
     /// keeps the whole allocation mapped for its lifetime.
     ///
-    /// Panics if the sub-range does not fit within the currently mapped extent.
+    /// Panics if the sub-range does not fit within the currently mapped extent,
+    /// or if the CUDA driver will not name the device that owns the allocation.
     pub fn keepalive_slice(&self, offset: usize, size: usize) -> KeepaliveLocalMemory {
         let mapped = self.size();
         assert!(
             offset.checked_add(size).is_some_and(|end| end <= mapped),
             "slice [0x{offset:x}, 0x{offset:x}+{size}) exceeds mapped allocation size {mapped}",
         );
-        KeepaliveLocalMemory::new(Arc::new(CudaAllocationSlice {
+        KeepaliveLocalMemory::try_new(Arc::new(CudaAllocationSlice {
             alloc: self.clone(),
             offset,
             size,
         }))
+        .expect("this allocation's own device should be resolvable")
     }
 
     /// Try to free the backing CUDA memory. Returns `true` if the
@@ -317,7 +319,7 @@ impl CudaAllocator {
             let mut prop: rdmaxcel_sys::CUmemAllocationProp = std::mem::zeroed();
             prop.type_ = rdmaxcel_sys::CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type_ = rdmaxcel_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = device;
+            rdmaxcel_sys::rdmaxcel_set_mem_location_id(&mut prop.location, device);
             prop.allocFlags.gpuDirectRDMACapable = 1;
             prop.requestedHandleTypes = rdmaxcel_sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
@@ -365,7 +367,7 @@ impl CudaAllocator {
 
             let mut access: rdmaxcel_sys::CUmemAccessDesc = std::mem::zeroed();
             access.location.type_ = rdmaxcel_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-            access.location.id = device;
+            rdmaxcel_sys::rdmaxcel_set_mem_location_id(&mut access.location, device);
             access.flags = rdmaxcel_sys::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             let r = rdmaxcel_sys::rdmaxcel_cuMemSetAccess(dptr, padded_initial, &access, 1);
             if r != rdmaxcel_sys::CUDA_SUCCESS {
@@ -437,10 +439,11 @@ impl CudaAllocator {
 }
 
 /// Number of CUDA devices the driver can use, or 0 on failure. Initializes
-/// CUDA (loading the driver if needed) and queries the driver directly, so it
-/// honors `CUDA_VISIBLE_DEVICES` — unlike
-/// [`crate::backend::ibverbs::device_selection::cuda_device_count`], which
-/// counts the kernel-visible GPUs without initializing CUDA.
+/// CUDA, loading the driver if needed — unlike
+/// [`crate::device_selection::cuda_device_count`], which adopts an
+/// already-resident driver and errors when there is none. Tests that reach
+/// device selection call this first so that ranking against a CUDA ordinal has
+/// a driver to ask.
 #[cfg(test)]
 pub(crate) fn cuda_device_count() -> i32 {
     // SAFETY: FFI to the CUDA driver. rdmaxcel only adopts an already-loaded
@@ -503,7 +506,7 @@ impl Actor for SenderActor {}
 impl RemoteSpawn for SenderActor {
     type Params = i32;
 
-    async fn new(device_id: i32, _env: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(device_id: i32, _env: &ActorEnvironment) -> Result<Self, anyhow::Error> {
         register_cuda_segment_scanner(Arc::new(cuda_allocator_segments));
         Ok(Self {
             device: device_id,
@@ -657,7 +660,7 @@ impl Actor for ReceiverActor {}
 impl RemoteSpawn for ReceiverActor {
     type Params = ();
 
-    async fn new((): (), _env: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new((): (), _env: &ActorEnvironment) -> Result<Self, anyhow::Error> {
         Ok(Self)
     }
 }
@@ -708,7 +711,7 @@ impl ReceiverMessageHandler for ReceiverActor {
         // unwritten destination is distinguishable from a successful
         // read.
         let buf: Box<[u8]> = vec![!expected_pattern; size].into_boxed_slice();
-        let local = KeepaliveLocalMemory::new(Arc::new(buf));
+        let local = KeepaliveLocalMemory::try_new(Arc::new(buf))?;
 
         let read_result = remote
             .read_into_local(cx, local.clone(), timeout_secs)
@@ -745,7 +748,7 @@ impl ReceiverMessageHandler for ReceiverActor {
         timeout_secs: u64,
     ) -> Result<Result<(), String>, anyhow::Error> {
         let buf: Box<[u8]> = vec![pattern; size].into_boxed_slice();
-        let local = KeepaliveLocalMemory::new(Arc::new(buf));
+        let local = KeepaliveLocalMemory::try_new(Arc::new(buf))?;
 
         let result = remote
             .write_from_local(cx, local, timeout_secs)

@@ -17,13 +17,13 @@ use async_trait::async_trait;
 use clap::Parser;
 use hyperactor as reference;
 use hyperactor::Actor;
+use hyperactor::ActorEnvironment;
 use hyperactor::Context;
 use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
 use hyperactor::RemoteSpawn;
 use hyperactor::context;
-use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::ActorMeshRef;
 use hyperactor_mesh::casting::CastInfo;
@@ -103,7 +103,10 @@ impl Actor for PhilosopherActor {}
 impl RemoteSpawn for PhilosopherActor {
     type Params = PhilosopherActorParams;
 
-    async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(
+        params: Self::Params,
+        _environment: &ActorEnvironment,
+    ) -> Result<Self, anyhow::Error> {
         Ok(Self {
             chopsticks: (ChopstickStatus::None, ChopstickStatus::None),
             rank: 0, // will be set upon dining start
@@ -270,30 +273,6 @@ async fn main() -> Result<ExitCode> {
         .await?
         .addr
         .ok_or_else(|| anyhow::anyhow!("mesh admin did not report an address"))?;
-    let mtls_flags = if mesh_admin_url.starts_with("https") {
-        "--cacert /var/facebook/rootcanal/ca.pem \
-         --cert /var/facebook/x509_identities/server.pem \
-         --key /var/facebook/x509_identities/server.pem "
-    } else {
-        ""
-    };
-    println!("Mesh admin server listening on {}", mesh_admin_url);
-    println!(
-        "  - Root node:     curl {}{}/v1/root",
-        mtls_flags, mesh_admin_url
-    );
-    println!(
-        "  - Mesh tree:     curl {}{}/v1/tree",
-        mtls_flags, mesh_admin_url
-    );
-    println!(
-        "  - API docs:      curl {}{}/SKILL.md",
-        mtls_flags, mesh_admin_url
-    );
-    println!(
-        "  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {}\n                   cargo run -p hyperactor_mesh_admin_tui_lib --bin hyperactor_mesh_admin_tui -- --addr {}",
-        mesh_admin_url, mesh_admin_url
-    );
     println!(
         "  - Diagnose:      cargo run -p hyperactor_mesh_admin_tui_lib --bin hyperactor_mesh_admin_tui -- --addr {} --diagnose",
         mesh_admin_url

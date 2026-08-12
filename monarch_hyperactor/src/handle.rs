@@ -52,9 +52,13 @@
 //!   and every acquisition goes through `monarch_with_gil{,_blocking}`. Enforced
 //!   by the crate's `#![deny(clippy::disallowed_methods)]` ban on raw
 //!   `Python::with_gil`/`attach` -- a hard compile error, not a `debug_assert`.
-//! - **HDL-6 (`WouldBlockRuntime` is `get()`'s alone).** Only `get()` raises it,
-//!   and only in a Tokio runtime context; `as_asyncio()`/`__await__` off a loop
-//!   raise the native `RuntimeError` instead.
+//! - **HDL-6 (`WouldBlockRuntime` is `get()`'s alone *among the observers*).**
+//!   Of the `Handle` observers only `get()` raises it, and only in a Tokio
+//!   runtime context; `as_asyncio()`/`__await__` off a loop raise the native
+//!   `RuntimeError` instead. The exception type itself is not private to this
+//!   module: it marks synchronous APIs that refuse to enter or block on Tokio
+//!   from an existing Tokio runtime context. The Python layer also raises it
+//!   for fresh root-client bootstrap (`monarch._src.actor.actor_mesh`).
 //! - **HDL-7 (`as_asyncio` publish).** The observer waits borrow-first (via
 //!   `wait_ready`, never `changed()`-first) and sets a result only on a
 //!   non-cancelled future, swallowing `InvalidStateError`; any `StopIteration`
@@ -139,7 +143,9 @@ pyo3::create_exception!(
     pytokio,
     WouldBlockRuntime,
     pyo3::exceptions::PyRuntimeError,
-    "raised when Handle.get() is called from a Tokio runtime context"
+    "raised when a synchronous API refuses to enter or block on Tokio from \
+     an existing Tokio runtime context -- Handle.get(), or a fresh root-client \
+     bootstrap from the Python layer"
 );
 
 /// The watch-channel mechanics behind a `Handle`.
@@ -525,10 +531,10 @@ impl PyHandle {
     /// `poll()`/`get()`/`await` still observes completion.
     #[pyo3(signature = (timeout = None))]
     fn get(slf: PyRef<'_, Self>, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
-        // HDL-6: get() is the sole WouldBlockRuntime raiser. It is the blocking
-        // API, and in a Tokio runtime context blocking would panic the runtime,
-        // so refuse unconditionally -- even a ready value -- keying the outcome
-        // to context, not producer timing.
+        // HDL-6: among the observers, get() is the sole WouldBlockRuntime
+        // raiser. It is the blocking API, and in a Tokio runtime context
+        // blocking would panic the runtime, so refuse unconditionally -- even
+        // a ready value -- keying the outcome to context, not producer timing.
         if is_tokio_thread() {
             return Err(WouldBlockRuntime::new_err(
                 "get() cannot be called from a Tokio runtime context; use poll() or as_asyncio()",
@@ -977,6 +983,62 @@ def run_two(h):
                 );
             })
             .await
+        });
+    }
+
+    // __await__ in a Tokio runtime context finds no asyncio loop to bridge to,
+    // so it surfaces asyncio's native "no running event loop" RuntimeError --
+    // NOT WouldBlockRuntime, which among the observers stays specific to get()
+    // (HDL-6). The refusal consumes nothing: the same handle still observes its
+    // value afterwards. Lives here rather than in the Python suite so the Handle
+    // contract does not depend on a PythonTask-driven test helper.
+    // Attests HDL-6, HDL-7.
+    #[test]
+    fn await_in_tokio_raises_native_and_leaves_handle_observable() {
+        ensure_python();
+        let handle = monarch_with_gil_blocking(GilSite::Test, |py| {
+            let value = 11i64.into_py_any(py).unwrap();
+            Py::new(py, PyHandle::from_value(value).unwrap()).unwrap()
+        });
+        let in_tokio = monarch_with_gil_blocking(GilSite::Test, |py| handle.clone_ref(py));
+
+        // `block_on` would poll the root future on *this* thread under an
+        // entered runtime -- `is_tokio_thread()` is true there, but it is not a
+        // worker and nested blocking is tolerated. Spawn instead, so the
+        // assertion genuinely runs on a runtime worker, and join from here.
+        let joined = get_tokio_runtime().spawn(async move {
+            assert!(
+                is_tokio_thread(),
+                "the oracle must observe from a runtime worker"
+            );
+            monarch_with_gil(GilSite::Test, |py| {
+                let err = PyHandle::__await__(in_tokio.borrow(py), py).unwrap_err();
+                assert!(
+                    !err.is_instance_of::<WouldBlockRuntime>(py),
+                    "__await__ must not raise WouldBlockRuntime; among the observers that is get()'s alone"
+                );
+                assert!(
+                    err.is_instance_of::<PyRuntimeError>(py),
+                    "__await__ off an asyncio loop should raise the native RuntimeError"
+                );
+                assert!(
+                    err.to_string().contains("no running event loop"),
+                    "expected asyncio's native message, got {err}"
+                );
+            })
+            .await
+        });
+        get_tokio_runtime()
+            .block_on(joined)
+            .expect("the spawned oracle panicked");
+
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            let value = PyHandle::get(handle.borrow(py), py, None).unwrap();
+            assert_eq!(
+                value.extract::<i64>(py).unwrap(),
+                11,
+                "a refused __await__ must not consume the handle"
+            );
         });
     }
 

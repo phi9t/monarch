@@ -24,6 +24,7 @@ from unittest.mock import patch
 import cloudpickle
 import pytest
 from isolate_in_subprocess import isolate_in_subprocess
+from monarch._rust_bindings.monarch_hyperactor.proc import ProcId, Uid
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask
 from monarch._rust_bindings.monarch_hyperactor.shape import Point, Shape, Slice
 from monarch._src.actor.actor_mesh import _client_context, Actor, attach, context
@@ -34,6 +35,7 @@ from monarch._src.actor.pickle import flatten, unflatten
 from monarch._src.actor.proc_mesh import get_or_spawn_controller
 from monarch._src.job.job import ProcessState
 from monarch._src.job.process import ProcessJob
+from monarch._src.job.service_identity import new_service_proc_id, service_proc_addr
 from monarch.config import configured
 from scoped_state import scoped_state
 
@@ -636,6 +638,18 @@ class CudaVisibleDevicesActor(Actor):
         return os.environ.get("CUDA_VISIBLE_DEVICES", "")
 
 
+def test_get_bootstrap_args_includes_parent_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monarch._src.actor.proc_mesh import _get_bootstrap_args
+
+    monkeypatch.setenv("MONARCH_BOOTSTRAP_ENV_TEST", "present")
+
+    _, _, env = _get_bootstrap_args()
+
+    assert env["MONARCH_BOOTSTRAP_ENV_TEST"] == "present"
+
+
 @pytest.mark.timeout(60)
 @isolate_in_subprocess
 def test_spawn_procs_with_bootstrap_command() -> None:
@@ -714,9 +728,11 @@ class DuplexProcessJob(ProcessJob):
         self,
         meshes: Optional[Dict[str, int]] = None,
         env: Optional[Dict[str, str]] = None,
+        service_proc_id: Optional[ProcId] = None,
     ) -> None:
         super().__init__(meshes or {"hosts": 1}, env)
         self._duplex_addr: Optional[str] = None
+        self._service_proc_id = service_proc_id
 
     def _create(self, client_script: Optional[str]) -> None:
         if client_script is not None:
@@ -728,6 +744,8 @@ class DuplexProcessJob(ProcessJob):
             for i in range(count):
                 host_key = f"{mesh_name}_{i}"
                 addr = f"ipc://{self._tmpdir}/{host_key}"
+                service_proc_id = self._service_proc_id or new_service_proc_id()
+                proc_addr = service_proc_addr(addr, service_proc_id)
                 worker_env = {**os.environ, "HYPERACTOR_PROCESS_NAME": host_key}
                 if self._env is not None:
                     worker_env.update(self._env)
@@ -736,11 +754,11 @@ class DuplexProcessJob(ProcessJob):
                     sys.executable,
                     "-c",
                     "from monarch.actor import run_worker_loop_forever; "
-                    f'run_worker_loop_forever(address="{addr}", '
+                    f"run_worker_loop_forever(address={proc_addr!r}, "
                     'ca="trust_all_connections")',
                 ]
                 proc = subprocess.Popen(cmd, env=worker_env, start_new_session=True)
-                self._host_to_pid[host_key] = ProcessState(proc.pid, addr)
+                self._host_to_pid[host_key] = ProcessState(proc.pid, proc_addr)
 
         # Wait for the first worker's frontend socket to appear.
         # The duplex server is now on the same address as the frontend.
@@ -782,6 +800,10 @@ class EchoActor(Actor):
     @endpoint
     async def echo(self, msg: str) -> str:
         return msg
+
+    @endpoint
+    async def getenv(self, name: str) -> Optional[str]:
+        return os.environ.get(name)
 
 
 @pytest.mark.timeout(120)
@@ -858,12 +880,35 @@ def test_client_attach_addr_this_host_and_this_proc() -> None:
         assert proc is not None
         host = this_host()
         assert host is not None
-        assert host is proc.host_mesh
+        assert host.region == proc.host_mesh.region
 
         # Verify the meshes are usable by spawning an actor.
         am = proc.spawn("echo2", EchoActor)
         result = am.echo.call_one("ping").get()
         assert result == "ping"
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
+def test_client_attach_service_singleton_spawns_on_client_host() -> None:
+    worker_marker = "MONARCH_TEST_ATTACHED_WORKER"
+    assert worker_marker not in os.environ
+    job = DuplexProcessJob(
+        env={worker_marker: "1"},
+        service_proc_id=ProcId.from_string("service"),
+    )
+    job.apply()
+    attach(job.duplex_addr)
+    with scoped_state(job, cached_path=None):
+        context()
+
+        actor = (
+            this_host()
+            .spawn_procs(per_host={"local": 1})
+            .spawn("local_origin", EchoActor)
+        )
+
+        assert actor.getenv.call_one(worker_marker).get() is None
 
 
 class RelayActor(Actor):
@@ -875,6 +920,28 @@ class RelayActor(Actor):
     @endpoint
     async def relay(self, msg: str) -> str:
         return await self._target.echo.call_one(msg)
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
+def test_client_attach_service_instance_spawns_on_client_host() -> None:
+    worker_marker = "MONARCH_TEST_ATTACHED_WORKER"
+    assert worker_marker not in os.environ
+    job = DuplexProcessJob(
+        env={worker_marker: "1"},
+        service_proc_id=ProcId(Uid.instance("service")),
+    )
+    job.apply()
+    attach(job.duplex_addr)
+    with scoped_state(job, cached_path=None):
+        context()
+
+        local_echo = (
+            this_host()
+            .spawn_procs(per_host={"local": 1})
+            .spawn("local_echo", EchoActor)
+        )
+        assert local_echo.getenv.call_one(worker_marker).get() is None
 
 
 @pytest.mark.timeout(120)

@@ -370,6 +370,7 @@ impl TcpManagerActor {
 #[async_trait]
 impl Actor for TcpManagerActor {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
+        this.set_system();
         let owner = this.parent_handle().ok_or_else(|| {
             anyhow::anyhow!("RdmaManagerActor not found as parent of TcpManagerActor")
         })?;
@@ -1014,11 +1015,11 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hyperactor::ActorEnvironment;
     use hyperactor::ActorHandle;
     use hyperactor::Proc;
     use hyperactor::RemoteSpawn;
     use hyperactor::channel::ChannelAddr;
-    use hyperactor_config::Flattrs;
 
     use super::TcpBackend;
     use super::TcpManagerActor;
@@ -1068,7 +1069,7 @@ mod tests {
             )?;
             let instance = proc.client("client");
 
-            let rdma_actor = RdmaManagerActor::new(None, Flattrs::default()).await?;
+            let rdma_actor = RdmaManagerActor::new(None, &ActorEnvironment::default()).await?;
             let rdma_handle = proc.spawn(rdma_actor);
 
             let tcp_ref = rdma_handle.get_tcp_actor_ref(&instance).await?;
@@ -1120,7 +1121,7 @@ mod tests {
             buffer_size: usize,
         ) -> anyhow::Result<(KeepaliveLocalMemory, crate::RdmaRemoteBuffer)> {
             let cpu_buf = vec![0u8; buffer_size].into_boxed_slice();
-            let local_memory = KeepaliveLocalMemory::new(Arc::new(cpu_buf));
+            let local_memory = KeepaliveLocalMemory::try_new(Arc::new(cpu_buf))?;
             let rdma_remote_buf = rdma_handle
                 .request_buffer(instance, local_memory.clone())
                 .await?;
@@ -1638,7 +1639,7 @@ mod tests {
             )?;
             let instance = proc.client("client");
 
-            let rdma_actor = RdmaManagerActor::new(None, Flattrs::default()).await?;
+            let rdma_actor = RdmaManagerActor::new(None, &ActorEnvironment::default()).await?;
             let rdma_handle = proc.spawn(rdma_actor);
 
             let tcp_ref = rdma_handle.get_tcp_actor_ref(&instance).await?;
@@ -1649,7 +1650,7 @@ mod tests {
             );
 
             let alloc = CudaAllocator::get().allocate(device, buffer_size, buffer_size);
-            let local_memory = KeepaliveLocalMemory::new(Arc::new(alloc));
+            let local_memory = KeepaliveLocalMemory::try_new(Arc::new(alloc))?;
             let rdma_remote_buf = rdma_handle
                 .request_buffer(&instance, local_memory.clone())
                 .await?;

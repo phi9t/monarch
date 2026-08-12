@@ -57,6 +57,7 @@ mod config;
 pub mod in_memory_reader;
 #[cfg(all(fbcode_build, target_os = "linux"))]
 mod meta;
+mod metrics_table;
 mod otel;
 pub(crate) mod otlp;
 mod pool;
@@ -140,7 +141,7 @@ pub fn username() -> String {
         env::Env::Mast => {
             std::env::var("MAST_JOB_OWNER_UNIXNAME").unwrap_or_else(|_| "mast_owner".to_string())
         }
-        _ => whoami::username(),
+        _ => whoami::username().unwrap_or_else(|_| "unknown".to_owned()),
     }
 }
 
@@ -161,11 +162,10 @@ pub fn log_file_path(
         .unwrap_or_default();
     match env {
         env::Env::Local | env::Env::MastEmulator => {
-            let username = if whoami::username().is_empty() {
-                "monarch".to_string()
-            } else {
-                whoami::username()
-            };
+            let mut username = whoami::username().unwrap_or_else(|_| "unknown".to_owned());
+            if username.is_empty() {
+                username.push_str("monarch");
+            }
             Ok((
                 format!("/tmp/{}", username),
                 format!("monarch_log{}", suffix),

@@ -110,6 +110,55 @@ def test_rdma_ibverbs_target_round_trip_and_propagation() -> None:
     assert get_global_config()["rdma_ibverbs_target"] == ""
 
 
+def test_rdma_peer_device_affinity_round_trip() -> None:
+    assert get_global_config()["rdma_peer_device_affinity"] == ""
+
+    for policy in ("any", "match_name", "groups:mlx5_0,mlx5_1|mlx5_2,mlx5_3"):
+        with configured(rdma_peer_device_affinity=policy) as config:
+            assert config["rdma_peer_device_affinity"] == policy
+
+    assert get_global_config()["rdma_peer_device_affinity"] == ""
+
+
+def test_rdma_max_nics_per_buffer_round_trip() -> None:
+    assert get_global_config()["rdma_max_nics_per_buffer"] == 1
+
+    with configured(rdma_max_nics_per_buffer=4) as config:
+        assert config["rdma_max_nics_per_buffer"] == 4
+
+    # None means no limit: every equally good NIC serves the buffer.
+    with configured(rdma_max_nics_per_buffer=None) as config:
+        assert config["rdma_max_nics_per_buffer"] is None
+
+    assert get_global_config()["rdma_max_nics_per_buffer"] == 1
+
+    # The attribute is non-zero, so zero is rejected rather than silently
+    # meaning "no NIC".
+    with pytest.raises(ValueError):
+        with configured(rdma_max_nics_per_buffer=0):
+            pass
+
+
+def test_rdma_runtime_worker_threads_round_trip() -> None:
+    assert get_global_config()["rdma_runtime_worker_threads"] == 16
+
+    with configured(rdma_runtime_worker_threads=32) as config:
+        assert config["rdma_runtime_worker_threads"] == 32
+
+    assert get_global_config()["rdma_runtime_worker_threads"] == 16
+
+
+def test_pyspy_bin_round_trip() -> None:
+    # Empty means the mesh admin py-spy path falls back to PATH.
+    assert get_global_config()["pyspy_bin"] == ""
+
+    path = "/tmp/py-spy"
+    with configured(pyspy_bin=path) as config:
+        assert config["pyspy_bin"] == path
+
+    assert get_global_config()["pyspy_bin"] == ""
+
+
 @isolate_in_subprocess
 def test_codec_max_frame_length_exceeds_default() -> None:
     """Test that sending 4 chunks of 256KiB fails with a 1 MiB limit."""
@@ -321,8 +370,6 @@ def test_integer_params(param_name, test_value, default_value):
         # Logging config
         ("force_file_log", False),
         ("prefix_with_rank", True),
-        # Actor queue dispatch
-        ("actor_queue_dispatch", True),
     ],
 )
 def test_boolean_params(param_name, default_value):
@@ -428,8 +475,6 @@ def test_all_params_together():
         # Host mesh timeouts
         proc_stop_max_idle="45s",
         get_proc_state_max_idle="90s",
-        # Actor queue dispatch
-        actor_queue_dispatch=False,
         # Mesh attach
         mesh_attach_config_timeout="20s",
         # Mesh admin
@@ -461,7 +506,6 @@ def test_all_params_together():
         assert config["supervision_watchdog_timeout"] == "1m 30s"
         assert config["proc_stop_max_idle"] == "45s"
         assert config["get_proc_state_max_idle"] == "1m 30s"
-        assert config["actor_queue_dispatch"] is False
         assert config["mesh_attach_config_timeout"] == "20s"
         assert config["mesh_admin_addr"] == "[::]:8080"
 
@@ -492,7 +536,6 @@ def test_all_params_together():
     assert config["supervision_watchdog_timeout"] == "2m"
     assert config["proc_stop_max_idle"] == "30s"
     assert config["get_proc_state_max_idle"] == "1m"
-    assert config["actor_queue_dispatch"] is True
     assert config["mesh_attach_config_timeout"] == "1m"
     assert config["mesh_admin_addr"] == "[::]:1729"
 

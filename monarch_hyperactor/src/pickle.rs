@@ -51,6 +51,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use hyperactor::Instance;
 use monarch_types::py_global;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
@@ -60,9 +61,11 @@ use serde_multipart::Part;
 
 use crate::actor::MeshRef;
 use crate::actor::PyMeshRef;
+use crate::actor::PythonActor;
 use crate::actor::PythonMessage;
 use crate::actor::PythonMessageKind;
 use crate::buffers::Buffer;
+use crate::context::PyInstance;
 use crate::pytokio::PyPythonTask;
 use crate::pytokio::PyShared;
 use crate::runtime::GilSite;
@@ -151,6 +154,71 @@ impl Drop for ActivePicklingGuard {
     }
 }
 
+thread_local! {
+    /// The actor that is *receiving* the payload currently being decoded.
+    ///
+    /// A reply is decoded on a Tokio worker with no Monarch context, so
+    /// `Port._reconstruct_port` cannot recover the receiver from `context()`
+    /// without bootstrapping a client in a worker process. The eager decoders
+    /// install the caller instance they already hold here for the duration of
+    /// the decode.
+    ///
+    /// Deliberately a sibling of `ACTIVE_PICKLING_STATE` rather than a field
+    /// on it: the receiver is decode context, not pickling payload state, and
+    /// must never reach `PicklingStateInner` or the serialized bytes.
+    static RECEIVER_INSTANCE: RefCell<Option<Instance<PythonActor>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII guard installing the receiver for the current decode, restoring the
+/// previous value on drop -- on success, on error, and on panic.
+///
+/// Private: the only way to install a receiver is
+/// [`PicklingState::unpickle_with_receiver`], which cannot span an `await`.
+struct ReceiverInstanceGuard {
+    previous: Option<Instance<PythonActor>>,
+}
+
+impl ReceiverInstanceGuard {
+    /// Install `instance` as the receiver, saving any existing one.
+    ///
+    /// Takes a reference and clones internally so callers keep ownership of
+    /// the instance they are already holding across the collector.
+    fn enter(instance: &Instance<PythonActor>) -> Self {
+        let previous =
+            RECEIVER_INSTANCE.with(|cell| cell.borrow_mut().replace(instance.clone_for_py()));
+        Self { previous }
+    }
+}
+
+impl Drop for ReceiverInstanceGuard {
+    fn drop(&mut self) {
+        RECEIVER_INSTANCE.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Clone of the receiver installed for the current decode, if any.
+///
+/// Clones rather than consumes: one payload may carry several `Port`s and each
+/// must reconstruct against the same receiver.
+fn current_receiver_instance_raw() -> Option<Instance<PythonActor>> {
+    RECEIVER_INSTANCE.with(|cell| cell.borrow().as_ref().map(|i| i.clone_for_py()))
+}
+
+/// The receiver for the decode in progress, or `None` outside one.
+///
+/// `Port._reconstruct_port` prefers this and falls back to `context()`, which
+/// keeps reconstruction outside an endpoint reply decode unchanged.
+#[pyfunction]
+fn _current_receiver_instance() -> Option<PyInstance> {
+    // Clone out of the `RefCell` before building the Python wrapper: the
+    // conversion allocates a Python object, and holding the borrow across that
+    // risks a re-entrant borrow.
+    current_receiver_instance_raw().map(PyInstance::from)
+}
+
 /// State maintained during active pickling/unpickling operations.
 ///
 /// This is the thread-local state used while cloudpickle is running.
@@ -213,6 +281,11 @@ impl PicklingStateInner {
     /// Take the Part (pickled bytes) from this inner state.
     pub fn take_buffer(self) -> Part {
         self.buffer
+    }
+
+    /// The size in bytes of the pickled payload.
+    pub fn payload_len(&self) -> usize {
+        self.buffer.len()
     }
 }
 
@@ -356,6 +429,21 @@ impl PicklingState {
 }
 
 impl PicklingState {
+    /// [`unpickle`](Self::unpickle) with `instance` installed as the receiver.
+    ///
+    /// Rust-only and deliberately unexposed to Python: the guard must not
+    /// outlive the synchronous decode. Every caller is the body of a
+    /// `monarch_with_gil_blocking` closure, so the guard never spans an
+    /// `await` and the thread-local cannot leak to another task.
+    pub(crate) fn unpickle_with_receiver(
+        &mut self,
+        py: Python<'_>,
+        instance: &Instance<PythonActor>,
+    ) -> PyResult<Py<PyAny>> {
+        let _guard = ReceiverInstanceGuard::enter(instance);
+        self.unpickle(py)
+    }
+
     /// Fill the reserved mesh slots from their pending handles, producing a
     /// PicklingState whose out-of-band `refs` table is fully populated.
     ///
@@ -428,6 +516,15 @@ impl PendingMessage {
             kind: std::mem::take(&mut self.kind),
             state: PicklingState { inner: Some(inner) },
         })
+    }
+
+    /// The size in bytes of the pickled payload. Out-of-band mesh references
+    /// are carried beside these bytes, so they do not count towards it.
+    pub(crate) fn payload_len(&self) -> usize {
+        self.state
+            .inner_ref()
+            .expect("should be called before the message is resolved")
+            .payload_len()
     }
 
     fn into_python_message(mut self) -> PyResult<PythonMessage> {
@@ -783,6 +880,7 @@ pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(pop_tensor_engine_reference, module)?)?;
     module.add_function(wrap_pyfunction!(pop_mesh_reference, module)?)?;
+    module.add_function(wrap_pyfunction!(_current_receiver_instance, module)?)?;
     module.add_function(wrap_pyfunction!(reserve_mesh_reference, module)?)?;
     module.add_function(wrap_pyfunction!(_get_pending_reserve_count, module)?)?;
     module.add_function(wrap_pyfunction!(_reset_pending_reserve_count, module)?)?;
@@ -804,25 +902,76 @@ mod tests {
     use hyperactor_mesh::proc_agent::ProcAgent;
     use hyperactor_mesh::proc_mesh::ProcMeshRef;
     use hyperactor_mesh::proc_mesh::ProcRef;
+    use pyo3::IntoPyObjectExt;
+    use pyo3::PyTypeInfo;
 
     use super::*;
+    use crate::proc_mesh::PyProcMesh;
 
-    fn resolved_proc_mesh_ref() -> MeshRef {
+    /// A distinct resolved proc mesh per `(instance, mesh)` pair, so a test can
+    /// tell one filled slot from another.
+    fn proc_mesh_ref(instance: u64, mesh: &str) -> ProcMeshRef {
         let proc_id = ProcId::new(
-            Uid::Instance(1, None),
+            Uid::Instance(instance, None),
             Some(Label::new("local").expect("test label should be valid")),
         );
         let proc_addr = ProcAddr::new(proc_id, ChannelAddr::Local(1).into());
         let agent: ActorRef<ProcAgent> =
             ActorRef::attest(proc_addr.actor_addr(PROC_AGENT_ACTOR_NAME));
         let proc_ref = ProcRef::new(proc_addr, 0, agent);
-        MeshRef::Proc(Box::new(
-            ProcMeshRef::new_singleton(
-                ProcMeshId::singleton(Label::new("mesh").expect("test label should be valid")),
-                proc_ref,
-            )
-            .expect("test proc mesh should be valid"),
-        ))
+        ProcMeshRef::new_singleton(
+            ProcMeshId::singleton(Label::new(mesh).expect("test label should be valid")),
+            proc_ref,
+        )
+        .expect("test proc mesh should be valid")
+    }
+
+    fn resolved_proc_mesh_ref() -> MeshRef {
+        MeshRef::Proc(Box::new(proc_mesh_ref(1, "mesh")))
+    }
+
+    /// A `Shared` that is already completed with `value`.
+    ///
+    /// Built through the Python classmethod so nothing is spawned: the handle
+    /// is finished before any test looks at it, which keeps slot filling free
+    /// of scheduling order.
+    fn completed_shared(py: Python<'_>, value: Py<PyAny>) -> Py<PyShared> {
+        py.get_type::<PyShared>()
+            .call_method1("from_value", (value,))
+            .expect("Shared.from_value should accept any object")
+            .extract()
+            .expect("Shared.from_value should return a Shared")
+    }
+
+    /// The Python object a resolved pending mesh hands back: the wrapper type
+    /// the sender-side fill knows how to turn into a `MeshRef`.
+    fn mesh_value(py: Python<'_>, mesh: &ProcMeshRef) -> Py<PyAny> {
+        Py::new(py, PyProcMesh::new_ref(mesh.clone()))
+            .expect("PyProcMesh should construct")
+            .into_any()
+    }
+
+    /// `Result::expect_err` for a success type that is not `Debug`.
+    fn expect_error(result: PyResult<PyPythonTask>, context: &str) -> PyErr {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+
+    fn pickling_state(
+        buffer: Vec<u8>,
+        mesh_references: Vec<Option<MeshRef>>,
+        pending_mesh_fills: Vec<(usize, Py<PyShared>)>,
+    ) -> PicklingState {
+        PicklingState {
+            inner: Some(PicklingStateInner {
+                buffer: Part::from(buffer),
+                tensor_engine_references: VecDeque::new(),
+                mesh_references: mesh_references.into(),
+                pending_mesh_fills,
+            }),
+        }
     }
 
     fn pending_message(
@@ -841,6 +990,90 @@ mod tests {
                 }),
             },
         )
+    }
+
+    /// `payload_len` reports the pickled bytes only, so an out-of-band ref does
+    /// not change it: the refs table rides beside the payload, not inside it.
+    #[test]
+    fn payload_len_counts_pickled_bytes_only() {
+        let kind = PythonMessageKind::Result { rank: Some(7) };
+        let buffer = vec![0, 1, 2, 3, 127, 128, 254, 255];
+
+        for refs in [Vec::new(), vec![resolved_proc_mesh_ref()]] {
+            assert_eq!(
+                pending_message(kind.clone(), buffer.clone(), refs).payload_len(),
+                8,
+                "payload_len should be the length of the pickled buffer"
+            );
+        }
+    }
+
+    /// The receiver guard's three contracts: a lookup clones rather than
+    /// consumes, a nested guard overrides and then restores, and a guard
+    /// dropped by an unwinding error restores too.
+    // `#[tokio::test]` because `Proc::direct` needs a runtime. The body has no
+    // await, so it stays on one thread and the thread-local is observed there.
+    #[tokio::test]
+    async fn receiver_instance_guard_clones_nests_and_restores() {
+        use std::panic::AssertUnwindSafe;
+
+        use hyperactor::Proc;
+        use hyperactor::channel::ChannelTransport;
+
+        fn instance(name: &str) -> Instance<PythonActor> {
+            Proc::direct(ChannelTransport::Unix.any(), format!("{name}_proc"))
+                .unwrap()
+                .actor_instance::<PythonActor>(name)
+                .unwrap()
+                .instance
+        }
+
+        let outer = instance("outer");
+        let inner = instance("inner");
+        let outer_id = outer.self_addr().clone();
+        let inner_id = inner.self_addr().clone();
+
+        assert!(current_receiver_instance_raw().is_none(), "clean to start");
+
+        {
+            let _g = ReceiverInstanceGuard::enter(&outer);
+
+            // Non-consuming: a payload with several Ports looks up repeatedly.
+            for _ in 0..3 {
+                let got = current_receiver_instance_raw().expect("receiver installed");
+                assert_eq!(got.self_addr(), &outer_id);
+            }
+
+            {
+                let _nested = ReceiverInstanceGuard::enter(&inner);
+                assert_eq!(
+                    current_receiver_instance_raw().unwrap().self_addr(),
+                    &inner_id,
+                );
+            }
+            assert_eq!(
+                current_receiver_instance_raw().unwrap().self_addr(),
+                &outer_id,
+                "nested guard must restore its parent",
+            );
+
+            // Drop on unwind restores the parent, not `None`.
+            let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _failing = ReceiverInstanceGuard::enter(&inner);
+                panic!("decode blew up");
+            }));
+            assert!(unwound.is_err());
+            assert_eq!(
+                current_receiver_instance_raw().unwrap().self_addr(),
+                &outer_id,
+                "a guard dropped while unwinding must restore",
+            );
+        }
+
+        assert!(
+            current_receiver_instance_raw().is_none(),
+            "outermost guard must clear the receiver",
+        );
     }
 
     #[tokio::test]
@@ -866,5 +1099,281 @@ mod tests {
                 "sync and async resolution should preserve kind, bytes, and refs"
             );
         }
+    }
+
+    /// `resolve` writes each pending mesh into the slot it reserved, leaving
+    /// the slots it did not reserve and the pickled bytes alone.
+    ///
+    /// The two pending slots are nonadjacent, with an already-resolved slot
+    /// between them, so filling them in the wrong order or appending instead of
+    /// writing in place both produce a different table.
+    #[tokio::test]
+    async fn resolve_fills_nonadjacent_slots_in_place_without_touching_the_payload() {
+        pyo3::Python::initialize();
+
+        let first = proc_mesh_ref(11, "first");
+        let already = proc_mesh_ref(22, "already");
+        let second = proc_mesh_ref(33, "second");
+        assert_ne!(
+            first, second,
+            "the two pending meshes must be distinguishable"
+        );
+        let payload: Vec<u8> = vec![0, 1, 2, 3, 127, 128, 254, 255];
+
+        let state = monarch_with_gil_blocking(GilSite::Test, |py| {
+            Ok::<_, PyErr>(pickling_state(
+                payload.clone(),
+                vec![None, Some(MeshRef::Proc(Box::new(already.clone()))), None],
+                // Deliberately out of index order: an implementation that
+                // ignored the index and filled successive empty slots would
+                // produce the reverse table.
+                vec![
+                    (2, completed_shared(py, mesh_value(py, &second))),
+                    (0, completed_shared(py, mesh_value(py, &first))),
+                ],
+            ))
+        })
+        .expect("building the pending state should succeed");
+
+        let resolved = state.resolve().await.expect("resolution should succeed");
+        let inner = resolved
+            .inner
+            .expect("a resolved state should still hold its inner");
+
+        assert_eq!(
+            inner.mesh_references,
+            VecDeque::from(vec![
+                Some(MeshRef::Proc(Box::new(first))),
+                Some(MeshRef::Proc(Box::new(already))),
+                Some(MeshRef::Proc(Box::new(second))),
+            ]),
+            "each pending mesh must land in the slot it reserved"
+        );
+        assert_eq!(
+            &inner.take_buffer().into_bytes()[..],
+            &payload[..],
+            "resolution must not re-pickle: the payload bytes are carried through"
+        );
+    }
+
+    /// `py_resolve` consumes its source in the call and defers the fill.
+    ///
+    /// The handle resolves to a value that is not a mesh, so filling its slot
+    /// must fail. `py_resolve` returning `Ok` therefore shows the fill did not
+    /// happen during the call, and
+    /// `py_resolve_task_surfaces_the_fill_error_and_leaves_the_source_consumed`
+    /// drives the same shape and collects that failure.
+    /// `py_resolve_retains_no_waiter_on_a_pending_handle` is what covers the
+    /// stronger timing claim, that the call retains no waiter on the handle.
+    #[tokio::test]
+    async fn py_resolve_consumes_the_source_before_returning_its_task() {
+        pyo3::Python::initialize();
+
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            let not_a_mesh = 41i64.into_py_any(py)?;
+            let mut message = PendingMessage::new(
+                PythonMessageKind::Result { rank: Some(7) },
+                pickling_state(
+                    vec![1, 2, 3],
+                    vec![None],
+                    vec![(0, completed_shared(py, not_a_mesh))],
+                ),
+            );
+
+            let task = message
+                .py_resolve()
+                .expect("the fill is deferred, so construction must not perform it");
+
+            // Discarded without ever being driven: no fill runs and no
+            // `PythonMessage` is ever produced.
+            drop(task);
+
+            let second = expect_error(
+                message.py_resolve(),
+                "the source was consumed by the first call",
+            );
+            assert_eq!(
+                second.value(py).to_string(),
+                "PicklingState has already been consumed",
+                "a second resolution must report the consumed source"
+            );
+            Ok::<_, PyErr>(())
+        })
+        .expect("test body should not fail");
+    }
+
+    /// The control for the case above: the fill error the construction did not
+    /// raise surfaces when the returned task is driven, and the source stays
+    /// consumed afterwards.
+    #[tokio::test]
+    async fn py_resolve_task_surfaces_the_fill_error_and_leaves_the_source_consumed() {
+        pyo3::Python::initialize();
+
+        let (mut task, mut message) = monarch_with_gil_blocking(GilSite::Test, |py| {
+            let not_a_mesh = 41i64.into_py_any(py)?;
+            let mut message = PendingMessage::new(
+                PythonMessageKind::Result { rank: Some(7) },
+                pickling_state(
+                    vec![1, 2, 3],
+                    vec![None],
+                    vec![(0, completed_shared(py, not_a_mesh))],
+                ),
+            );
+            let task = message.py_resolve()?;
+            Ok::<_, PyErr>((task, message))
+        })
+        .expect("construction should succeed");
+
+        let error = task
+            .take_task()
+            .expect("the returned task should be takeable")
+            .await
+            .expect_err("driving the task must surface the fill failure");
+
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            assert!(
+                error
+                    .get_type(py)
+                    .is(pyo3::exceptions::PyRuntimeError::type_object(py)),
+                "the original exception type must survive the task boundary exactly, \
+                 not merely as a subclass"
+            );
+            assert_eq!(
+                error.value(py).to_string(),
+                "pending pickle did not resolve to a mesh reference",
+                "the original message must survive the task boundary"
+            );
+
+            let second = expect_error(
+                message.py_resolve(),
+                "a failed drive must not hand the source back",
+            );
+            assert_eq!(
+                second.value(py).to_string(),
+                "PicklingState has already been consumed",
+            );
+            Ok::<_, PyErr>(())
+        })
+        .expect("assertions should not fail");
+    }
+
+    /// A failure raised by the pending handle's own task, rather than by the
+    /// conversion that follows it, is what the outer task reports.
+    ///
+    /// The inner message reserves a slot with no fill for it, so its task fails
+    /// in assembly with a message the conversion path cannot produce. Spawning
+    /// that task backs the handle with a task that fails, so awaiting the handle
+    /// is the step that fails and the sibling conversion-error test cannot be
+    /// what this one is measuring.
+    #[tokio::test]
+    async fn py_resolve_task_surfaces_a_failed_pending_handle_error() {
+        pyo3::Python::initialize();
+
+        let (mut outer_task, mut outer) = monarch_with_gil_blocking(GilSite::Test, |py| {
+            let mut inner = PendingMessage::new(
+                PythonMessageKind::Result { rank: Some(1) },
+                pickling_state(vec![9], vec![None], vec![]),
+            );
+            let handle = Py::new(py, inner.py_resolve()?.spawn()?)?;
+
+            let mut outer = PendingMessage::new(
+                PythonMessageKind::Result { rank: Some(7) },
+                pickling_state(vec![1, 2, 3], vec![None], vec![(0, handle)]),
+            );
+            let task = outer.py_resolve()?;
+            Ok::<_, PyErr>((task, outer))
+        })
+        .expect("construction should succeed");
+
+        let error = outer_task
+            .take_task()
+            .expect("the returned task should be takeable")
+            .await
+            .expect_err("the failed handle must fail the outer resolution");
+
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            assert!(
+                error
+                    .get_type(py)
+                    .is(pyo3::exceptions::PyRuntimeError::type_object(py)),
+                "the producer's exception type must survive both task boundaries"
+            );
+            assert_eq!(
+                error.value(py).to_string(),
+                "mesh reference slot was never filled",
+                "the outer task must report the producer's own failure, not a \
+                 conversion failure raised after a successful await"
+            );
+
+            let second = expect_error(
+                outer.py_resolve(),
+                "a failed handle must not hand the source back",
+            );
+            assert_eq!(
+                second.value(py).to_string(),
+                "PicklingState has already been consumed",
+            );
+            Ok::<_, PyErr>(())
+        })
+        .expect("assertions should not fail");
+    }
+
+    /// `py_resolve` returns without retaining a waiter on a pending handle:
+    /// it consumes the source and leaves the waiting to the returned task.
+    ///
+    /// The witness is the sender's receiver count, because `Shared::task()`
+    /// clones the watch receiver and holds it for the life of the waiter. The
+    /// count is read before the returned task is dropped, since dropping it
+    /// would release any waiter it had retained and restore the baseline.
+    ///
+    /// Scope: this is about retaining a waiter, not about looking. `poll()`
+    /// reads the watch value through a borrow and clones nothing, so a count
+    /// that has not moved does not rule out a poll.
+    #[tokio::test]
+    async fn py_resolve_retains_no_waiter_on_a_pending_handle() {
+        pyo3::Python::initialize();
+
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            let (sender, pending) = PyShared::pending();
+            let handle = Py::new(py, pending)?;
+            let baseline = sender.receiver_count();
+
+            let mut message = PendingMessage::new(
+                PythonMessageKind::Result { rank: Some(7) },
+                pickling_state(vec![1, 2, 3], vec![None], vec![(0, handle.clone_ref(py))]),
+            );
+
+            let task = message.py_resolve()?;
+            let retained = sender.receiver_count();
+            drop(task);
+
+            assert_eq!(
+                retained, baseline,
+                "py_resolve must return without retaining a waiter on the handle"
+            );
+
+            let waiter = handle.borrow(py).task()?;
+            assert_eq!(
+                sender.receiver_count(),
+                baseline + 1,
+                "one task() waiter must retain exactly one additional receiver"
+            );
+            drop(waiter);
+
+            let second = expect_error(
+                message.py_resolve(),
+                "the source was consumed by the first call",
+            );
+            assert_eq!(
+                second.value(py).to_string(),
+                "PicklingState has already been consumed",
+            );
+
+            // Nothing is parked on this handle, but publish rather than leave
+            // the fixture's sender to drop on a still-live receiver.
+            sender.send(Some(Ok(py.None()))).ok();
+            Ok::<_, PyErr>(())
+        })
+        .expect("test body should not fail");
     }
 }

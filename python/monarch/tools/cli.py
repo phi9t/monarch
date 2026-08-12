@@ -20,8 +20,11 @@ from monarch.tools.commands import (
     context_use,
     debug,
     exec_on_job,
+    shell_on_job,
 )
 from monarch.tools.debug_env import _get_debug_server_host, _get_debug_server_port
+
+_DEFAULT_DASHBOARD_PORT: int = 8265
 
 
 class DebugCmd:
@@ -174,6 +177,54 @@ class ExecCmd:
             sys.exit(rc)
 
 
+class ShellCmd:
+    def add_arguments(self, subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument(
+            "--mesh",
+            type=str,
+            default=None,
+            metavar="NAME",
+            help="Open the shell on the named mesh (default: first mesh)",
+        )
+        subparser.add_argument(
+            "--point",
+            type=str,
+            default=None,
+            metavar="DIM=N,DIM=N",
+            help="Open the shell at a coordinate (default: flat rank 0)",
+        )
+        subparser.add_argument(
+            "-e",
+            "--env",
+            action="append",
+            default=[],
+            help="Extra environment variables as KEY=VALUE (can be repeated)",
+        )
+        subparser.add_argument(
+            "--workdir",
+            type=str,
+            default=None,
+            help="Working directory on the worker",
+        )
+        subparser.add_argument(
+            "--kill",
+            action="store_true",
+            default=False,
+            help="Kill the job after the shell exits",
+        )
+
+    def run(self, args: argparse.Namespace) -> None:
+        rc = shell_on_job(
+            mesh_name=args.mesh,
+            point_str=args.point,
+            env=args.env or None,
+            workdir=args.workdir,
+            kill=args.kill,
+        )
+        if rc != 0:
+            sys.exit(rc)
+
+
 class ContextCmd:
     def add_arguments(self, subparser: argparse.ArgumentParser) -> None:
         sub = subparser.add_subparsers(title="CONTEXT COMMANDS", dest="context_cmd")
@@ -236,6 +287,59 @@ class KillCmd:
         print("Killed job")
 
 
+class DashboardCmd:
+    def add_arguments(self, subparser: argparse.ArgumentParser) -> None:
+        subparser.set_defaults(_dashboard_subparser=subparser)
+        sub = subparser.add_subparsers(title="DASHBOARD COMMANDS", dest="dashboard_cmd")
+        mast = sub.add_parser(
+            "mast",
+            help="Relay an existing MAST job's Monarch dashboard through this host",
+        )
+        mast.add_argument(
+            "job",
+            type=str,
+            help="Direct MAST job name.",
+        )
+        mast.add_argument(
+            "--role-name",
+            type=str,
+            default=None,
+            help=(
+                "MAST task group / Monarch host mesh role that hosts the dashboard. "
+                "If omitted, Monarch probes every role and uses the single reachable dashboard."
+            ),
+        )
+        mast.add_argument(
+            "--dashboard-port",
+            type=int,
+            default=_DEFAULT_DASHBOARD_PORT,
+            help="Dashboard port on the MAST task.",
+        )
+        mast.set_defaults(dashboard_func=self._run_mast)
+
+    def run(self, args: argparse.Namespace) -> None:
+        if not hasattr(args, "dashboard_func"):
+            args._dashboard_subparser.print_help()
+            sys.exit(1)
+        args.dashboard_func(args)
+
+    def _run_mast(self, args: argparse.Namespace) -> None:
+        try:
+            from monarch.monarch_dashboard.meta.mast import serve_mast_dashboard_relay
+        except ImportError:
+            sys.stderr.write(
+                "Error: `monarch-launch dashboard mast` is only available in "
+                "Meta-internal builds.\n"
+            )
+            sys.exit(1)
+
+        serve_mast_dashboard_relay(
+            job_name=args.job,
+            role_name=args.role_name,
+            dashboard_port=args.dashboard_port,
+        )
+
+
 def _load_skill_md() -> str:
     """Load SKILL.md as the help text."""
     skill_file = importlib.resources.files("monarch.tools").joinpath("SKILL.md")
@@ -263,8 +367,10 @@ def get_parser() -> argparse.ArgumentParser:
             "Run a command on workers. Sets MONARCH_RANK_<DIM> and MONARCH_SIZE_<DIM> "
             "env vars for each rank dimension.",
         ),
+        ("shell", ShellCmd(), "Open an interactive shell on one worker"),
         ("kill", KillCmd(), "Kill the active job"),
         ("debug", DebugCmd(), "Connect to the debug server"),
+        ("dashboard", DashboardCmd(), "Serve Monarch dashboards"),
     ]:
         cmd_parser = subparser.add_parser(cmd_name, help=cmd_help)
         cmd.add_arguments(cmd_parser)

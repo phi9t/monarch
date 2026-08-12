@@ -13,6 +13,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hyperactor::Actor;
+use hyperactor::ActorEnvironment;
 use hyperactor::ActorHandle;
 use hyperactor::ActorRef;
 use hyperactor::Context;
@@ -26,18 +27,18 @@ use hyperactor::RefClient;
 use hyperactor::RemoteSpawn;
 use hyperactor::Uid;
 use hyperactor::channel::ChannelAddr;
-use hyperactor_config::Flattrs;
 
-use super::IbvBuffer;
 use super::device_selection::IbvDeviceTarget;
 use super::manager_actor::IbvManagerActor;
-use super::manager_actor::IbvManagerMessageClient;
+use super::memory_region::IbvMemoryRegionView;
+use super::memory_region::IbvRemoteMemoryRegionView;
 use super::mlx_device::MlxDevice;
 use super::queue_pair::PollTarget;
 use super::queue_pair::legacy::IbvQueuePair;
 use crate::IbvConfig;
 use crate::RdmaManagerMessageClient;
 use crate::RdmaRemoteBuffer;
+use crate::ReleaseBufferClient;
 use crate::local_memory::Keepalive;
 use crate::local_memory::KeepaliveLocalMemory;
 use crate::rdma_manager_actor::RdmaManagerActor;
@@ -93,7 +94,7 @@ impl Actor for CudaActor {}
 impl RemoteSpawn for CudaActor {
     type Params = i32;
 
-    async fn new(device_id: i32, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(device_id: i32, _environment: &ActorEnvironment) -> Result<Self, anyhow::Error> {
         unsafe {
             // rdmaxcel only adopts an already-loaded driver, so load it first.
             if rdmaxcel_sys::ensure_cuda_driver_loaded() != 0 {
@@ -237,10 +238,10 @@ impl Handler<CudaActorMessage> for CudaActor {
 
                 // Register via RdmaManagerActor request_buffer.
                 // See the module-level note on `NoKeepalive`.
-                let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+                let local_memory = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
                     addr: dptr,
                     size: padded_size,
-                }));
+                }))?;
                 let handle = rdma_actor
                     .downcast_handle(cx)
                     .ok_or_else(|| anyhow::anyhow!("failed to get handle"))?;
@@ -351,8 +352,8 @@ pub async fn wait_for_completion(
 /// Posts a work request to the send queue of the given RDMA queue pair.
 pub async fn send_wqe_gpu(
     qp: &mut IbvQueuePair,
-    lhandle: &IbvBuffer,
-    rhandle: &IbvBuffer,
+    lhandle: &IbvMemoryRegionView,
+    rhandle: &IbvRemoteMemoryRegionView,
     op_type: u32,
 ) -> Result<(), anyhow::Error> {
     // SAFETY: `qp` is borrowed for the duration of this call; the
@@ -363,7 +364,7 @@ pub async fn send_wqe_gpu(
         let dv_qp = qp.dv_qp as *mut rdmaxcel_sys::mlx5dv_qp;
         let send_wqe_idx = rdmaxcel_sys::rdmaxcel_qp_load_send_wqe_idx(ibv_qp);
         let params = rdmaxcel_sys::wqe_params_t {
-            laddr: lhandle.addr,
+            laddr: lhandle.rdma_addr,
             length: lhandle.size,
             lkey: lhandle.lkey,
             wr_id: send_wqe_idx,
@@ -386,8 +387,8 @@ pub async fn send_wqe_gpu(
 /// Posts a work request to the receive queue of the given RDMA queue pair.
 pub async fn recv_wqe_gpu(
     qp: &mut IbvQueuePair,
-    lhandle: &IbvBuffer,
-    _rhandle: &IbvBuffer,
+    lhandle: &IbvMemoryRegionView,
+    _rhandle: &IbvRemoteMemoryRegionView,
     op_type: u32,
 ) -> Result<(), anyhow::Error> {
     // SAFETY: `qp` is borrowed for the duration of this call; the
@@ -398,7 +399,7 @@ pub async fn recv_wqe_gpu(
         let dv_qp = qp.dv_qp as *mut rdmaxcel_sys::mlx5dv_qp;
         let recv_wqe_idx = rdmaxcel_sys::rdmaxcel_qp_load_recv_wqe_idx(rdmaxcel_qp);
         let params = rdmaxcel_sys::wqe_params_t {
-            laddr: lhandle.addr,
+            laddr: lhandle.rdma_addr,
             length: lhandle.size,
             lkey: lhandle.lkey,
             wr_id: recv_wqe_idx,
@@ -455,7 +456,8 @@ pub async fn wait_for_completion_gpu(
 ) -> Result<bool, anyhow::Error> {
     // SAFETY: `qp` is borrowed mutably for the duration of this call;
     // the `rdmaxcel_qp` pointer is consumed before we return, so the
-    // QP's `Drop` cannot run mid-use.
+    // QP's `Drop` cannot run mid-use. That mutable borrow is also what
+    // makes this the only poller of the completion queue read below.
     unsafe {
         let start_time = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
@@ -521,8 +523,14 @@ pub struct DoorbellTestEnv {
     pub rdma_handle_2: RdmaRemoteBuffer,
     pub local_memory_1: KeepaliveLocalMemory,
     pub local_memory_2: KeepaliveLocalMemory,
-    pub ibv_buffer_1: IbvBuffer,
-    pub ibv_buffer_2: IbvBuffer,
+    /// Each side's own registration, which is what it addresses its memory
+    /// through when it is the initiator.
+    pub local_mrv_1: IbvMemoryRegionView,
+    pub local_mrv_2: IbvMemoryRegionView,
+    /// The same regions as the other side sees them: the target of a WR posted
+    /// from the peer.
+    pub remote_mrv_1: IbvRemoteMemoryRegionView,
+    pub remote_mrv_2: IbvRemoteMemoryRegionView,
     cuda_actor_1: Option<ActorRef<CudaActor>>,
     cuda_actor_2: Option<ActorRef<CudaActor>>,
     device_ptr_1: Option<usize>,
@@ -546,6 +554,30 @@ fn accel_target(accel: &str) -> IbvDeviceTarget {
         "nic" => IbvDeviceTarget::nic(idx),
         _ => IbvDeviceTarget::cpu(idx.parse().unwrap()),
     }
+}
+
+/// The local view of `mem`'s registration on `rdma`'s proc: what that side
+/// addresses its own memory through when it posts a work request.
+async fn local_view(
+    rdma: &ActorRef<RdmaManagerActor>,
+    client: &hyperactor::Client,
+    mem: &KeepaliveLocalMemory,
+) -> Result<IbvMemoryRegionView, anyhow::Error> {
+    let handle = rdma
+        .downcast_handle(client)
+        .ok_or_else(|| anyhow::anyhow!("RdmaManagerActor is not in this process"))?;
+    let device = handle
+        .request_buffer(client, mem.clone())
+        .await?
+        .resolve_mlx()
+        .ok_or_else(|| anyhow::anyhow!("local buffer has no Mellanox backend"))?
+        .buffers
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("local buffer carries no registration"))?
+        .device_name;
+    mem.registered_mr::<MlxDevice>(&device)?
+        .ok_or_else(|| anyhow::anyhow!("request_buffer should have registered on {device}"))
 }
 
 /// Helper function to parse accelerator strings
@@ -606,12 +638,14 @@ impl DoorbellTestEnv {
         let instance_2 = proc_2.client("client");
 
         // Must match `RdmaManagerActor::local_handle`'s singleton lookup of "rdma_manager".
-        let rdma_actor_1 = RdmaManagerActor::new(Some(config1), Flattrs::default()).await?;
+        let rdma_actor_1 =
+            RdmaManagerActor::new(Some(config1), &ActorEnvironment::default()).await?;
         let rdma_actor_handle_1 =
             proc_1.spawn_with_uid(Uid::singleton(Label::strip("rdma_manager")), rdma_actor_1)?;
         let actor_1: ActorRef<RdmaManagerActor> = rdma_actor_handle_1.bind();
 
-        let rdma_actor_2 = RdmaManagerActor::new(Some(config2), Flattrs::default()).await?;
+        let rdma_actor_2 =
+            RdmaManagerActor::new(Some(config2), &ActorEnvironment::default()).await?;
         let rdma_actor_handle_2 =
             proc_2.spawn_with_uid(Uid::singleton(Label::strip("rdma_manager")), rdma_actor_2)?;
         let actor_2: ActorRef<RdmaManagerActor> = rdma_actor_handle_2.bind();
@@ -635,10 +669,10 @@ impl DoorbellTestEnv {
                 len: buffer.len(),
                 cpu_ref: Some(buffer),
             });
-            local_memory_1 = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+            local_memory_1 = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
                 addr: ptr as usize,
                 size: buffer_size,
-            }));
+            }))?;
             let handle_1 = actor_1
                 .downcast_handle(&instance_1)
                 .ok_or_else(|| anyhow::anyhow!("failed to get handle"))?;
@@ -646,7 +680,8 @@ impl DoorbellTestEnv {
                 .request_buffer(&instance_1, local_memory_1.clone())
                 .await?;
         } else {
-            let cuda_actor = CudaActor::new(parsed_accel1.1 as i32, Flattrs::default()).await?;
+            let cuda_actor =
+                CudaActor::new(parsed_accel1.1 as i32, &ActorEnvironment::default()).await?;
             let cuda_handle = proc_1.spawn(cuda_actor);
             let cuda_actor_ref_1: ActorRef<CudaActor> = cuda_handle.bind();
 
@@ -655,10 +690,10 @@ impl DoorbellTestEnv {
                 .await?;
             rdma_handle_1 = rdma_buf;
             device_ptr_1 = Some(dev_ptr);
-            local_memory_1 = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+            local_memory_1 = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
                 addr: dev_ptr,
                 size: buffer_size,
-            }));
+            }))?;
 
             buf_vec.push(Buffer {
                 ptr: dev_ptr as u64,
@@ -676,10 +711,10 @@ impl DoorbellTestEnv {
                 len: buffer.len(),
                 cpu_ref: Some(buffer),
             });
-            local_memory_2 = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+            local_memory_2 = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
                 addr: ptr as usize,
                 size: buffer_size,
-            }));
+            }))?;
             let handle_2 = actor_2
                 .downcast_handle(&instance_2)
                 .ok_or_else(|| anyhow::anyhow!("failed to get handle"))?;
@@ -687,7 +722,8 @@ impl DoorbellTestEnv {
                 .request_buffer(&instance_2, local_memory_2.clone())
                 .await?;
         } else {
-            let cuda_actor = CudaActor::new(parsed_accel2.1 as i32, Flattrs::default()).await?;
+            let cuda_actor =
+                CudaActor::new(parsed_accel2.1 as i32, &ActorEnvironment::default()).await?;
             let cuda_handle = proc_2.spawn(cuda_actor);
             let cuda_actor_ref_2: ActorRef<CudaActor> = cuda_handle.bind();
 
@@ -696,10 +732,10 @@ impl DoorbellTestEnv {
                 .await?;
             rdma_handle_2 = rdma_buf;
             device_ptr_2 = Some(dev_ptr);
-            local_memory_2 = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+            local_memory_2 = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
                 addr: dev_ptr,
                 size: buffer_size,
-            }));
+            }))?;
 
             buf_vec.push(Buffer {
                 ptr: dev_ptr as u64,
@@ -709,10 +745,27 @@ impl DoorbellTestEnv {
             cuda_actor_2 = Some(cuda_actor_ref_2);
         }
 
+        // Both sides pin a NIC, so each buffer carries exactly one registration.
         let ctx_1 = rdma_handle_1.resolve_mlx().expect("buffer 1 is Mellanox");
-        let (ibv_actor_1, ibv_buffer_1) = (ctx_1.manager, ctx_1.buffer);
+        let (ibv_actor_1, remote_mrv_1) = (
+            ctx_1.manager,
+            ctx_1
+                .buffers
+                .into_iter()
+                .next()
+                .expect("buffer 1 is registered"),
+        );
         let ctx_2 = rdma_handle_2.resolve_mlx().expect("buffer 2 is Mellanox");
-        let (ibv_actor_2, ibv_buffer_2) = (ctx_2.manager, ctx_2.buffer);
+        let (ibv_actor_2, remote_mrv_2) = (
+            ctx_2.manager,
+            ctx_2
+                .buffers
+                .into_iter()
+                .next()
+                .expect("buffer 2 is registered"),
+        );
+        let local_mrv_1 = local_view(&actor_1, &instance_1, &local_memory_1).await?;
+        let local_mrv_2 = local_view(&actor_2, &instance_2, &local_memory_2).await?;
         let ibv_handle_1: ActorHandle<IbvManagerActor<MlxDevice>> = ibv_actor_1
             .downcast_handle(&instance_1)
             .ok_or_else(|| anyhow::anyhow!("ibv_actor_1 is not in proc_1"))?;
@@ -754,8 +807,10 @@ impl DoorbellTestEnv {
             rdma_handle_2,
             local_memory_1,
             local_memory_2,
-            ibv_buffer_1,
-            ibv_buffer_2,
+            local_mrv_1,
+            local_mrv_2,
+            remote_mrv_1,
+            remote_mrv_2,
             cuda_actor_1,
             cuda_actor_2,
             device_ptr_1,
@@ -764,11 +819,13 @@ impl DoorbellTestEnv {
     }
 
     pub async fn cleanup(self) -> Result<(), anyhow::Error> {
-        self.ibv_actor_1
+        // Release through the owning manager, which is what holds the memory
+        // handles the registrations hang off.
+        self.actor_1
             .release_buffer(&self.client_1, self.rdma_handle_1.id)
             .await?;
 
-        self.ibv_actor_2
+        self.actor_2
             .release_buffer(&self.client_2, self.rdma_handle_2.id)
             .await?;
         Ok(())

@@ -44,6 +44,22 @@ Job State
    :show-inheritance:
 
 
+Interactive Shell
+=================
+
+Use a singleton slice of a job's host mesh to open an interactive terminal on
+that host.
+
+.. autofunction:: shell
+
+
+Port Forwarding
+===============
+
+.. autoclass:: PortForwarder
+   :members:
+
+
 Job Base Class
 ==============
 
@@ -134,6 +150,12 @@ an AppDef and executes the training script across the mesh.
 .. autofunction:: serve
 
 .. autoclass:: SPMDJob
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :exclude-members: __init__
+
+.. autoclass:: StoreJob
    :members:
    :undoc-members:
    :show-inheritance:

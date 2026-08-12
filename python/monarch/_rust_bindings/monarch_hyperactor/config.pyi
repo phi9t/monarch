@@ -11,7 +11,7 @@ Type hints for the monarch_hyperactor.config Rust bindings.
 """
 
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
 
@@ -76,14 +76,16 @@ def configure(
     supervision_watchdog_timeout: str = ...,
     proc_stop_max_idle: str = ...,
     get_proc_state_max_idle: str = ...,
-    actor_queue_dispatch: bool = ...,
     mesh_admin_addr: str = ...,
     mesh_attach_config_timeout: str = ...,
     mesh_orphan_timeout: str = ...,
+    pyspy_bin: str = ...,
     rdma_allow_tcp_fallback: bool = ...,
     rdma_disable_ibverbs: bool = ...,
     rdma_max_chunk_size_mb: int = ...,
     rdma_ibverbs_target: str = ...,
+    rdma_peer_device_affinity: str = ...,
+    rdma_max_nics_per_buffer: Optional[int] = ...,
     **kwargs: object,
 ) -> None:
     """Configure Hyperactor runtime defaults for this process.
@@ -172,6 +174,11 @@ def configure(
             HTTP server (e.g. "[::]:1729", "0.0.0.0:8080")
         mesh_attach_config_timeout: Timeout for the config-push barrier
             during attach_to_workers() (humantime, default "10s")
+        pyspy_bin: Path to the py-spy binary used by the mesh admin
+            py-spy endpoints. Tried ahead of "py-spy" on PATH; empty
+            uses PATH alone. Resolved in the proc being dumped, so it
+            must be set before that proc is spawned. The environment
+            variable is PYSPY_BIN, not HYPERACTOR_*.
         rdma_allow_tcp_fallback: Allow TCP fallback when ibverbs RDMA
             hardware is unavailable. When True (default), RDMA operations
             fall back to chunked hyperactor messaging over the default
@@ -186,6 +193,15 @@ def configure(
             "gpu:<ordinal>", or "nic:<name>". Empty preserves automatic
             selection. Non-empty value syntax is validated when the RDMA
             manager starts.
+        rdma_peer_device_affinity: Which peer NICs each local NIC may pair
+            with for a transfer. Accepts "any", "match_name", or "groups:"
+            followed by any number of "|"-separated groups, each naming any
+            number of comma-separated devices, e.g.
+            "groups:mlx5_0,mlx5_1|mlx5_2,mlx5_3|mlx5_4". Groups must be
+            disjoint. Empty, the default, means "any". Value syntax is
+            validated when the RDMA manager starts.
+        rdma_max_nics_per_buffer: How many NICs a buffer is registered
+            on, at most (default: 1); None sets no limit.
         **kwargs: Reserved for future configuration keys
 
     For historical reasons, this API is named ``configure(...)``;

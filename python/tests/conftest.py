@@ -17,6 +17,12 @@ import pytest
 
 _THIS_DIR = Path(__file__).parent
 
+# The multihost RDMA benchmark's modules import as bare names -- `bench_topology`,
+# not a dotted path -- so the owning directory needs to be added to `sys.path`.
+_BENCH_DIR = _THIS_DIR.parent / "benches" / "multihost_rdma"
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
+
 collect_ignore: list[str] = []
 
 # FUSE and RDMA require Linux; skip these files on other platforms to avoid
@@ -133,6 +139,24 @@ def _load_disabled_tests() -> frozenset[str]:
     )
 
 
+def _is_disabled_test(node_id: str, disabled: frozenset[str]) -> bool:
+    """Return whether a pytest node ID matches a disabled-test entry.
+
+    Entries may identify a complete node ID, a structural prefix such as a
+    file or class node ID, or a bare test name. Prefixes only match at pytest
+    node-ID boundaries so similarly named tests and files remain enabled.
+    """
+    test_name = node_id.rsplit("::", 1)[-1]
+    for entry in disabled:
+        if node_id == entry or test_name == entry:
+            return True
+        if node_id.startswith((f"{entry}::", f"{entry}[")):
+            return True
+        if test_name.startswith(f"{entry}["):
+            return True
+    return False
+
+
 def pytest_collection_modifyitems(
     items: list[pytest.Item],
     config: pytest.Config,
@@ -157,8 +181,8 @@ def pytest_collection_modifyitems(
         if not disabled:
             continue
 
-        test_name = node_id.split("::")[-1]
-        if node_id in disabled or test_name in disabled:
+        test_name = node_id.rsplit("::", 1)[-1]
+        if _is_disabled_test(node_id, disabled):
             item.add_marker(
                 pytest.mark.skip(
                     reason=f"Disabled via GitHub issue: DISABLED {test_name}"

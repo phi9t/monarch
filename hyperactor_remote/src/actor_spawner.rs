@@ -112,10 +112,12 @@
 
 use async_trait::async_trait;
 use hyperactor::Actor;
+use hyperactor::ActorHandle;
 use hyperactor::ActorRef;
 use hyperactor::Context;
 use hyperactor::Endpoint;
 use hyperactor::Handler;
+use hyperactor::Instance;
 use hyperactor::OncePortHandle;
 use hyperactor::RemoteSpawn;
 use hyperactor::Uid;
@@ -139,7 +141,12 @@ hyperactor::behavior!(SpawnActor, SpawnActorMessage);
 pub struct ActorSpawner;
 
 #[async_trait]
-impl Actor for ActorSpawner {}
+impl Actor for ActorSpawner {
+    async fn init(&mut self, this: &Instance<Self>) -> anyhow::Result<()> {
+        this.set_system();
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl Handler<SpawnActorMessage> for ActorSpawner {
@@ -167,6 +174,30 @@ pub trait ActorSpawnerEndpoint {
         for<'a> &'a Self: Endpoint<SpawnActorMessage>,
     {
         self.spawn_uid::<A>(cx, Uid::anonymous(), params)
+    }
+
+    /// Spawn a registered actor and return its local supervisor handle.
+    ///
+    /// The returned actor ref identifies the eventual remote actor. The handle
+    /// controls its local supervisor proxy and can be stopped immediately,
+    /// including before the remote supervision session links.
+    fn spawn_with_handle<A>(
+        &self,
+        cx: &impl context::Actor,
+        params: A::Params,
+    ) -> anyhow::Result<(ActorRef<A>, ActorHandle<Supervisor>)>
+    where
+        A: RemoteSpawn,
+        Self: Clone + Send + 'static,
+        for<'a> &'a Self: Endpoint<SpawnActorMessage>,
+    {
+        self.spawn_uid_with_link_and_ready::<A>(
+            cx,
+            Uid::anonymous(),
+            params,
+            KeepaliveLink::default(),
+            None,
+        )
     }
 
     /// Spawn a registered actor with an explicit actor uid.
@@ -211,6 +242,7 @@ pub trait ActorSpawnerEndpoint {
             KeepaliveLink::default(),
             Some(ready),
         )
+        .map(|(actor_ref, _supervisor)| actor_ref)
     }
 
     /// Spawn a registered actor with an explicit actor uid and liveness link.
@@ -227,6 +259,7 @@ pub trait ActorSpawnerEndpoint {
         for<'a> &'a Self: Endpoint<SpawnActorMessage>,
     {
         self.spawn_uid_with_link_and_ready::<A>(cx, uid, params, liveness, None)
+            .map(|(actor_ref, _supervisor)| actor_ref)
     }
 
     /// Spawn a registered actor with an explicit actor uid, liveness link, and
@@ -240,7 +273,7 @@ pub trait ActorSpawnerEndpoint {
         params: A::Params,
         liveness: KeepaliveLink,
         ready: Option<OncePortHandle<()>>,
-    ) -> anyhow::Result<ActorRef<A>>
+    ) -> anyhow::Result<(ActorRef<A>, ActorHandle<Supervisor>)>
     where
         A: RemoteSpawn,
         Self: Clone + Send + 'static,
@@ -261,7 +294,7 @@ pub trait ActorSpawnerEndpoint {
         );
         let actor_spawner = self.clone();
         let gspawn = Gspawn::for_actor_uid::<A>(cx, uid, params)?;
-        cx.instance().spawn(Supervisor::bootstrap_uid(
+        let supervisor = cx.instance().spawn(Supervisor::bootstrap_uid(
             liveness,
             SupervisionOptions::default(),
             Uid::anonymous(),
@@ -272,7 +305,7 @@ pub trait ActorSpawnerEndpoint {
                 Ok(())
             },
         ));
-        Ok(actor_ref)
+        Ok((actor_ref, supervisor))
     }
 }
 
@@ -293,12 +326,12 @@ mod tests {
     use hyperactor::Instance;
     use hyperactor::Label;
     use hyperactor::OncePortHandle;
+    use hyperactor::OncePortRef;
     use hyperactor::PortRef;
     use hyperactor::Proc;
     use hyperactor::RemoteSpawn;
     use hyperactor::Uid;
     use hyperactor::supervision::ActorSupervisionEvent;
-    use hyperactor_config::Flattrs;
     use hyperactor_config::attrs::declare_attrs;
     use serde::Deserialize;
     use serde::Serialize;
@@ -327,7 +360,7 @@ mod tests {
     impl RemoteSpawn for TestChild {
         type Params = ();
 
-        async fn new(_params: (), _environment: Flattrs) -> anyhow::Result<Self> {
+        async fn new(_params: (), _environment: &ActorEnvironment) -> anyhow::Result<Self> {
             Ok(Self)
         }
     }
@@ -356,7 +389,7 @@ mod tests {
     impl RemoteSpawn for FailingChild {
         type Params = ();
 
-        async fn new(_params: (), _environment: Flattrs) -> anyhow::Result<Self> {
+        async fn new(_params: (), _environment: &ActorEnvironment) -> anyhow::Result<Self> {
             Ok(Self)
         }
     }
@@ -400,7 +433,7 @@ mod tests {
     impl RemoteSpawn for EnvironmentChild {
         type Params = PortRef<(u64, u64, Option<u64>, Option<u64>)>;
 
-        async fn new(reply: Self::Params, environment: Flattrs) -> anyhow::Result<Self> {
+        async fn new(reply: Self::Params, environment: &ActorEnvironment) -> anyhow::Result<Self> {
             Ok(Self {
                 reply,
                 constructor_value: environment.get(REMOTE_ENVIRONMENT_TAG).unwrap_or_default(),
@@ -469,6 +502,41 @@ mod tests {
         ) -> anyhow::Result<bool> {
             // Absorb teardown events so cleanup doesn't surface as a root failure.
             Ok(!event.is_error())
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize, Named)]
+    struct Ping(OncePortRef<()>);
+    wirevalue::register_type!(Ping);
+
+    #[derive(Debug)]
+    #[hyperactor::export(Ping)]
+    struct StoppingSpawner {
+        actor_spawner: ActorHandle<ActorSpawner>,
+        stopped: Option<OncePortHandle<()>>,
+    }
+
+    #[async_trait]
+    impl Actor for StoppingSpawner {
+        async fn init(&mut self, this: &Instance<Self>) -> anyhow::Result<()> {
+            let (_child, supervisor) = self
+                .actor_spawner
+                .spawn_with_handle::<TestChild>(this, ())?;
+            supervisor.stop("test complete")?;
+            let _status = supervisor.await;
+            self.stopped
+                .take()
+                .expect("stopping spawner initialized once")
+                .post(this, ());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Ping> for StoppingSpawner {
+        async fn handle(&mut self, cx: &Context<Self>, message: Ping) -> anyhow::Result<()> {
+            message.0.post(cx, ());
+            Ok(())
         }
     }
 
@@ -572,6 +640,47 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), actor_spawner)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_handle_stops_only_spawned_actor() {
+        let proc = Proc::isolated();
+        let client = proc.client("client");
+        let actor_spawner = proc.spawn(ActorSpawner);
+        let (stopped, stopped_rx) = client.open_once_port::<()>();
+        let parent = proc.spawn(StoppingSpawner {
+            actor_spawner: actor_spawner.clone(),
+            stopped: Some(stopped),
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), stopped_rx.recv())
+            .await
+            .expect("spawned actor stop timed out")
+            .expect("spawned actor stop signal closed");
+        assert!(
+            !parent.status().borrow().is_terminal(),
+            "stopping the spawned actor should not stop its parent"
+        );
+        assert!(
+            !actor_spawner.status().borrow().is_terminal(),
+            "stopping the spawned actor should not stop the actor spawner"
+        );
+
+        let (pong, pong_rx) = client.open_once_port::<()>();
+        parent.post(&client, Ping(pong.bind()));
+        tokio::time::timeout(Duration::from_secs(5), pong_rx.recv())
+            .await
+            .expect("parent ping timed out")
+            .expect("parent ping port closed");
+
+        parent.stop("test complete").expect("stop parent");
+        tokio::time::timeout(Duration::from_secs(5), parent)
+            .await
+            .expect("parent stop timed out");
+        actor_spawner.stop("test").expect("stop actor spawner");
+        tokio::time::timeout(Duration::from_secs(5), actor_spawner)
+            .await
+            .expect("actor spawner stop timed out");
     }
 
     #[tokio::test]

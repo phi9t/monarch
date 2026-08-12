@@ -61,6 +61,7 @@ if TYPE_CHECKING:
             cleanup_timeout: NotRequired[str]
             default_encoding: NotRequired[Encoding]
             channel_net_rx_buffer_full_check_interval: NotRequired[str]
+            channel_tcp_congestion: NotRequired[str]
             message_latency_sampling_rate: NotRequired[float]
             enable_dest_actor_reordering_buffer: NotRequired[bool]
             mesh_bootstrap_enable_pdeathsig: NotRequired[bool]
@@ -79,14 +80,17 @@ if TYPE_CHECKING:
             supervision_watchdog_timeout: NotRequired[str]
             proc_stop_max_idle: NotRequired[str]
             get_proc_state_max_idle: NotRequired[str]
-            actor_queue_dispatch: NotRequired[bool]
             mesh_admin_addr: NotRequired[str]
             mesh_attach_config_timeout: NotRequired[str]
             mesh_orphan_timeout: NotRequired[str]
+            pyspy_bin: NotRequired[str]
             rdma_allow_tcp_fallback: NotRequired[bool]
             rdma_disable_ibverbs: NotRequired[bool]
             rdma_max_chunk_size_mb: NotRequired[int]
             rdma_ibverbs_target: NotRequired[str]
+            rdma_peer_device_affinity: NotRequired[str]
+            rdma_max_nics_per_buffer: NotRequired[int | None]
+            rdma_runtime_worker_threads: NotRequired[int]
 
         # pyrefly: ignore [invalid-annotation]
         ConfigureKwargsType = Unpack[ConfigureArgs]
@@ -132,6 +136,7 @@ def configure(**kwargs: "ConfigureKwargsType") -> None:
             cleanup_timeout: Timeout for cleanup operations (humantime).
             default_encoding: Default message encoding (Encoding.Bincode, Encoding.Json, or Encoding.Multipart).
             channel_net_rx_buffer_full_check_interval: Network receive buffer check interval (humantime).
+            channel_tcp_congestion: TCP congestion control: ``"cubic"``, ``"reno"``, ``"bbr"`` (OS-dependent); empty keeps the host default.
             message_latency_sampling_rate: Sampling rate for message latency tracking (0.0 to 1.0).
             enable_dest_actor_reordering_buffer: Enable reordering buffer in dest actor.
 
@@ -175,6 +180,14 @@ def configure(**kwargs: "ConfigureKwargsType") -> None:
                 during ``attach_to_workers()`` (humantime, default ``"10s"``).
                 Best-effort: if exceeded, a warning is logged and attach continues.
 
+        Diagnostics:
+            pyspy_bin: Path to the py-spy binary used by the mesh admin
+                py-spy endpoints. Tried ahead of ``py-spy`` on ``PATH``;
+                empty uses ``PATH`` alone. Resolved in the proc being
+                dumped, so it must be set before that proc is spawned.
+                The environment variable is ``PYSPY_BIN``, not
+                ``HYPERACTOR_*``.
+
         RDMA configuration:
             rdma_allow_tcp_fallback: Allow TCP fallback when ibverbs RDMA
                 is unavailable. When True, RDMA operations use a TCP-based
@@ -188,6 +201,19 @@ def configure(**kwargs: "ConfigureKwargsType") -> None:
                 ``"gpu:<ordinal>"``, or ``"nic:<name>"``. Empty preserves
                 automatic selection. Non-empty value syntax is validated when
                 the RDMA manager starts.
+            rdma_peer_device_affinity: Which peer NICs each local NIC may pair
+                with for a transfer. Accepts ``"any"``, ``"match_name"``, or
+                ``"groups:"`` followed by any number of ``|``-separated groups,
+                each naming any number of comma-separated devices, e.g.
+                ``"groups:mlx5_0,mlx5_1|mlx5_2,mlx5_3|mlx5_4"``. Groups must be
+                disjoint. Empty, the default, means ``"any"``. Value syntax is
+                validated when the RDMA manager starts.
+            rdma_max_nics_per_buffer: How many NICs a buffer is registered on,
+                at most (default 1); ``None`` sets no limit.
+            rdma_runtime_worker_threads: Worker threads for the shared RDMA
+                data-plane runtime, which every queue pair's poll loop runs on.
+                Latched at the first RDMA use in a process; setting it later
+                has no effect.
 
         **kwargs: Reserved for future configuration keys exposed by Rust bindings.
     """
@@ -301,7 +327,7 @@ def parametrize_config(
         >>> from monarch.config import parametrize_config
         >>>
         >>> @parametrize_config(
-        ...     actor_queue_dispatch={True, False},
+        ...     force_file_log={True, False},
         ...     prefix_with_rank={True, False},
         ... )
         ... async def test_actor_feature():
@@ -391,13 +417,13 @@ def parametrize_config_pointwise(
         >>> from monarch.config import parametrize_config_pointwise
         >>>
         >>> @parametrize_config_pointwise(
-        ...     actor_queue_dispatch=[True, False],
+        ...     force_file_log=[True, False],
         ...     prefix_with_rank=[True, False],
         ... )
         ... async def test_actor_feature():
         ...     # Runs 2 times:
-        ...     # (actor_queue_dispatch=True, prefix_with_rank=True)
-        ...     # (actor_queue_dispatch=False, prefix_with_rank=False)
+        ...     # (force_file_log=True, prefix_with_rank=True)
+        ...     # (force_file_log=False, prefix_with_rank=False)
         ...     pass
     """
     import asyncio

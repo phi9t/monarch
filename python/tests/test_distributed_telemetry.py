@@ -1571,6 +1571,83 @@ def test_message_status_events_failed_handler() -> None:
 
 @pytest.mark.timeout(120)
 @isolate_in_subprocess
+def test_metrics_table() -> None:
+    """Test that OpenTelemetry metrics are queryable through distributed SQL."""
+    with scoped_state(
+        ProcessJob({"hosts": 1}).enable_telemetry(_sidecar_telemetry_config()),
+        cached_path=None,
+    ) as state:
+        _assert_sidecar(state)
+        hosts = state.hosts
+        worker_procs = hosts.spawn_procs(
+            per_host={"workers": 1}, name="metrics_workers_procs"
+        )
+        workers = worker_procs.spawn("metrics_test_worker", WorkerActor)
+        workers.initialized.get()
+        workers.ping.call().get()
+
+        metric_rows = _query(
+            state,
+            "SELECT name, attributes_json, resource_attributes_json, "
+            "sum_u64 AS metric_sum, temporality, is_monotonic "
+            "FROM metric_sums "
+            "WHERE name = 'mailbox.posts' "
+            "AND sum_u64 > 0",
+            timeout_secs=40.0,
+        )
+
+        assert metric_rows.get("name"), "Expected mailbox.posts metric rows"
+        assert all(name == "mailbox.posts" for name in metric_rows["name"]), metric_rows
+        assert all(metric_sum > 0 for metric_sum in metric_rows["metric_sum"]), (
+            metric_rows
+        )
+        assert all(value == "delta" for value in metric_rows["temporality"]), (
+            metric_rows
+        )
+        assert all(metric_rows["is_monotonic"]), metric_rows
+
+        attributes = [json.loads(raw) for raw in metric_rows["attributes_json"]]
+        assert any("actor_id" in attrs for attrs in attributes), attributes
+        assert any("dest_actor_id" in attrs for attrs in attributes), attributes
+        resources = [json.loads(raw) for raw in metric_rows["resource_attributes_json"]]
+        assert all(resource.get("service.name") for resource in resources), resources
+        assert all(
+            resource.get("telemetry.sdk.name") == "opentelemetry"
+            for resource in resources
+        ), resources
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
+def test_custom_metric() -> None:
+    """Test that a user-defined metric retains its scope and attributes."""
+    with scoped_state(
+        ProcessJob({"hosts": 1}).enable_telemetry(_sidecar_telemetry_config()),
+        cached_path=None,
+    ) as state:
+        _assert_sidecar(state)
+
+        requests = monarch.actor.get_meter().create_counter("example.requests")
+        requests.add(1, {"operation": "predict", "outcome": "success"})
+
+        metric_rows = _query(
+            state,
+            "SELECT scope_name, attributes_json, sum_u64 AS metric_sum "
+            "FROM metric_sums "
+            "WHERE name = 'example.requests'",
+            timeout_secs=40.0,
+        )
+
+        assert metric_rows["scope_name"] == ["monarch"], metric_rows
+        assert metric_rows["metric_sum"] == [1], metric_rows
+        assert json.loads(metric_rows["attributes_json"][0]) == {
+            "operation": "predict",
+            "outcome": "success",
+        }
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
 def test_sent_messages_with_sliced_mesh() -> None:
     """Test that sent_messages view_json/shape_json reflect sliced vs full actor mesh casts."""
     with scoped_state(

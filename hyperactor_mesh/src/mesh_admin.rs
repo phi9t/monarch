@@ -230,19 +230,28 @@
 //!   etc.) rather than propagating panics or unwinding. Failed reply
 //!   sends (the caller went away) are silently swallowed.
 //!
-//! ## TLS transport invariant (MA-T1)
+//! ## TLS transport invariants (MA-T*)
 //!
 //! - **MA-T1 (tls):** At Meta (`fbcode_build`), the admin HTTP
-//!   server **requires** mutual TLS. At startup it probes for
-//!   certificates via `try_tls_acceptor` with client cert
-//!   enforcement enabled. If no usable certificate bundle is found,
-//!   `init()` returns an error — no plain HTTP fallback. In OSS,
-//!   TLS is best-effort with plain HTTP fallback.
+//!   server **requires** mutual TLS. At startup it resolves a paired
+//!   acceptor and credential bundle via
+//!   `try_tls_acceptor_with_pem_bundle` with client cert enforcement
+//!   enabled. If no usable certificate bundle is found, `init()`
+//!   returns an error — no plain HTTP fallback. In OSS, TLS is
+//!   best-effort with plain HTTP fallback.
 //!
 //! - **MA-T2 (scheme-in-url):** The URL returned by `GetAdminAddr`
 //!   is always `https://host:port` or `http://host:port`, never a
 //!   bare `host:port`. All callers receive and use this full URL
 //!   directly.
+//!
+//! - **MA-T3 (access-instructions):** `MeshAdminAgent::init` emits one
+//!   startup access block. For HTTPS, runnable `curl` flags come from
+//!   the exact `PemBundle` paired with the selected acceptor and are
+//!   rendered only when the CA, certificate, and key are `Pem::File`
+//!   or `Pem::StaticPath`. If any credential is `Pem::Value`, the
+//!   block shows endpoint URLs without claiming a runnable `curl`
+//!   command. Plain HTTP endpoints retain runnable `curl` commands.
 //!
 //! ## Client host invariants (CH-*)
 //!
@@ -335,7 +344,9 @@
 //! live invariant. It is not in this registry.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -359,7 +370,9 @@ use hyperactor::Instance;
 use hyperactor::OncePortRef;
 use hyperactor::ProcAddr;
 use hyperactor::RefClient;
-use hyperactor::channel::try_tls_acceptor;
+use hyperactor::channel::try_tls_acceptor_with_pem_bundle;
+use hyperactor::config::Pem;
+use hyperactor::config::PemBundle;
 use hyperactor::introspect::IntrospectMessage;
 use hyperactor::introspect::IntrospectResult;
 use hyperactor::introspect::IntrospectView;
@@ -373,7 +386,6 @@ use typeuri::Named;
 
 use crate::config_dump::ConfigDump;
 use crate::config_dump::ConfigDumpResult;
-use crate::host::SERVICE_PROC_NAME;
 use crate::host_mesh::host_agent::HOST_MESH_AGENT_ACTOR_NAME;
 use crate::host_mesh::host_agent::HostAgent;
 use crate::introspect::NodePayload;
@@ -389,6 +401,52 @@ use crate::pyspy::PySpyProfileOpts;
 use crate::pyspy::PySpyProfileResult;
 use crate::pyspy::PySpyResult;
 use crate::pyspy::ValidatedProfileRequest;
+
+/// Builds user-facing commands for accessing a mesh admin server.
+fn mesh_admin_access_instructions(admin_url: &str, tls_bundle: Option<&PemBundle>) -> String {
+    fn path(pem: &Pem) -> Option<&Path> {
+        match pem {
+            Pem::File(path) => Some(path),
+            Pem::StaticPath(path) => Some(Path::new(*path)),
+            Pem::Value(_) => None,
+        }
+    }
+
+    let curl_prefix = if admin_url.starts_with("https://") {
+        tls_bundle.and_then(|bundle| {
+            Some(format!(
+                "curl --cacert {} --cert {} --key {} ",
+                path(&bundle.ca)?.display(),
+                path(&bundle.cert)?.display(),
+                path(&bundle.key)?.display(),
+            ))
+        })
+    } else {
+        Some("curl ".to_string())
+    };
+    let access = |path: &str| match &curl_prefix {
+        Some(prefix) => format!("{prefix}{admin_url}{path}"),
+        None => format!("{admin_url}{path}"),
+    };
+
+    format!(
+        concat!(
+            "Mesh admin server listening on {admin_url}\n",
+            "  - Root node:     {root_access}\n",
+            "  - Mesh tree:     {tree_access}\n",
+            "  - API docs:      {docs_access}\n",
+            "  - TUI:           buck2 run ",
+            "fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui ",
+            "-- --addr {admin_url}\n",
+            "                   cargo run -p hyperactor_mesh_admin_tui_lib ",
+            "--bin hyperactor_mesh_admin_tui -- --addr {admin_url}",
+        ),
+        admin_url = admin_url,
+        root_access = access("/v1/root"),
+        tree_access = access("/v1/tree"),
+        docs_access = access("/SKILL.md"),
+    )
+}
 
 /// Send an `IntrospectMessage` to an actor and receive the reply.
 /// Encapsulates open_once_port + send + timeout + error handling.
@@ -801,6 +859,8 @@ struct BridgeState {
     /// Addr to the `MeshAdminAgent` actor that performs
     /// reference resolution.
     admin_ref: ActorRef<MeshAdminAgent>,
+    /// Exact actor identities of the HostAgents managed by this admin.
+    host_agents: HashSet<hyperactor::ActorAddr>,
     /// Dedicated client mailbox on system_proc for HTTP bridge reply
     /// ports. Using a separate `Instance<()>` avoids sharing the
     /// actor's own mailbox with the HTTP bridge and ensures the
@@ -909,15 +969,16 @@ impl Actor for MeshAdminAgent {
     ///    call `bind()` — unlike `gspawn` — so the actor must do it
     ///    itself before becoming reachable).
     /// 2. Binds a TCP listener (ephemeral or fixed port).
-    /// 3. Builds a TLS acceptor (explicit env vars, then Meta default
-    ///    paths). At Meta (`fbcode_build`), mTLS is mandatory and
-    ///    init fails if no certs are found. In OSS, falls back to
-    ///    plain HTTP.
+    /// 3. Builds a TLS acceptor and retains its selected credential
+    ///    bundle (explicit env vars, then Meta default paths). At Meta
+    ///    (`fbcode_build`), mTLS is mandatory and init fails if no certs
+    ///    are found. In OSS, falls back to plain HTTP.
     /// 4. Creates a dedicated `Instance<()>` client mailbox on
     ///    system_proc for the HTTP bridge's reply ports, keeping
     ///    bridge traffic off the actor's own mailbox.
     /// 5. Spawns the axum server in a background task (HTTPS with
     ///    mTLS at Meta, HTTPS or HTTP in OSS depending on step 3).
+    /// 6. Prints one access block derived from the selected bundle.
     ///
     /// The hostname-based listen address is stored in `admin_host` so
     /// it can be returned via `GetAdminAddr`. The scheme (`https://`
@@ -945,9 +1006,9 @@ impl Actor for MeshAdminAgent {
         // In OSS: TLS is best-effort with plain HTTP fallback.
         // See MA-T1 in module doc.
         let enforce_mtls = cfg!(fbcode_build);
-        let tls_acceptor = try_tls_acceptor(enforce_mtls);
+        let tls = try_tls_acceptor_with_pem_bundle(enforce_mtls);
 
-        if enforce_mtls && tls_acceptor.is_none() {
+        if enforce_mtls && tls.is_none() {
             return Err(anyhow::anyhow!(
                 "mesh admin requires mTLS but no TLS certificates found; \
                  set HYPERACTOR_TLS_CERT/KEY/CA or ensure Meta cert paths exist \
@@ -955,11 +1016,7 @@ impl Actor for MeshAdminAgent {
             ));
         }
 
-        let scheme = if tls_acceptor.is_some() {
-            "https"
-        } else {
-            "http"
-        };
+        let scheme = if tls.is_some() { "https" } else { "http" };
 
         // Build the host portion of the admin URL.
         //
@@ -995,8 +1052,11 @@ impl Actor for MeshAdminAgent {
             .admin_host
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
+        let access_instructions =
+            mesh_admin_access_instructions(&admin_url, tls.as_ref().map(|(_, bundle)| bundle));
         let bridge_state = Arc::new(BridgeState {
             admin_ref: ActorRef::attest(this.self_addr().clone()),
+            host_agents: self.host_agents_by_actor_id.keys().cloned().collect(),
             bridge_cx,
             resolve_semaphore: tokio::sync::Semaphore::new(hyperactor_config::global::get(
                 crate::config::MESH_ADMIN_MAX_CONCURRENT_RESOLVES,
@@ -1012,7 +1072,7 @@ impl Actor for MeshAdminAgent {
         });
         let router = create_mesh_admin_router(bridge_state);
 
-        if let Some(acceptor) = tls_acceptor {
+        if let Some((acceptor, _)) = tls {
             let tls_listener = TlsListener {
                 tcp: listener,
                 acceptor,
@@ -1031,6 +1091,7 @@ impl Actor for MeshAdminAgent {
             });
         }
 
+        println!("{access_instructions}");
         tracing::info!(
             "mesh admin server listening on {}",
             self.admin_host.as_deref().unwrap_or("unknown")
@@ -1994,7 +2055,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
                 "post": {
                     "summary": "Trigger py-spy dump and store in telemetry",
                     "operationId": "pyspyDumpAndStore",
-                    "description": "Runs py-spy against the target process, stores the result in the dashboard's DataFusion pyspy tables, and returns the dump_id.",
+                    "description": "Runs py-spy against the target process, stores a successful result in the dashboard's DataFusion pyspy tables, and returns the dump_id. Failed captures return an error without a dump_id.",
                     "parameters": [{
                         "name": "proc_reference",
                         "in": "path",
@@ -2013,7 +2074,8 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         },
                         "400": error_response("Bad request (malformed proc reference)"),
                         "404": error_response("Proc or dashboard not found"),
-                        "500": error_response("Internal error"),
+                        "500": error_response("Capture, storage, or internal error"),
+                        "503": error_response("py-spy binary unavailable"),
                         "504": error_response("Gateway timeout")
                     }
                 }
@@ -2261,19 +2323,18 @@ impl ResolvedProcHandler {
 /// Parse + route + attest. No probe. The single `ActorRef::attest`
 /// minting point. Used by `config_bridge` which intentionally skips
 /// the probe (CFG-4).
-fn route_proc_handler(raw_proc_reference: &str) -> Result<ResolvedProcHandler, ApiError> {
+fn route_proc_handler(
+    host_agents: &HashSet<hyperactor::ActorAddr>,
+    raw_proc_reference: &str,
+) -> Result<ResolvedProcHandler, ApiError> {
     let (_proc_reference, proc_id) = parse_proc_reference(raw_proc_reference)?;
-    let is_service = proc_id
-        .uid()
-        .as_singleton()
-        .is_some_and(|label| label.as_str() == SERVICE_PROC_NAME);
-    if is_service {
-        let agent_id = proc_id.actor_addr(HOST_MESH_AGENT_ACTOR_NAME);
-        Ok(ResolvedProcHandler::Host(ActorRef::attest(agent_id)))
-    } else {
-        let agent_id = proc_id.actor_addr(PROC_AGENT_ACTOR_NAME);
-        Ok(ResolvedProcHandler::Proc(ActorRef::attest(agent_id)))
+    let host_agent_id = proc_id.actor_addr(HOST_MESH_AGENT_ACTOR_NAME);
+    if host_agents.contains(&host_agent_id) {
+        return Ok(ResolvedProcHandler::Host(ActorRef::attest(host_agent_id)));
     }
+
+    let proc_agent_id = proc_id.actor_addr(PROC_AGENT_ACTOR_NAME);
+    Ok(ResolvedProcHandler::Proc(ActorRef::attest(proc_agent_id)))
 }
 
 /// Parse + route + attest + probe (PS-13).
@@ -2281,7 +2342,7 @@ async fn resolve_proc_handler(
     state: &BridgeState,
     raw_proc_reference: &str,
 ) -> Result<ResolvedProcHandler, ApiError> {
-    let handler = route_proc_handler(raw_proc_reference)?;
+    let handler = route_proc_handler(&state.host_agents, raw_proc_reference)?;
     let cx = &state.bridge_cx;
     if !probe_actor(cx, &handler.agent_id()).await? {
         return Err(ApiError::not_found(
@@ -2450,6 +2511,46 @@ pub struct PyspyDumpAndStoreResponse {
     pub dump_id: String,
 }
 
+fn serialize_storable_pyspy_result(pyspy_result: &PySpyResult) -> Result<String, ApiError> {
+    match pyspy_result {
+        PySpyResult::Ok { .. } => serde_json::to_string(pyspy_result).map_err(|e| ApiError {
+            code: "internal_error".to_string(),
+            message: format!("failed to serialize PySpyResult: {}", e),
+            details: None,
+        }),
+        PySpyResult::BinaryNotFound { searched } => Err(ApiError {
+            code: "service_unavailable".to_string(),
+            message: format!(
+                "py-spy not available on target host; searched: {}",
+                searched.join(", ")
+            ),
+            details: None,
+        }),
+        PySpyResult::Failed {
+            pid,
+            binary,
+            exit_code,
+            stderr,
+        } => {
+            let exit_code =
+                exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string());
+            let stderr = stderr.trim();
+            let message = if stderr.is_empty() {
+                format!("py-spy dump failed for pid {pid} using {binary} (exit code {exit_code})")
+            } else {
+                format!(
+                    "py-spy dump failed for pid {pid} using {binary} (exit code {exit_code}): {stderr}"
+                )
+            };
+            Err(ApiError {
+                code: "pyspy_failed".to_string(),
+                message,
+                details: None,
+            })
+        }
+    }
+}
+
 /// Resolve the telemetry URL from bridge state, returning an
 /// `ApiError` if not configured.
 fn require_telemetry_url(state: &BridgeState) -> Result<&str, ApiError> {
@@ -2521,9 +2622,10 @@ async fn query_proxy(
 ///
 /// 1. Performs a py-spy dump via `do_pyspy_dump` (same as
 ///    `pyspy_bridge`).
-/// 2. POSTs the serialized result to the dashboard's
+/// 2. Rejects unsuccessful captures without generating a dump id.
+/// 3. POSTs the serialized successful result to the dashboard's
 ///    `/api/pyspy_dump` endpoint for persistent storage.
-/// 3. Returns the generated dump id.
+/// 4. Returns the generated dump id.
 async fn pyspy_dump_and_store(
     State(state): State<Arc<BridgeState>>,
     AxumPath(proc_reference): AxumPath<String>,
@@ -2531,12 +2633,8 @@ async fn pyspy_dump_and_store(
     let telemetry_url = require_telemetry_url(&state)?;
     let pyspy_result = do_pyspy_dump(&state, &proc_reference).await?;
 
+    let pyspy_json = serialize_storable_pyspy_result(&pyspy_result)?;
     let dump_id = uuid::Uuid::new_v4().to_string();
-    let pyspy_json = serde_json::to_string(&pyspy_result).map_err(|e| ApiError {
-        code: "internal_error".to_string(),
-        message: format!("failed to serialize PySpyResult: {}", e),
-        details: None,
-    })?;
 
     let store_body = StorePyspyDumpRequest {
         dump_id: dump_id.clone(),
@@ -2578,7 +2676,7 @@ async fn config_bridge(
     State(state): State<Arc<BridgeState>>,
     AxumPath(proc_reference): AxumPath<String>,
 ) -> Result<Json<ConfigDumpResult>, ApiError> {
-    let handler = route_proc_handler(&proc_reference)?;
+    let handler = route_proc_handler(&state.host_agents, &proc_reference)?;
     let timeout =
         hyperactor_config::global::get(crate::config::MESH_ADMIN_CONFIG_DUMP_BRIDGE_TIMEOUT);
     let result = handler.config_dump(&state.bridge_cx, timeout).await?;
@@ -3057,10 +3155,10 @@ mod advertised_host {
 
     /// Extract SAN entries from the server cert PEM bundle.
     ///
-    /// Loads the same cert bundle that `try_tls_acceptor` uses,
-    /// parses the leaf cert with `x509_parser`, and returns SAN
-    /// DNS names and IP addresses. Returns empty if no cert is
-    /// available or parsing fails.
+    /// Probes cert bundles in the same source order as
+    /// `try_tls_acceptor_with_pem_bundle`, parses the leaf cert with
+    /// `x509_parser`, and returns SAN DNS names and IP addresses.
+    /// Returns empty if no cert is available or parsing fails.
     fn load_cert_sans() -> Vec<SanIdentity> {
         use std::io::BufReader;
 
@@ -3206,11 +3304,13 @@ mod advertised_host {
 mod tests {
     use std::net::SocketAddr;
 
+    use hyperactor::ProcId;
     use hyperactor::channel::ChannelAddr;
     use hyperactor::id::Label;
     use hyperactor::testing::ids::test_proc_id_with_addr;
 
     use super::*;
+    use crate::host::SERVICE_PROC_NAME;
     use crate::mesh_id::ResourceId;
 
     // Integration tests that spawn MeshAdminAgent must pass
@@ -3218,6 +3318,117 @@ mod tests {
     // ephemeral port. The default (`None`) reads MESH_ADMIN_ADDR
     // config which is `[::]:1729` — a fixed port that causes bind
     // conflicts when tests run concurrently.
+
+    #[test]
+    fn failed_pyspy_dump_is_rejected_before_storage() {
+        let error = serialize_storable_pyspy_result(&PySpyResult::Failed {
+            pid: 1234,
+            binary: "py-spy".to_string(),
+            exit_code: Some(1),
+            stderr: "capture failed".to_string(),
+        })
+        .expect_err("a failed capture must not be sent to storage");
+
+        assert_eq!(error.code, "pyspy_failed");
+        assert_eq!(
+            error.message,
+            "py-spy dump failed for pid 1234 using py-spy (exit code 1): capture failed"
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn missing_pyspy_binary_is_rejected_before_storage() {
+        let error = serialize_storable_pyspy_result(&PySpyResult::BinaryNotFound {
+            searched: vec!["configured-py-spy".to_string(), "py-spy".to_string()],
+        })
+        .expect_err("a missing binary must not be sent to storage");
+
+        assert_eq!(error.code, "service_unavailable");
+        assert_eq!(
+            error.message,
+            "py-spy not available on target host; searched: configured-py-spy, py-spy"
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn successful_pyspy_dump_is_serialized_for_storage() {
+        let result = PySpyResult::Ok {
+            pid: 1234,
+            binary: "py-spy".to_string(),
+            stack_traces: vec![],
+            warnings: vec![],
+        };
+
+        let serialized = serialize_storable_pyspy_result(&result)
+            .expect("a successful capture should be sent to storage");
+
+        assert_eq!(
+            serde_json::from_str::<PySpyResult>(&serialized).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn mesh_admin_access_instructions_print_file_tls_paths() {
+        let bundle = PemBundle {
+            ca: Pem::File("/tmp/custom-ca.pem".into()),
+            cert: Pem::File("/tmp/custom-cert.pem".into()),
+            key: Pem::File("/tmp/custom-key.pem".into()),
+        };
+
+        let instructions =
+            mesh_admin_access_instructions("https://admin.example.com", Some(&bundle));
+
+        assert!(instructions.contains(
+            "Root node:     curl --cacert /tmp/custom-ca.pem --cert /tmp/custom-cert.pem --key /tmp/custom-key.pem https://admin.example.com/v1/root"
+        ));
+    }
+
+    #[test]
+    fn mesh_admin_access_instructions_print_static_tls_paths() {
+        let bundle = PemBundle {
+            ca: Pem::StaticPath("/etc/hyperactor/tls/ca.crt"),
+            cert: Pem::StaticPath("/etc/hyperactor/tls/tls.crt"),
+            key: Pem::StaticPath("/etc/hyperactor/tls/tls.key"),
+        };
+
+        let instructions =
+            mesh_admin_access_instructions("https://admin.example.com", Some(&bundle));
+
+        assert!(instructions.contains(
+            "Root node:     curl --cacert /etc/hyperactor/tls/ca.crt --cert /etc/hyperactor/tls/tls.crt --key /etc/hyperactor/tls/tls.key https://admin.example.com/v1/root"
+        ));
+    }
+
+    #[test]
+    fn mesh_admin_access_instructions_do_not_render_pem_values_as_curl() {
+        let bundle = PemBundle {
+            ca: Pem::Value(b"ca".to_vec()),
+            cert: Pem::File("/tmp/custom-cert.pem".into()),
+            key: Pem::File("/tmp/custom-key.pem".into()),
+        };
+
+        let instructions =
+            mesh_admin_access_instructions("https://admin.example.com", Some(&bundle));
+
+        assert!(instructions.contains("Root node:     https://admin.example.com/v1/root"));
+        assert!(!instructions.contains("Root node:     curl"));
+    }
+
+    #[test]
+    fn mesh_admin_access_instructions_print_plain_http_curl() {
+        let instructions = mesh_admin_access_instructions("http://localhost:1729", None);
+
+        assert!(instructions.contains("Root node:     curl http://localhost:1729/v1/root"));
+    }
 
     /// Minimal introspectable actor for tests. The `#[export]`
     /// attribute generates `Named + Referable + Binds` so that
@@ -4375,40 +4586,58 @@ mod tests {
         assert_eq!(parsed, proc_id);
     }
 
-    /// PS-12: service proc routes to HostAgent.
+    /// PS-12: a registered legacy service proc routes to HostAgent.
     #[test]
     fn route_proc_handler_service_proc_yields_host() {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let proc_id = ResourceId::proc_addr_from_name(ChannelAddr::Tcp(addr), SERVICE_PROC_NAME);
-        let handler = route_proc_handler(&proc_id.to_string()).unwrap();
+        let host_agents = HashSet::from([proc_id.actor_addr(HOST_MESH_AGENT_ACTOR_NAME)]);
+        let handler = route_proc_handler(&host_agents, &proc_id.to_string()).unwrap();
         assert!(
             matches!(handler, ResolvedProcHandler::Host(_)),
-            "service proc should resolve to Host variant"
+            "a registered legacy service proc should resolve to Host"
         );
     }
 
-    /// PS-12: non-service proc routes to ProcAgent.
+    /// PS-12: an unregistered worker proc routes to ProcAgent.
     #[test]
     fn route_proc_handler_worker_proc_yields_proc() {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let proc_id = test_proc_id_with_addr(ChannelAddr::Tcp(addr), "worker_0");
-        let handler = route_proc_handler(&proc_id.to_string()).unwrap();
+        let handler = route_proc_handler(&HashSet::new(), &proc_id.to_string()).unwrap();
         assert!(
             matches!(handler, ResolvedProcHandler::Proc(_)),
-            "non-service proc should resolve to Proc variant"
+            "an unregistered worker proc should resolve to Proc"
         );
     }
 
-    /// PS-12: a labeled instance named "service" is still a normal proc.
+    /// PS-12: a registered instance proc routes to HostAgent regardless of label.
     #[test]
-    fn route_proc_handler_service_instance_yields_proc() {
+    fn route_proc_handler_registered_instance_yields_host() {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let proc_id =
-            ResourceId::proc_addr_from_name(ChannelAddr::Tcp(addr), "service-deadbeefdeadbeef");
-        let handler = route_proc_handler(&proc_id.to_string()).unwrap();
+        let proc_id = ProcAddr::new(
+            ProcId::instance(Label::strip("host-control")),
+            ChannelAddr::Tcp(addr).into(),
+        );
+        let host_agents = HashSet::from([proc_id.actor_addr(HOST_MESH_AGENT_ACTOR_NAME)]);
+        let handler = route_proc_handler(&host_agents, &proc_id.to_string()).unwrap();
+        assert!(
+            matches!(handler, ResolvedProcHandler::Host(_)),
+            "a registered proc should resolve to Host regardless of its label"
+        );
+    }
+
+    #[test]
+    fn route_proc_handler_service_label_without_host_registration_yields_proc() {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let proc_id = ProcAddr::new(
+            ProcId::instance(Label::strip(SERVICE_PROC_NAME)),
+            ChannelAddr::Tcp(addr).into(),
+        );
+        let handler = route_proc_handler(&HashSet::new(), &proc_id.to_string()).unwrap();
         assert!(
             matches!(handler, ResolvedProcHandler::Proc(_)),
-            "service-labeled instance proc should resolve to Proc variant"
+            "an unregistered proc must not become a host service based on its label"
         );
     }
 }

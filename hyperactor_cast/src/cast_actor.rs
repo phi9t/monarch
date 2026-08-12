@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -70,14 +71,15 @@ use hyperactor::mailbox::UndeliverableReason;
 use hyperactor::mailbox::monitored_return_handle;
 use hyperactor::ordering::SEQ_INFO;
 use hyperactor::ordering::SeqInfo;
+use hyperactor::ordering::SeqKey;
 use hyperactor::port::Port;
 use hyperactor::value_mesh::ValueMesh;
 use hyperactor_config::Flattrs;
 use ndslice::Point;
 use ndslice::Region;
-use ndslice::view::MapIntoExt;
 use ndslice::view::RankedSliceable;
 use ndslice::view::View;
+use ndslice::view::ViewExt;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
@@ -88,8 +90,11 @@ use crate::tile::Tile;
 pub use crate::tile::TilingPolicy;
 
 hyperactor_config::declare_attrs! {
-    /// Header stamped on each locally delivered message with the
-    /// recipient's point within the casting domain.
+    /// Point associated with a cast delivery or actor construction.
+    ///
+    /// Message headers carry the recipient's point in the current casting
+    /// domain. An `ActorEnvironment` may carry an inherited construction point;
+    /// it does not establish actor-mesh membership.
     pub attr CAST_POINT: Point;
 
     /// Header stamped on each locally delivered message with the
@@ -275,6 +280,9 @@ pub struct CastDomainRef {
     subtrees: Vec<CastSubtree>,
     /// Destination actor addresses keyed by this domain's rank space.
     members: Arc<ValueMesh<ActorAddr>>,
+    /// Per-rank handler sequence keys derived lazily from `members`.
+    #[serde(skip)]
+    seq_keys: Arc<OnceLock<Arc<Vec<SeqKey>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +302,7 @@ impl CastDomainRef {
             id,
             subtrees,
             members,
+            seq_keys: Arc::new(OnceLock::new()),
         }
     }
 
@@ -344,7 +353,7 @@ impl CastDomainRef {
         let mut data = wirevalue::Any::<wirevalue::encoding::Multipart>::serialize(&message)?;
         let sender = cx.mailbox().actor_addr().clone();
         let dest_port = M::port();
-        let (session_id, seqs) = self.seqs_for_cast(cx, dest_port)?;
+        let (session_id, seqs) = self.seqs_for_cast(cx)?;
 
         let cast_headers = headers.clone();
         let subtree_seqs = self
@@ -426,24 +435,24 @@ impl CastDomainRef {
     /// forwarding hops do not need route-local metadata to derive receiver
     /// ordering. `ValueMesh` preserves the domain rank space while allowing
     /// compact representations when seqs happen to be compressible.
-    fn seqs_for_cast(
-        &self,
-        cx: &impl context::Actor,
-        dest_port: u64,
-    ) -> Result<(Uuid, ValueMesh<u64>)> {
+    fn seqs_for_cast(&self, cx: &impl context::Actor) -> Result<(Uuid, ValueMesh<u64>)> {
         let sequencer = cx.instance().sequencer();
 
-        let mut seqs: ValueMesh<u64> = self.members.as_ref().map_into(|member| {
-            let port = member.port_addr(Port::handler_id(dest_port, None));
-            let SeqInfo::Session { session_id: _, seq } = sequencer.assign_seq(&port) else {
-                unreachable!("assign_seq always returns SeqInfo::Session");
-            };
-            seq
-        });
-
-        seqs.compress_adjacent_in_place();
-
-        Ok((sequencer.session_id(), seqs))
+        Ok((
+            sequencer.session_id(),
+            ValueMesh::from_ranges_with_default(
+                self.members.region().clone(),
+                0,
+                sequencer.assign_seqs(self.seq_keys.get_or_init(|| {
+                    Arc::new(
+                        self.members
+                            .values()
+                            .map(|member| SeqKey::for_handler(&member))
+                            .collect(),
+                    )
+                })),
+            )?,
+        ))
     }
 }
 

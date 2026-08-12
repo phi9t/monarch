@@ -154,9 +154,6 @@ async def async_main() -> None:
             f"\npy-spy workload: mode={args.mode}, "
             f"work_ms={args.work_ms}, concurrency={args.concurrency}"
         )
-        print(f"\nMesh admin server listening on {admin_url}")
-        print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
-        print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
         print("\nVerify with:")
         print("  buck2 run fbcode//monarch/python/examples:verify_pyspy -- \\")
         if mtls_flags:
@@ -166,9 +163,13 @@ async def async_main() -> None:
             print(f"    --admin-url {admin_url} --mode {args.mode} --samples 10")
         print("\nPress Ctrl+C to stop.\n", flush=True)
 
-        # Spawn worker procs. The actor name pyspy_worker lets the
-        # verifier filter to workload procs by prefix.
-        procs = host.spawn_procs(per_host={"replica": args.concurrency})
+        # Name the proc mesh so mesh admin shows pyspy_worker-N instead of anon-N.
+        procs = host.spawn_procs(
+            name="pyspy_worker",
+            per_host={"replica": args.concurrency},
+        )
+
+        # The verifier locates workload procs by their pyspy_worker actor.
         workers = procs.spawn("pyspy_worker", Worker, args.mode, args.work_ms)
 
         # Start all workers.

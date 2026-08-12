@@ -25,12 +25,13 @@ use anyhow::Context;
 use super::memory_region::IbvMemoryRegionView;
 use super::primitives::IbvConfig;
 use super::primitives::IbvContext;
+use super::primitives::IbvCq;
 use super::primitives::IbvDeviceInfo;
 use super::primitives::IbvMr;
 use super::primitives::IbvPd;
 use super::queue_pair::IbvQueuePair;
+use crate::device_selection::MemoryLocation;
 use crate::local_memory::KeepaliveLocalMemory;
-use crate::local_memory::is_device_ptr;
 
 /// Manages RDMA resources including context and protection domain.
 ///
@@ -186,10 +187,17 @@ impl<I: IbvDomainImpl> IbvDomain<I> {
         unsafe { I::register_mr(self, mem) }
     }
 
-    /// Create a queue pair against this domain, dispatching to the backend
-    /// [`IbvDomainImpl`] strategy.
-    pub fn create_queue_pair(&self, config: &IbvConfig) -> anyhow::Result<I::QueuePair> {
-        I::create_queue_pair(self, config)
+    /// Create a queue pair against this domain, reporting its completions on
+    /// `cq`, dispatching to the backend [`IbvDomainImpl`] strategy.
+    pub fn create_queue_pair(
+        &self,
+        config: &IbvConfig,
+        cq: Arc<IbvCq>,
+    ) -> anyhow::Result<I::QueuePair> {
+        // SAFETY: a fully-constructed `IbvDomain` holds a null-or-live PD, and
+        // through it a null-or-live context, per its construction contract --
+        // which is what `I::create_queue_pair` requires.
+        unsafe { I::create_queue_pair(self, config, cq) }
     }
 }
 
@@ -241,15 +249,36 @@ pub trait IbvDomainImpl: std::fmt::Debug + Send + Sync + 'static + Sized {
         unsafe { register_host_or_dmabuf_mr(domain, mem) }
     }
 
-    /// Create a queue pair against `domain`. The default builds [`Self::QueuePair`]
-    /// directly; backends override to construct their own queue-pair type.
-    fn create_queue_pair(
+    /// Create a queue pair against `domain`, reporting every completion on
+    /// `cq`. The default builds [`Self::QueuePair`] directly; backends override
+    /// to construct their own queue-pair type.
+    ///
+    /// One queue serves both the send and receive sides, because nothing posts
+    /// receive work requests on these queue pairs -- a separate receive queue
+    /// would only ever stay empty.
+    ///
+    /// # Safety
+    ///
+    /// `domain` must hold a null or live PD (`domain.as_ptr()`) and, with it, a
+    /// null or live device context, and `cq` must hold a live `ibv_cq` created
+    /// on that context: the queue pair is built against that PD and reports its
+    /// completions on that queue. A null PD yields `Err` rather than reaching
+    /// the driver.
+    unsafe fn create_queue_pair(
         domain: &IbvDomain<Self>,
         config: &IbvConfig,
+        cq: Arc<IbvCq>,
     ) -> anyhow::Result<Self::QueuePair> {
-        // SAFETY: a fully-constructed `IbvDomain` holds a null-or-live PD per
-        // its construction contract, which is what `IbvQueuePair::new` requires.
-        unsafe { Self::QueuePair::new(domain, config.clone()) }
+        // Reject a null PD (e.g. a test domain) up front, so a domain that
+        // cannot back a queue pair says so rather than reaching the driver.
+        if domain.as_ptr().is_null() {
+            anyhow::bail!("cannot create a queue pair on a null protection domain");
+        }
+
+        // SAFETY: `domain` holds a live PD (null was rejected above) and `cq` a
+        // live queue on its context, per this method's contract, which is what
+        // `IbvQueuePair::new` requires.
+        unsafe { Self::QueuePair::new(domain, config.clone(), Arc::clone(&cq), cq) }
     }
 }
 
@@ -421,9 +450,10 @@ pub(super) unsafe fn register_dmabuf_mr(
     // so make the pointer's own device context current first. Without this, in a
     // multi-GPU process it fails with `CUDA_ERROR_NOT_FOUND` whenever the active
     // context belongs to a different device than `addr`.
-    // SAFETY: this path is only taken for device memory (`is_device_ptr(addr)`
-    // in `register_host_or_dmabuf_mr`), so `addr` is a valid CUDA device pointer
-    // as `set_ctx_for_ptr` requires. The guard restores the prior context on drop.
+    // SAFETY: this path is only taken for device memory (the
+    // `MemoryLocation::Gpu` arm in `register_host_or_dmabuf_mr`), so `addr` is a
+    // valid CUDA device pointer as `set_ctx_for_ptr` requires. The guard
+    // restores the prior context on drop.
     let _ctx_guard = unsafe { crate::local_memory::set_ctx_for_ptr(addr)? };
 
     let (base, base_size) = cuda_alloc_range(addr)?;
@@ -476,10 +506,9 @@ pub(super) unsafe fn register_host_or_dmabuf_mr<I: IbvDomainImpl>(
     // PD (the helpers error on null), and `[addr, addr + size)` stays valid for
     // the returned MR's lifetime.
     let (mr, mr_offset) = unsafe {
-        if is_device_ptr(addr) {
-            register_dmabuf_mr(domain.pd(), addr, size, access_flags)?
-        } else {
-            (register_host_mr(domain.pd(), addr, size, access_flags)?, 0)
+        match mem.location() {
+            MemoryLocation::Gpu(_) => register_dmabuf_mr(domain.pd(), addr, size, access_flags)?,
+            MemoryLocation::Cpu(_) => (register_host_mr(domain.pd(), addr, size, access_flags)?, 0),
         }
     };
 
@@ -512,9 +541,10 @@ pub(super) unsafe fn register_host_or_dmabuf_mr<I: IbvDomainImpl>(
 mod tests {
     use super::*;
     use crate::backend::cuda_test_utils::CudaAllocator;
+    use crate::backend::cuda_test_utils::cuda_device_count;
     use crate::backend::ibverbs::device::IbvDevice;
     use crate::backend::ibverbs::device::IbvDeviceImpl;
-    use crate::backend::ibverbs::device_selection::get_cuda_device_to_ibv_device;
+    use crate::backend::ibverbs::device_selection::get_cuda_device_to_ibv_devices;
     use crate::backend::ibverbs::mlx_device::MlxDevice;
     use crate::backend::ibverbs::mlx_domain::MlxDomain;
 
@@ -528,16 +558,27 @@ mod tests {
     /// open/creation failure panics. The returned domain owns its context, so it
     /// (and its PD) stays valid after the local [`IbvDevice`] drops.
     fn open_domain_for_cuda_device(device: i32) -> IbvDomain<MlxDomain> {
-        let nic = get_cuda_device_to_ibv_device::<MlxDevice>()
+        // Ranking NICs against a CUDA ordinal asks the driver for the GPU's PCI
+        // address, and `device_selection` deliberately never loads or initializes
+        // the driver itself. Do it here: nothing else in this module touches CUDA
+        // before this point, so the ranking below would otherwise fail with
+        // `CUDA_ERROR_NOT_INITIALIZED`.
+        assert!(
+            cuda_device_count() > device,
+            "CUDA device {device} is required by this test",
+        );
+        let ordinal_to_nics = get_cuda_device_to_ibv_devices::<MlxDevice>()
+            .expect("the CUDA driver is initialized above");
+        let nic = ordinal_to_nics
             .get(device as usize)
-            .and_then(|nic| nic.as_ref())
+            .and_then(|nics| nics.first())
             .expect("CUDA device should map to RDMA NIC")
             .name()
             .clone();
         let mut config = IbvConfig::default();
         MlxDevice::apply_config_defaults(&mut config);
         let dev =
-            IbvDevice::<MlxDevice>::open(&nic, config.clone()).expect("mapped NIC should open");
+            IbvDevice::<MlxDevice>::try_open(&nic, config.clone()).expect("mapped NIC should open");
         // SAFETY: `dev.context()` wraps the live `ibv_context` opened above; the
         // returned `Arc<IbvContext>` keeps it open for the new domain's lifetime.
         unsafe { IbvDomain::new(dev.context(), dev.device_info().clone(), &config) }
@@ -735,9 +776,8 @@ mod tests {
         let view = unsafe { register_host_or_dmabuf_mr(&domain, &mem) }.unwrap();
         // Tie the view's lifetime to the allocation's lifetime so that the safety contract
         // above holds.
-        mem.mr_slot()
-            .set(view.clone())
-            .expect("mr_slot not already set");
+        mem.install_mr::<MlxDevice>(view.clone())
+            .expect("the region has no registration on this device yet");
         assert_eq!(view.virtual_addr, alloc.ptr());
         assert_eq!(view.size, alloc.size());
         assert_eq!(view.rdma_addr, 0, "whole allocation starts at MR offset 0");
@@ -763,9 +803,8 @@ mod tests {
         let view = unsafe { register_host_or_dmabuf_mr(&domain, &mem) }.unwrap();
         // Tie the view's lifetime to the allocation's lifetime so that the safety contract
         // above holds.
-        mem.mr_slot()
-            .set(view.clone())
-            .expect("mr_slot not already set");
+        mem.install_mr::<MlxDevice>(view.clone())
+            .expect("the region has no registration on this device yet");
         assert_eq!(view.virtual_addr, alloc.ptr() + offset);
         assert_eq!(view.size, size);
         assert_eq!(view.rdma_addr, offset, "rdma_addr is the sub-range offset");
@@ -787,9 +826,8 @@ mod tests {
         let view = unsafe { register_host_or_dmabuf_mr(&domain, &mem) }.unwrap();
         // Tie the view's lifetime to the allocation's lifetime so that the safety contract
         // above holds.
-        mem.mr_slot()
-            .set(view.clone())
-            .expect("mr_slot not already set");
+        mem.install_mr::<MlxDevice>(view.clone())
+            .expect("the region has no registration on this device yet");
         assert_eq!(view.virtual_addr, alloc.ptr() + offset);
         assert_eq!(view.size, size);
         assert_eq!(view.rdma_addr, offset);
@@ -808,9 +846,8 @@ mod tests {
         let view = unsafe { register_host_or_dmabuf_mr(&domain, &mem) }.unwrap();
         // Tie the view's lifetime to the allocation's lifetime so that the safety contract
         // above holds.
-        mem.mr_slot()
-            .set(view.clone())
-            .expect("mr_slot not already set");
+        mem.install_mr::<MlxDevice>(view.clone())
+            .expect("the region has no registration on this device yet");
         assert_eq!(view.virtual_addr, alloc.ptr());
         assert_eq!(view.size, size);
         assert_eq!(view.rdma_addr, 0);

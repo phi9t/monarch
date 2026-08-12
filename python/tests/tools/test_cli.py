@@ -7,6 +7,7 @@
 # pyre-strict
 
 import unittest
+from unittest.mock import MagicMock, patch
 
 from monarch.tools.cli import get_parser, main
 
@@ -27,6 +28,40 @@ class TestCli(unittest.TestCase):
         args = parser.parse_args(["context", "use", "myjob"])
         self.assertEqual(args.name, "myjob")
 
+    def test_dashboard_mast_command(self) -> None:
+        parser = get_parser()
+        args = parser.parse_args(["dashboard", "mast", "sample-mast-job"])
+        self.assertEqual(args.job, "sample-mast-job")
+        self.assertIsNone(args.role_name)
+        self.assertEqual(8265, args.dashboard_port)
+        self.assertFalse(hasattr(args, "relay_port"))
+
+    def test_dashboard_mast_accepts_role_name(self) -> None:
+        parser = get_parser()
+        args = parser.parse_args(
+            [
+                "dashboard",
+                "mast",
+                "sample-mast-job",
+                "--role-name",
+                "worker",
+            ]
+        )
+        self.assertEqual("worker", args.role_name)
+
+    def test_dashboard_mast_accepts_dashboard_port(self) -> None:
+        parser = get_parser()
+        args = parser.parse_args(
+            [
+                "dashboard",
+                "mast",
+                "sample-mast-job",
+                "--dashboard-port",
+                "9000",
+            ]
+        )
+        self.assertEqual(9000, args.dashboard_port)
+
     def test_exec_run_all_default(self) -> None:
         parser = get_parser()
         args = parser.parse_args(["exec", "echo", "hi"])
@@ -42,6 +77,33 @@ class TestCli(unittest.TestCase):
         parser = get_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["exec", "--all", "--mesh", "workers", "echo"])
+
+    @patch("monarch.tools.cli.shell_on_job", return_value=0)
+    def test_shell_forwards_single_host_options(self, shell_on_job: MagicMock) -> None:
+        parser = get_parser()
+        args = parser.parse_args(
+            [
+                "shell",
+                "--mesh",
+                "workers",
+                "--point",
+                "host=2",
+                "-e",
+                "FOO=bar",
+                "--workdir",
+                "/tmp/work",
+            ]
+        )
+
+        args.func(args)
+
+        shell_on_job.assert_called_once_with(
+            mesh_name="workers",
+            point_str="host=2",
+            env=["FOO=bar"],
+            workdir="/tmp/work",
+            kill=False,
+        )
 
     def test_help_has_job_reuse(self) -> None:
         import importlib.resources

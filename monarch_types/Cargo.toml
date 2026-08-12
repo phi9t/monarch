@@ -8,7 +8,7 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-derive_more = { version = "1.0.0", features = ["full"] }
+derive_more = { version = "2.1.1", features = ["full"] }
 monarch_gil = { version = "0.0.0", path = "../monarch_gil" }
 pyo3 = { version = "0.27", features = ["anyhow", "multiple-pymethods", "py-clone"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
@@ -18,10 +18,10 @@ typeuri = { version = "0.0.0", path = "../typeuri" }
 [dev-dependencies]
 anyhow = "1.0.104"
 timed_test = { version = "0.0.0", path = "../timed_test" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 
 [build-dependencies]
-build_utils = { path = "../build_utils" }
+build_utils = { version = "0.0.0", path = "../build_utils" }
 
 [features]
 default = []

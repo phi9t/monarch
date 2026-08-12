@@ -329,7 +329,47 @@ sequenceDiagram
     Mesh-->>Client: Future[List[Result]]
 ```
 
-#### 3. `broadcast()` - Fire and Forget
+#### 3. `choose()` - Random Single Actor
+
+Send to one randomly selected actor and get its response.
+
+```python
+workers = procs.spawn("workers", Worker)
+
+result = workers.compute.choose(data).get()
+```
+
+Each call independently selects an actor uniformly at random. Selection does not
+account for actor load, so calls are balanced only across many calls, and
+consecutive calls may hit the same actor.
+
+**Use When:**
+- Any one actor can serve the request
+- Actors are interchangeable and hold no per-rank state
+- Approximate spreading over many calls is good enough
+
+**Avoid When:**
+- The workload is sensitive to how evenly work is distributed
+- You need a specific rank — slice the mesh and use `call_one` instead
+
+**Flow Diagram:**
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Mesh
+    participant A1 as Actor 1
+    participant A2 as Actor 2
+    participant An as Actor N
+
+    Client->>Mesh: choose(args)
+    Note over Mesh: Pick one rank at random
+    Mesh->>A2: message
+    A2-->>Mesh: result
+    Mesh-->>Client: Future[Result]
+```
+
+#### 4. `broadcast()` - Fire and Forget
 
 Send to all actors without waiting for responses.
 
@@ -362,7 +402,7 @@ sequenceDiagram
     Note over Actors: Process async
 ```
 
-#### 4. `rref()` - Distributed Tensor Reference
+#### 5. `rref()` - Distributed Tensor Reference
 
 Return distributed tensor from actor endpoint.
 
@@ -389,7 +429,7 @@ with procs.activate():
 - Need tensor operations across actors
 - Building neural network layers
 
-#### 5. `stream()` - Streaming Responses
+#### 6. `stream()` - Streaming Responses
 
 Stream responses as they arrive.
 
@@ -1088,18 +1128,14 @@ When spawning processes, you can customize the bootstrap command used to launch 
 Pass a `BootstrapCommand` to use the same command for all spawned processes:
 
 ```python
-from monarch._rust_bindings.monarch_hyperactor.host_mesh import BootstrapCommand
-from monarch.actor import this_host
+from monarch.actor import default_bootstrap_cmd, this_host
 
 host = this_host()
 
 # Custom BootstrapCommand for all procs
-cmd = BootstrapCommand(
-    program="/custom/python",
-    arg0=None,
-    args=["-m", "monarch._src.actor.bootstrap_main"],
-    env={"CUDA_VISIBLE_DEVICES": "0,1,2,3", "MY_VAR": "value"},
-)
+cmd = default_bootstrap_cmd()
+cmd.program = "/custom/python"
+cmd = cmd.with_env({"CUDA_VISIBLE_DEVICES": "0,1,2,3", "MY_VAR": "value"})
 procs = host.spawn_procs(
     per_host={"gpus": 4},
     bootstrap_command=cmd
@@ -1111,19 +1147,14 @@ procs = host.spawn_procs(
 Pass a callable to customize the bootstrap command per process. The callable receives a `Point` representing the combined coordinate across host and per_host dimensions:
 
 ```python
-from monarch.actor import this_host
-from monarch._rust_bindings.monarch_hyperactor.host_mesh import BootstrapCommand
+from monarch.actor import default_bootstrap_cmd, this_host
 
 host = this_host()
+base = default_bootstrap_cmd()
 
 # Set CUDA_VISIBLE_DEVICES based on coordinate
 def make_bootstrap(point):
-    return BootstrapCommand(
-        program="/usr/bin/python3",
-        arg0=None,
-        args=["-m", "monarch._src.actor.bootstrap_main"],
-        env={"CUDA_VISIBLE_DEVICES": str(point["gpus"])},
-    )
+    return base.with_env({"CUDA_VISIBLE_DEVICES": str(point["gpus"])})
 
 procs = host.spawn_procs(
     per_host={"gpus": 4},
@@ -1142,7 +1173,7 @@ This is particularly useful for:
 
 ### Using with_env for Ergonomic Customization
 
-The `BootstrapCommand.with_env()` method makes it easy to create modified copies of a base command with additional environment variables. Use `default_bootstrap_cmd()` to get the default command for the current environment:
+The `BootstrapCommand.env` dictionary is the complete child environment; a raw `BootstrapCommand` does not inherit variables from its parent process. The `BootstrapCommand.with_env()` method makes it easy to create modified copies of a complete base command with additional environment variables. Use `default_bootstrap_cmd()` to get the default command for the current environment:
 
 ```python
 from monarch.actor import default_bootstrap_cmd, this_host
@@ -1191,16 +1222,15 @@ procs2 = host.spawn_procs(per_host={"gpus": 2})
 Bootstrap commands work with other HostMesh customization methods:
 
 ```python
+from monarch.actor import default_bootstrap_cmd
+
 host = this_host()
 
 # Customize Python executable and bootstrap command
 custom_host = host.with_python_executable("/path/to/python")
-cmd = BootstrapCommand(
-    program="/path/to/python",
-    arg0=None,
-    args=["-m", "monarch._src.actor.bootstrap_main"],
-    env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
-)
+cmd = default_bootstrap_cmd()
+cmd.program = "/path/to/python"
+cmd = cmd.with_env({"CUDA_VISIBLE_DEVICES": "0,1,2,3"})
 procs = custom_host.spawn_procs(
     per_host={"gpus": 4},
     bootstrap_command=cmd

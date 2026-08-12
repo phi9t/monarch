@@ -40,6 +40,7 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use hyperactor::Actor;
+use hyperactor::ActorEnvironment;
 use hyperactor::ActorHandle;
 use hyperactor::ActorRef;
 use hyperactor::Context;
@@ -51,7 +52,6 @@ use hyperactor::OncePortRef;
 use hyperactor::RefClient;
 use hyperactor::RemoteSpawn;
 use hyperactor::context;
-use hyperactor_config::Flattrs;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
@@ -162,7 +162,10 @@ impl RdmaManagerActor {
 impl RemoteSpawn for RdmaManagerActor {
     type Params = Option<IbvConfig>;
 
-    async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(
+        params: Self::Params,
+        _environment: &ActorEnvironment,
+    ) -> Result<Self, anyhow::Error> {
         Ok(Self {
             next_remote_buf_id: 0,
             buffers: HashMap::new(),
@@ -175,6 +178,7 @@ impl RemoteSpawn for RdmaManagerActor {
 #[async_trait]
 impl Actor for RdmaManagerActor {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
+        this.set_system();
         // An explicit per-manager target takes precedence over
         // `RDMA_IBVERBS_TARGET`. Otherwise validate the process setting here:
         // `spawn_available` may ignore an ibverbs initialization failure when
@@ -187,6 +191,9 @@ impl Actor for RdmaManagerActor {
         {
             let _ = crate::backend::ibverbs::device_selection::configured_ibverbs_target()?;
         }
+        // Likewise: nothing reads the affinity policy until a transfer runs, so
+        // a malformed value would otherwise surface far from its cause.
+        let _ = crate::backend::ibverbs::device_selection::configured_peer_device_affinity()?;
 
         // Spawn every available backend. `spawn_available` bails when none
         // is available (e.g. no NIC and TCP fallback disabled).

@@ -58,6 +58,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyperactor::Actor;
+use hyperactor::ActorEnvironment;
 use hyperactor::ActorRef;
 use hyperactor::Context;
 use hyperactor::Endpoint as _;
@@ -70,7 +71,6 @@ use hyperactor::channel::ChannelTransport;
 use hyperactor::context::Mailbox as _;
 use hyperactor::id::Label;
 use hyperactor::supervision::ActorSupervisionEvent;
-use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::Bootstrap;
 use hyperactor_mesh::HostBootstrapReady;
@@ -162,7 +162,10 @@ impl Actor for ParameterServerActor {
 impl RemoteSpawn for ParameterServerActor {
     type Params = (ActorRef<RdmaManagerActor>, usize);
 
-    async fn new(_params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(
+        _params: Self::Params,
+        _environment: &ActorEnvironment,
+    ) -> Result<Self, anyhow::Error> {
         let (owner_ref, worker_world_size) = _params;
         tracing::info!("creating parameter server actor");
         let weights_data = vec![0u8; BUFFER_SIZE].into_boxed_slice();
@@ -209,7 +212,7 @@ impl Handler<PsGetBuffers> for ParameterServerActor {
             let addr = self.weights_data.as_ptr() as usize;
             let size = self.weights_data.len();
             // See the module-level note on `NoKeepalive`.
-            let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive { addr, size }));
+            let local_memory = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive { addr, size }))?;
             let handle = self
                 .owner_ref
                 .downcast_handle(cx)
@@ -229,7 +232,8 @@ impl Handler<PsGetBuffers> for ParameterServerActor {
                 let addr = self.grad_buffer_data[rank].as_ptr() as usize;
                 let size = self.grad_buffer_data[rank].len();
                 // See the module-level note on `NoKeepalive`.
-                let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive { addr, size }));
+                let local_memory =
+                    KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive { addr, size }))?;
                 let handle = self
                     .owner_ref
                     .downcast_handle(cx)
@@ -316,7 +320,10 @@ impl Actor for WorkerActor {
 impl RemoteSpawn for WorkerActor {
     type Params = ();
 
-    async fn new(_params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+    async fn new(
+        _params: Self::Params,
+        _environment: &ActorEnvironment,
+    ) -> Result<Self, anyhow::Error> {
         let weights_data = vec![0u8; BUFFER_SIZE].into_boxed_slice();
         let local_gradients = vec![0u8; BUFFER_SIZE].into_boxed_slice();
         Ok(Self {
@@ -400,10 +407,10 @@ impl Handler<WorkerStep> for WorkerActor {
             .as_ref()
             .expect("worker_actor should be initialized");
         // See the module-level note on `NoKeepalive`.
-        let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+        let local_memory = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
             addr: self.local_gradients.as_ptr() as usize,
             size: self.local_gradients.len(),
-        }));
+        }))?;
 
         ps_grad_handle.write_from_local(cx, local_memory, 5).await?;
 
@@ -434,10 +441,10 @@ impl Handler<WorkerUpdate> for WorkerActor {
             .as_ref()
             .expect("worker_actor should be initialized");
         // See the module-level note on `NoKeepalive`.
-        let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+        let local_memory = KeepaliveLocalMemory::try_new(Arc::new(NoKeepalive {
             addr: self.weights_data.as_ptr() as usize,
             size: self.weights_data.len(),
-        }));
+        }))?;
         ps_weights_handle
             .read_into_local(cx, local_memory, 5)
             .await?;

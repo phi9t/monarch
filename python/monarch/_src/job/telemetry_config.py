@@ -64,7 +64,7 @@ from monarch._src.job.telemetry_actor import (
 )
 from monarch.actor import context, HostMesh, shutdown_context
 from monarch.distributed_telemetry.engine import QueryEngine
-from monarch.monarch_dashboard.server.app import start_dashboard
+from monarch.monarch_dashboard.server.app import start_telemetry_servers
 from monarch.monarch_dashboard.server.query_engine_adapter import QueryEngineAdapter
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ class TelemetryConfig:
             0 disables periodic capture.
     """
 
-    retention_secs: int = 600
+    retention_secs: int = 3600
     include_dashboard: bool = False
     dashboard_port: int = 8265
     snapshot_interval_secs: float = 30.0
@@ -105,7 +105,7 @@ class TelemetryConfig:
 # before the cast.
 class _TelemetryResponse(TypedDict):
     telemetry_url: str
-    dashboard_url: str
+    dashboard_url: str | None
     socket_path: str
 
 
@@ -277,7 +277,9 @@ class _TelemetryHandle:
             raise RuntimeError("telemetry handle is not open")
         api_url = dashboard_info["api_url"]
         url = dashboard_info["url"]
-        if not isinstance(api_url, str) or not isinstance(url, str):
+        if not isinstance(api_url, str) or (
+            url is not None and not isinstance(url, str)
+        ):
             raise RuntimeError(f"invalid dashboard info: {dashboard_info!r}")
         return {
             "telemetry_url": api_url,
@@ -304,9 +306,10 @@ class _TelemetryHandle:
         client_actor.activate.call_one().get()
 
         query_engine = QueryEngine(client_actor)
-        dashboard_info = start_dashboard(
+        dashboard_info = start_telemetry_servers(
             adapter=QueryEngineAdapter(query_engine),
             port=config.dashboard_port,
+            include_dashboard=config.include_dashboard,
         )
         # Self-activate the sidecar process's own `UnixSocketSink` against
         # the client socket so telemetry emitted *by* the sidecar (dashboard

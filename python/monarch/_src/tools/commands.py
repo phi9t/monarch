@@ -95,7 +95,7 @@ def create(
     from monarch.tools.config import (  # @manual=//monarch/python/monarch/tools/config/meta:defaults
         defaults,
     )
-    from torchx.specs import AppDef, AppDryRunInfo, CfgVal
+    from torchx.specs import AppDef, CfgVal
 
     if name is None:
         name = _default_name()
@@ -120,16 +120,9 @@ def create(
 
                 info = runner.dryrun(appdef, scheduler, cfg, str(workspace_out))
 
-        info_json_fmt = AppDryRunInfo(
-            info.request,
-            fmt=defaults.dryrun_info_formatter(info),
-        )
-        info_json_fmt._app = info._app
-        info_json_fmt._cfg = info._cfg
-        info_json_fmt._scheduler = info._scheduler
-
         if config.dryrun:
-            return info_json_fmt
+            info._fmt = defaults.dryrun_info_formatter(info)
+            return info
         else:
             server_handle = runner.schedule(info)
             return server_handle
@@ -714,3 +707,48 @@ def exec_on_job(
         shutdown_context().get()
 
     return max_rc
+
+
+def shell_on_job(
+    mesh_name: Optional[str] = None,
+    point_str: Optional[str] = None,
+    env: Optional[list[str]] = None,
+    workdir: Optional[str] = None,
+    kill: bool = False,
+) -> int:
+    """Load the current job and open a shell on one of its hosts."""
+    from monarch._src.job.shell import shell  # pyre-ignore[21]
+
+    job = load_current_job()
+    state = job.state()
+    if not state._hosts:
+        raise RuntimeError("Job has no host meshes")
+
+    if mesh_name is None:
+        mesh_name = next(iter(state._hosts))
+    elif mesh_name not in state._hosts:
+        raise ValueError(
+            f"Mesh {mesh_name!r} not found. Available: {list(state._hosts)}"
+        )
+
+    host_mesh = state._hosts[mesh_name]
+    if point_str is not None:
+        host_mesh = host_mesh.slice(**_parse_point(point_str))
+    else:
+        host_mesh = host_mesh.flatten("rank").slice(rank=0)
+
+    shell_env = _parse_env(env)
+    executable = job._components.mounts.python_executable_for_mesh(mesh_name)
+    if executable is not None:
+        bin_dir = os.path.dirname(executable)
+        existing_path = shell_env.get("PATH", os.environ.get("PATH", ""))
+        shell_env["PATH"] = f"{bin_dir}:{existing_path}"
+
+    returncode = shell(host_mesh, env=shell_env, workdir=workdir)
+    if kill:
+        from monarch.actor import shutdown_context  # pyre-ignore[21]
+
+        host_mesh.shutdown().get()
+        job.kill()
+        shutdown_context().get()
+    return returncode

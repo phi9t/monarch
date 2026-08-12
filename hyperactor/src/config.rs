@@ -18,6 +18,7 @@ use std::time::Duration;
 use hyperactor_config::AttrValue;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
+use hyperactor_config::NonZeroUsize;
 use hyperactor_config::attrs::declare_attrs;
 use serde::Deserialize;
 use serde::Serialize;
@@ -203,6 +204,24 @@ declare_attrs! {
     ))
     pub attr CHANNEL_TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 
+    /// TCP congestion-control algorithm applied to channel sockets after
+    /// connect/accept (e.g. `bbr`). Empty (the default) leaves the host
+    /// default (`cubic`) in place, so this is a no-op for the overwhelming
+    /// majority of channels; only bandwidth-bound long-haul paths (e.g.
+    /// remotemount's client->leader block ship) opt in. `cubic` underfills a
+    /// link with a high bandwidth-delay product; `bbr` recovers that
+    /// bandwidth. Set via env
+    /// `HYPERACTOR_CHANNEL_TCP_CONGESTION` or
+    /// `configure(channel_tcp_congestion="bbr")`; both propagate to spawned
+    /// worker procs (env via the child's Env layer, `configure` via the
+    /// Runtime config snapshotted into the child), with env winning if both
+    /// are set.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("HYPERACTOR_CHANNEL_TCP_CONGESTION".to_string()),
+        Some("channel_tcp_congestion".to_string()),
+    ))
+    pub attr CHANNEL_TCP_CONGESTION: String = String::new();
+
     /// Maximum time `Link::next()` spends retrying a failed connect
     /// before giving up. Pairs with TCP keepalive: keepalive surfaces
     /// peer death as an I/O error, then the connect-retry loop quits
@@ -228,6 +247,15 @@ declare_attrs! {
         Some("enable_dest_actor_reordering_buffer".to_string()),
     ))
     pub attr ENABLE_DEST_ACTOR_REORDERING_BUFFER: bool = true;
+
+    /// Maximum number of destination keys assigned while holding the
+    /// sequencer lock.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("HYPERACTOR_SEQUENCER_MAX_LOCKED_KEYS".to_string()),
+        Some("sequencer_max_locked_keys".to_string()),
+    ))
+    pub attr SEQUENCER_MAX_LOCKED_KEYS: NonZeroUsize =
+        NonZeroUsize::new(128).expect("128 is non-zero");
 
     /// Timeout for [`Host::spawn`] to await proc readiness.
     ///
@@ -318,6 +346,7 @@ mod tests {
         );
         assert_eq!(config[MESSAGE_ACK_EVERY_N_MESSAGES], 1000);
         assert_eq!(config[SPLIT_MAX_BUFFER_SIZE], 5);
+        assert_eq!(config[SEQUENCER_MAX_LOCKED_KEYS].get(), 128);
     }
 
     #[tracing_test::traced_test]
@@ -405,6 +434,7 @@ mod tests {
         );
         assert_eq!(config[MESSAGE_ACK_EVERY_N_MESSAGES], 1000);
         assert_eq!(config[SPLIT_MAX_BUFFER_SIZE], 5);
+        assert_eq!(config[SEQUENCER_MAX_LOCKED_KEYS].get(), 128);
 
         // Verify the keys have defaults
         assert!(CODEC_MAX_FRAME_LENGTH.has_default());
@@ -412,6 +442,7 @@ mod tests {
         assert!(MESSAGE_ACK_TIME_INTERVAL.has_default());
         assert!(MESSAGE_ACK_EVERY_N_MESSAGES.has_default());
         assert!(SPLIT_MAX_BUFFER_SIZE.has_default());
+        assert!(SEQUENCER_MAX_LOCKED_KEYS.has_default());
 
         // Verify we can get defaults directly from keys
         assert_eq!(
@@ -428,6 +459,10 @@ mod tests {
         );
         assert_eq!(MESSAGE_ACK_EVERY_N_MESSAGES.default(), Some(&1000));
         assert_eq!(SPLIT_MAX_BUFFER_SIZE.default(), Some(&5));
+        assert_eq!(
+            SEQUENCER_MAX_LOCKED_KEYS.default().map(|v| v.get()),
+            Some(128)
+        );
     }
 
     #[test]

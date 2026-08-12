@@ -14,7 +14,6 @@ from typing import Any, Callable, cast, Coroutine, Iterable, Type, TYPE_CHECKING
 
 from monarch._rust_bindings.monarch_hyperactor.actor import (
     MethodSpecifier,
-    PanicFlag,
     PythonMessageKind,
 )
 from monarch._rust_bindings.monarch_hyperactor.buffers import Buffer
@@ -41,10 +40,11 @@ class MyActor:
         ctx: Any,
         method: MethodSpecifier,
         message: bytes,
-        panic_flag: PanicFlag,
+        panic_flag: Any,
         local_state: Iterable[Any],
         mesh_references: Iterable[Any],
         response_port: "PortProtocol[Any]",
+        correlation_id: int | None = None,
     ) -> None:
         match method:
             # pyrefly: ignore [invalid-pattern]

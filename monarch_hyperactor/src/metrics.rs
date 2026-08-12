@@ -10,23 +10,38 @@
 //!
 //! This module contains metrics definitions for tracking Python actor endpoint performance.
 
+use hyperactor::id::Label;
 use hyperactor_telemetry::declare_static_counter;
 use hyperactor_telemetry::declare_static_histogram;
+use opentelemetry::KeyValue;
+
+/// Stands in for a name an endpoint cannot supply.
+pub(crate) const UNKNOWN: &str = "unknown";
+
+/// The attributes carried by every endpoint metric:
+///   - the endpoint's method;
+///   - the actor it belongs to. Specifically, this is the name users use to
+///     spawn their mesh, not the actor ID, which contains additional information
+///     such as channel address.
+pub(crate) struct EndpointAttrs([KeyValue; 2]);
+
+impl EndpointAttrs {
+    pub(crate) fn new(method: &str, actor: Option<&Label>) -> Self {
+        let actor = actor.map_or_else(|| UNKNOWN.to_owned(), |actor| actor.as_str().to_owned());
+        Self([
+            KeyValue::new("method", method.to_owned()),
+            KeyValue::new("actor", actor),
+        ])
+    }
+
+    pub(crate) fn as_slice(&self) -> &[KeyValue] {
+        &self.0
+    }
+}
 
 // ENDPOINT METRICS
 // Tracks the size of endpoint messages in bytes
 declare_static_histogram!(ENDPOINT_MESSAGE_SIZE_HISTOGRAM, "endpoint_message_size");
-// Tracks latency of endpoint calls in microseconds
-declare_static_histogram!(
-    ENDPOINT_ACTOR_LATENCY_US_HISTOGRAM,
-    "endpoint_actor_latency_us_histogram"
-);
-// Tracks the total number of endpoint calls
-declare_static_counter!(ENDPOINT_ACTOR_COUNT, "endpoint_actor_count");
-// Tracks errors that occur during endpoint execution
-declare_static_counter!(ENDPOINT_ACTOR_ERROR, "endpoint_actor_error");
-// Tracks panics that occur during endpoint execution
-declare_static_counter!(ENDPOINT_ACTOR_PANIC, "endpoint_actor_panic");
 // Tracks latency of endpoint calls from the caller's perspective in microseconds
 declare_static_histogram!(
     ENDPOINT_CALL_LATENCY_US_HISTOGRAM,

@@ -33,11 +33,13 @@ first when building against this API.
 Errors return an `ApiErrorEnvelope` JSON body (see error schema).
 The `error.code` field is authoritative for programmatic decisions,
 not the HTTP status code. Stable codes: `not_found`, `bad_request`,
-`gateway_timeout`, `service_unavailable`, `internal_error`.
+`gateway_timeout`, `service_unavailable`, `pyspy_failed`,
+`internal_error`.
 
-`service_unavailable` is transient (server at capacity) — retry
-with backoff. `gateway_timeout` means a downstream host did not
-respond in time; the node may still exist.
+Retry a capacity-related `service_unavailable` with backoff. The same
+code can also mean a required tool is unavailable on the target.
+`gateway_timeout` means a downstream host did not respond in time;
+the node may still exist.
 
 ## Schema-first workflow
 
@@ -121,6 +123,11 @@ Most endpoints are read-only (`GET`). Three endpoints accept `POST`:
   - `{"BinaryNotFound": {"searched": [...]}}` — py-spy not available
   - `{"Failed": {"pid": N, "binary": "...", "exit_code": N, "stderr": "..."}}` — py-spy error
 
+  Native frames are requested server-side and are best-effort: on
+  failure the server retries python-only and still returns `Ok`, so
+  a degraded dump is only distinguishable via `warnings`. See
+  "py-spy: missing native frames".
+
   The endpoint supports worker procs and the service proc. A
   proc supports py-spy iff its stable handler actor is
   reachable: the service proc requires `host_agent`; non-service
@@ -138,10 +145,17 @@ Most endpoints are read-only (`GET`). Three endpoints accept `POST`:
 - `POST {base}/v1/pyspy_profile_svg/{proc_reference}`
   Profiles the process for a requested duration and returns an SVG
   flamegraph. POST body is JSON `PySpyProfileOpts`:
-  `{"duration_s": 5, "rate_hz": 100, "native": true, "threads": false, "nonblocking": false}`
+  `{"duration_s": 5, "rate_hz": 100, "native": false, "threads": false, "nonblocking": false}`
 
   Returns `image/svg+xml` on success. Long-running — timeout scales
   with `duration_s`. Max duration is configurable (default 300s).
+
+  `native` is caller-controlled for profiles. Unlike stack dumps, a
+  profile requested with `native: true` does not fall back to
+  Python-only sampling when native capture fails; it returns
+  `profile_failed`. Use `native: false` when a Python-only flamegraph
+  is acceptable, or configure a py-spy binary that can capture native
+  frames.
 
   Error responses:
   - 400 — invalid `duration_s` or `rate_hz`
@@ -233,7 +247,7 @@ Most endpoints are read-only (`GET`). Three endpoints accept `POST`:
   The endpoint performs two steps:
   1. Sends a `PySpyDump` message to the target proc's agent
      (same routing as `GET /v1/pyspy/{proc_reference}`).
-  2. Stores the result in DataFusion via the dashboard, keyed
+  2. Stores a successful result in DataFusion via the dashboard, keyed
      by a generated UUID.
 
   Success returns a `PyspyDumpAndStoreResponse`:
@@ -246,12 +260,86 @@ Most endpoints are read-only (`GET`). Three endpoints accept `POST`:
   {"sql": "SELECT * FROM pyspy_dumps WHERE dump_id = '550e8400-...'"}
   ```
 
-  Error handling follows the same conventions as
-  `GET /v1/pyspy/{proc_reference}`: `not_found` if the target
-  agent is unreachable, `gateway_timeout` on timeout.
+  `pyspy_dumps.warnings_json` preserves the result's warnings as a JSON
+  string array. Read it before interpreting a stored dump; a native-capture
+  fallback is recorded there.
+
+  A failed capture returns `pyspy_failed`, and a missing py-spy binary
+  returns `service_unavailable`. Neither response includes a `dump_id`.
+  An unreachable target returns `not_found`; a bridge timeout returns
+  `gateway_timeout`.
+
+  Runs the same native-frame capture as `GET /v1/pyspy`, with the
+  same best-effort fallback. See "py-spy: missing native frames".
 
 - `GET {base}/SKILL.md`
   This document.
+
+### py-spy: missing native frames
+
+**If every frame in a dump is a `.py` file, read `warnings` before
+drawing any conclusion about the process.** An all-Python stack is
+ambiguous: it may be the truth, or it may be a degraded capture.
+
+This matters because a proc blocked in a collective, an allocator, or a
+hyperactor C++ path shows nothing useful in Python-only frames -- one
+opaque call into an extension module, the real state invisible. Reading
+"idle" or "stuck in `<some .py line>`" off a degraded dump is the
+mistake this prevents.
+
+`GET /v1/pyspy` and `POST /v1/pyspy_dump` request native frames
+(`--native --native-all`) server-side, so a healthy dump interleaves
+interpreter and extension frames with the Python ones:
+
+```
+0x7f237a20189a       libpython3.12.so.1.0:0
+<your frame>         your_module.py:118
+task_step_impl       _asyncio.cpython-312-x86_64-linux-gnu.so:0
+```
+
+#### Recognizing the loss
+
+For stack dumps, native capture is best-effort: on failure the server
+retries python-only rather than erroring, so you get `200`, an `Ok`
+result, and no error anywhere. `warnings` is the only signal:
+
+- `native capture failed; fell back to python-only frames. py-spy
+  (<resolution>) could not unwind native frames …` — Python-only. Do not
+  treat the stack as complete.
+- `--native-all unsupported by py-spy (<resolution>); fell back to
+  --native` — native frames are present; the stack is usable.
+
+`<resolution>` is how py-spy was found: `PYSPY_BIN=/path` if set, else
+`py-spy on PATH`. A `PYSPY_BIN=…` prefix means the variable is already
+set to a build that cannot unwind — repoint it, do not set it.
+
+In the admin TUI the warning renders under the `pid`/`binary` header,
+above the first thread.
+
+#### Recovering native frames
+
+py-spy 0.4.0 fails with `UNW_EINVAL` on fbcode Python binaries; 0.4.1
+unwinds them. Install 0.4.1 from PyPI (wheel sha256
+`6a80ec05eb8a6883863a367c6a4d4f2d57de68466f7956b6367d4edd5c61bb29`):
+
+```
+mkdir -p /tmp/pyspy041 && cd /tmp/pyspy041
+curl -sSfL -o py_spy.whl https://files.pythonhosted.org/packages/68/fb/bc7f639aed026bca6e7beb1e33f6951e16b7d315594e7635a4f7d21d63f4/py_spy-0.4.1-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl
+echo '6a80ec05eb8a6883863a367c6a4d4f2d57de68466f7956b6367d4edd5c61bb29  py_spy.whl' | sha256sum -c -
+python3 -c "import zipfile,os; z=zipfile.ZipFile('py_spy.whl'); open('py-spy','wb').write(z.read('py_spy-0.4.1.data/scripts/py-spy')); os.chmod('py-spy',0o755)"
+```
+
+Point `PYSPY_BIN` at it **in the environment of the proc being dumped** --
+resolution happens there, at dump time, so it must precede that proc
+starting:
+
+```
+PYSPY_BIN=/tmp/pyspy041/py-spy <workload command>
+```
+
+`monarch.config.configure(pyspy_bin=...)` also works and reaches procs
+spawned afterwards. Neither route affects a running proc. 0.4.1 has no
+`--native-all`, so expect that warning; the frames are still native.
 
 ## Response: NodePayload
 
@@ -427,36 +515,3 @@ Compare across sessions. A score regression after a SKILL.md
 change means the edit made the document harder to follow. A
 score regression after a server change means the API or schema
 drifted. Use the schema `$id` to correlate.
-
-## py-spy validation
-
-Automated integration test (runs all three modes — cpu, block,
-mixed — sequentially):
-
-```
-buck2 test fbcode//monarch/hyperactor_mesh:pyspy_integration_test
-```
-
-Manual verification against a live mesh:
-
-1. Start the py-spy workload:
-
-```
-buck2 run fbcode//monarch/python/examples:pyspy_workload -- \
-  --mode cpu --work-ms 500 --concurrency 3
-```
-
-2. Run the verification script (exit codes: 0 PASS, 1 FAIL,
-   2 SKIP when py-spy is unavailable):
-
-```
-buck2 run fbcode//monarch/python/examples:verify_pyspy -- \
-  --admin-url <url> --mode cpu --samples 10 \
-  --cacert /var/facebook/rootcanal/ca.pem \
-  --cert /var/facebook/x509_identities/server.pem \
-  --key /var/facebook/x509_identities/server.pem
-```
-
-Modes: `cpu` (iterative CPU burn), `block` (blocking sleep),
-`mixed` (alternating CPU + async). The verifier checks for
-mode-specific evidence frames in py-spy stacks.

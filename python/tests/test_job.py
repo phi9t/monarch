@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import monarch._src.job._job_sidecar_worker as js_worker
 import monarch._src.job.job_sidecar as js
 import pytest
+from monarch._rust_bindings.monarch_hyperactor.proc import ProcId, Uid
 
 # Import directly from _src since job module isn't properly exposed
 from monarch._src.job.job import (
@@ -43,7 +44,29 @@ from monarch._src.job.job_components import JobComponent, JobComponents, MountCo
 from monarch._src.job.mount_config import Mounts
 from monarch._src.job.process import ProcessJob
 from monarch._src.job.process_guard import _Shutdown, _wait_for_socket
+from monarch._src.job.service_identity import (
+    deserialize_service_proc_ids,
+    serialize_service_proc_ids,
+)
 from monarch.actor import Future, HostMesh
+
+
+def test_explicit_uid_values_are_instance_identities() -> None:
+    first = ProcId(Uid.instance_from_value(12, "service"))
+    second = ProcId(Uid.instance_from_value(13, "service"))
+
+    assert isinstance(first, ProcId)
+    assert first != second
+    assert first.label == "service"
+    assert first.uid.is_instance
+    assert ProcId.from_string(str(first)) == first
+    assert pickle.loads(pickle.dumps(first)) == first
+    assert deserialize_service_proc_ids(
+        serialize_service_proc_ids([first, second])
+    ) == [
+        first,
+        second,
+    ]
 
 
 def _append_line(path: str, line: str) -> None:
@@ -219,17 +242,30 @@ def test_spawn_module_reenters_parent_binary_inside_par():
 
 def test_create_job_sidecar_spawns_job_sidecar_worker_module():
     with (
+        patch.object(js, "_IN_PAR", False),
         patch.object(js, "sidecar_transport_from_runtime", return_value="metatls"),
-        patch.object(js, "spawn_module") as spawn_module,
+        patch("monarch._src.job.process_guard.ProcessGuard.create") as create,
     ):
-        js.create_job_sidecar("apply_id")
+        js.create_job_sidecar(
+            "apply_id",
+            attach_to="tcp://127.0.0.1:45678",
+        )
 
-    spawn_module.assert_called_once_with(
-        js.job_sidecar_lock_path("apply_id"),
-        "apply_id",
+    lock_path, config_key, command = create.call_args.args
+    assert lock_path == js.job_sidecar_lock_path("apply_id")
+    assert config_key == "apply_id"
+    assert command == [
+        sys.executable,
+        "-m",
         "monarch._src.job._job_sidecar_worker",
-        runtime_transport="metatls",
-    )
+        "--runtime-transport",
+        "metatls",
+        "--attach-to",
+        "tcp://127.0.0.1:45678",
+    ]
+    assert create.call_args.kwargs == {
+        "env": {"HYPERACTOR_PROCESS_NAME": "job_sidecar"}
+    }
 
 
 def test_mounts_ensure_open_clears_existing_sidecar_when_empty():
@@ -277,7 +313,7 @@ def test_mounts_ensure_open_sends_mounts_request():
     guard.send.return_value.get.assert_called_once_with()
 
 
-def test_job_sidecar_worker_passes_transport_arg_to_server():
+def test_job_sidecar_worker_passes_startup_args_to_server():
     with (
         patch.object(
             sys,
@@ -286,6 +322,8 @@ def test_job_sidecar_worker_passes_transport_arg_to_server():
                 "worker",
                 "--runtime-transport",
                 "metatls",
+                "--attach-to",
+                "tcp://127.0.0.1:45678",
                 "/tmp/socket",
                 "123",
             ],
@@ -294,7 +332,28 @@ def test_job_sidecar_worker_passes_transport_arg_to_server():
     ):
         js_worker.main()
 
-    run_sidecar.assert_called_once_with("/tmp/socket", runtime_transport="metatls")
+    run_sidecar.assert_called_once_with(
+        "/tmp/socket",
+        runtime_transport="metatls",
+        attach_to="tcp://127.0.0.1:45678",
+    )
+
+
+def test_run_job_sidecar_attaches_gateway_once_before_serving():
+    server = MagicMock()
+    server.accept.side_effect = OSError
+    with (
+        patch("signal.signal"),
+        patch.object(js, "attach") as attach,
+        patch.object(js.socket, "socket", return_value=server),
+    ):
+        js._run_job_sidecar(
+            "/tmp/socket",
+            attach_to="tcp://127.0.0.1:45678",
+        )
+
+    attach.assert_called_once_with("tcp://127.0.0.1:45678")
+    server.bind.assert_called_once_with("/tmp/socket")
 
 
 def test_run_job_sidecar_manages_mount_lifecycle():
@@ -1197,6 +1256,18 @@ def test_telemetry_uses_sidecar():
     m.install_sink.assert_called_once_with("/tmp/telemetry.sock")
 
 
+def test_telemetry_dashboard_url_printed_only_once(capsys):
+    with _patched_sidecar():
+        job = MockJobTrait(host_names=["hosts"]).enable_telemetry(
+            TelemetryConfig(include_dashboard=True)
+        )
+        job.state(cached_path=None)
+        job.state(cached_path=None)
+
+    output = capsys.readouterr().out
+    assert output.count("Monarch Dashboard: http://dashboard\n") == 1
+
+
 def test_sidecar_bootstrap_then_fanout_carry_host_meshes():
     """state() bootstraps the sidecar with empty host_meshes, then fans out
     workers with the materialized host meshes."""
@@ -1271,15 +1342,18 @@ def test_sidecar_worker_fanout_uses_configured_host_meshes():
     assert state.hosts.python_executable == python_exe
 
 
-def test_sidecar_bootstrap_failure_is_isolated():
+def test_sidecar_bootstrap_failure_is_isolated(capsys):
     """A sidecar bootstrap failure disables telemetry and never fails state()."""
     with _patched_sidecar(ensure_open_side_effect=RuntimeError("boom")) as m:
-        job = MockJobTrait(host_names=["hosts"]).enable_telemetry(TelemetryConfig())
+        job = MockJobTrait(host_names=["hosts"]).enable_telemetry(
+            TelemetryConfig(include_dashboard=True)
+        )
         state = job.state(cached_path=None)  # must not raise
 
     assert state.query_engine_client is None
     assert state.query_engine is None
     m.query_engine_client_cls.assert_not_called()
+    assert "Monarch Dashboard:" not in capsys.readouterr().out
 
 
 def test_sidecar_worker_fanout_failure_is_isolated():

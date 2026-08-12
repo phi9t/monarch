@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+from __future__ import annotations
 
 import abc
 import asyncio
@@ -16,7 +17,7 @@ import inspect
 import logging
 import threading
 import warnings
-from abc import abstractmethod, abstractproperty
+from abc import abstractmethod
 from dataclasses import dataclass
 from functools import cache
 from pprint import pformat
@@ -46,7 +47,6 @@ from typing import (
 from monarch._rust_bindings.monarch_hyperactor.actor import (
     DroppingPort,
     MethodSpecifier,
-    PanicFlag,
     PythonMessage,
     PythonMessageKind,
 )
@@ -63,12 +63,17 @@ from monarch._rust_bindings.monarch_hyperactor.mailbox import (
     UndeliverableMessageEnvelope,
 )
 from monarch._rust_bindings.monarch_hyperactor.pickle import (
+    _current_receiver_instance,
     PendingMessage,
     pickle,
     PicklingState,
 )
 from monarch._rust_bindings.monarch_hyperactor.proc import ActorAddr
-from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask
+from monarch._rust_bindings.monarch_hyperactor.pytokio import (
+    is_tokio_thread,
+    PythonTask,
+    WouldBlockRuntime,
+)
 from monarch._rust_bindings.monarch_hyperactor.shape import Point as HyPoint, Shape
 from monarch._rust_bindings.monarch_hyperactor.supervision import MeshFailure
 from monarch._src.actor import config
@@ -85,13 +90,14 @@ from monarch._src.actor.mpsc import Receiver  # noqa: F401 - used in annotations
 from monarch._src.actor.python_extension_methods import rust_struct
 from monarch._src.actor.shape import MeshTrait, NDSlice
 from monarch._src.actor.sync_state import fake_sync_state
-from monarch._src.actor.telemetry import METER, span
+from monarch._src.actor.telemetry import METER, span_with_correlation_id
 from monarch._src.actor.tensor_engine_shim import actor_rref, create_actor_message_kind
 from opentelemetry.metrics import Counter
 from typing_extensions import Self
 
 if TYPE_CHECKING:
     from monarch._rust_bindings.monarch_hyperactor.actor import (
+        PanicFlag,
         PortProtocol,
         QueuedMessage,
     )
@@ -171,7 +177,8 @@ class Instance(abc.ABC):
 
         return real_spawn(proc_mesh)
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def _mailbox(self) -> Mailbox:
         """
         This can be removed once we fix all the uses of mailbox to just use context instead.
@@ -185,7 +192,8 @@ class Instance(abc.ABC):
         """
         return self.actor_id.proc_id
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def actor_id(self) -> ActorAddr:
         """
         The actor_id of the current actor.
@@ -458,6 +466,12 @@ def _init_client_context(via: Optional[str] = None) -> Context:
     Create a client context that bootstraps an actor instance running on a real
     local proc mesh on a real local host mesh.
 
+    Fresh bootstrap ends in ``block_on()``, which panics on a Tokio runtime
+    worker. Reject it from every Tokio runtime context, including the blocking
+    pool, so this synchronous API does not depend on which Tokio-managed thread
+    invoked it. An already-initialized client bypasses this function and can
+    still be reused.
+
     When ``via`` is a non-empty ZMQ-style address, the local client's
     gateway is connected to the gateway serving that address: outbound
     traffic forwards over the duplex, and the remote gateway routes
@@ -466,6 +480,13 @@ def _init_client_context(via: Optional[str] = None) -> Context:
     procs are reached, not the host's identity. Use ``attach``
     to supply ``via`` before the client context is first used.
     """
+    if is_tokio_thread():
+        raise WouldBlockRuntime(
+            "cannot bootstrap a root client from inside the Tokio runtime; "
+            "call context(), this_host(), or attach(addr) before entering "
+            "Tokio. An already-initialized client can still be reused."
+        )
+
     import atexit
 
     from monarch._rust_bindings.monarch_hyperactor.host_mesh import bootstrap_host
@@ -523,7 +544,8 @@ def attach(addr: str) -> None:
     first client-context use. Raises ``RuntimeError`` if the client
     context has already been bootstrapped. ``this_host()`` still names
     the current machine — attach only changes how this host's procs
-    are reached.
+    are reached. Raises ``WouldBlockRuntime`` if called from inside a Tokio
+    runtime before the client has been initialized.
     """
     with _client_context._lock:
         if _client_context._val is not None:
@@ -590,7 +612,9 @@ def context() -> Context:
 
     Call this from within an endpoint to inspect the running actor and the
     current message's position in the mesh. Outside an actor (on the client) it
-    returns the root client context.
+    returns the root client context. Raises ``WouldBlockRuntime`` rather than
+    attempting fresh root-client bootstrap from inside a Tokio runtime; an
+    already-initialized client can still be reused there.
     """
     c = _context.get()
     if c is None:
@@ -734,6 +758,7 @@ def _create_endpoint_message(
     kwargs: Dict[str, Any],
     port_ref: "Optional[PortRef | OncePortRef]",
     proc_mesh: "Optional[ProcMesh]",
+    correlation_id: int | None = None,
 ) -> PendingMessage:
     """
     Create a PythonMessage for sending to an actor endpoint.
@@ -752,11 +777,17 @@ def _create_endpoint_message(
     )
     objects = pickling_state.tensor_engine_references()
     if not objects:
+        # `PythonMessageKind.CallMethod` is a pyo3 complex-enum variant; both type
+        # checkers model it as the classmethod-property getter, not the constructor.
         # pyrefly: ignore [bad-argument-count]
-        message_kind = PythonMessageKind.CallMethod(method_name, port_ref)
+        message_kind = PythonMessageKind.CallMethod(
+            method_name,  # pyre-ignore[19]
+            port_ref,
+            correlation_id,
+        )
     else:
         message_kind = create_actor_message_kind(
-            method_name, proc_mesh, objects, port_ref
+            method_name, proc_mesh, objects, port_ref, correlation_id
         )
 
     # pyrefly: ignore [bad-argument-type]
@@ -1104,8 +1135,15 @@ class Port(Generic[R]):
         def _reconstruct_port(
             port_ref: PortRef | OncePortRef, rank: Optional[int]
         ) -> "Port[R]":
-            instance = context().actor_instance._as_rust()
-            return Port(port_ref, instance, rank)
+            # Prefer the receiver the decoder installed. An eager reply decode
+            # runs on a Tokio worker with no Monarch context, where `context()`
+            # would bootstrap a client inside the receiving actor's process.
+            # Outside such a decode -- ordinary client-side reconstruction --
+            # there is no receiver and the context path is unchanged.
+            receiver = _current_receiver_instance()
+            if receiver is not None:
+                return Port(port_ref, receiver, rank)
+            return Port(port_ref, context().actor_instance._as_rust(), rank)
 
         return (
             _reconstruct_port,
@@ -1241,10 +1279,9 @@ class ActorInitArgs:
 
 
 class _QueuePanicFlag:
-    """Panic flag for queue dispatch mode.
+    """Store a panic so the dispatch loop can re-raise it after cleanup.
 
-    Unlike the DummyPanicFlag, this one stores the exception so it can
-    be re-raised after handle() returns, ensuring proper cleanup.
+    Re-raising after ``handle()`` returns ensures its cleanup runs first.
     """
 
     def __init__(self) -> None:
@@ -1289,10 +1326,11 @@ async def _handle_queued_message(actor: Any, msg: "QueuedMessage") -> None:
             msg.context,
             msg.method,
             msg.bytes,
-            panic_flag,  # pyre-ignore[6]: _QueuePanicFlag implements PanicFlag protocol
+            panic_flag,
             msg.local_state,
             msg.refs,
             msg.response_port,
+            msg.correlation_id,
         )
         # If a panic was signaled, re-raise it after handle() has cleaned up.
         if panic_flag.panic_exception is not None:
@@ -1334,6 +1372,7 @@ class _Actor:
         local_state: List[Any],
         mesh_references: List[Any],
         response_port: "PortProtocol[Any]",
+        correlation_id: int | None = None,
     ) -> None:
         MESSAGES_HANDLED.add(1)
 
@@ -1435,7 +1474,7 @@ class _Actor:
             try:
                 if is_coro:
                     if should_instrument:
-                        with span(method_name):
+                        with span_with_correlation_id(method_name, correlation_id):
                             result = await the_method(*args, **kwargs)
                     else:
                         result = await the_method(*args, **kwargs)
@@ -1443,7 +1482,7 @@ class _Actor:
                 else:
                     with fake_sync_state():
                         if should_instrument:
-                            with span(method_name):
+                            with span_with_correlation_id(method_name, correlation_id):
                                 result = the_method(*args, **kwargs)
                         else:
                             result = the_method(*args, **kwargs)
@@ -1659,6 +1698,11 @@ class Actor(MeshTrait):
             "actor implementations are not meshes, but we can't convince the typechecker of it..."
         )
 
+    def stop(self, reason: str = "stopped by client") -> "Future[None]":
+        raise NotImplementedError(
+            "actor implementations are not meshes, but we can't convince the typechecker of it..."
+        )
+
     # Methods to be (optionally) overridden by user code
     def _handle_undeliverable_message(
         self, message: UndeliverableMessageEnvelope
@@ -1702,7 +1746,7 @@ class Actor(MeshTrait):
         ...
 
     @_doc_stub
-    def __cleanup__(self, exc: Exception | None) -> None:
+    def __cleanup__(self, exc: Exception | None) -> None | Awaitable[None]:
         """Called when the actor stops, normally (via ``ActorMesh.stop()``) or
         because of an error. The same ``__cleanup__`` runs in both cases;
         ``exc`` is ``None`` on a normal stop and carries the exception on an

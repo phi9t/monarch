@@ -7,9 +7,8 @@
 """
 Internal implementation of SPMD job primitives.
 
-Provides the :func:`serve` function and :class:`SPMDJob` class for launching
-torchrun-style SPMD training jobs. Parses torchrun arguments and creates a Monarch
-mesh to run the training script, replicating torchrun behavior.
+Provides jobs for launching torchrun-style SPMD training and for attaching the
+Job API to workers rendezvoused through a torch distributed store.
 """
 
 import argparse
@@ -21,11 +20,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
 from monarch._rust_bindings.monarch_hyperactor.config import configure
+from monarch._rust_bindings.monarch_hyperactor.proc import ProcId
 from monarch._src.actor.bootstrap import attach_to_workers
+from monarch._src.actor.future import Future
 from monarch._src.actor.host_mesh import this_host
 from monarch._src.job.job import JobState, JobTrait
+from monarch._src.job.service_identity import (
+    allocate_service_proc_ids,
+    serialize_service_proc_ids,
+    service_proc_addrs,
+    SERVICE_PROC_IDS_ENV,
+    SERVICE_PROC_RANK_ENV,
+)
 from monarch._src.spmd.actor import SPMDActor
+from monarch._src.spmd.host_mesh import _worker_addrs_from_store, StoreLike
 from monarch._src.tools.commands import torchx_runner
+from torchx import specs
 from torchx.runner import Runner
 from torchx.specs import AppDef, AppState, Role
 
@@ -319,8 +329,16 @@ def serve(
 
     # Cache original entrypoints before modifying
     original_roles = []
+    service_proc_ids_by_role: dict[str, list[ProcId]] = {}
     scheme = "metatls" if scheduler.startswith("mast") else "tcp"
-    for role in appdef.roles:
+    if len(appdef.roles) > 1:
+        warnings.warn(
+            "SPMDJob currently only uses service proc IDs for the first role; "
+            f"got {len(appdef.roles)} roles, only {appdef.roles[0].name!r} will be "
+            "given coordinated identities. Other roles will use legacy fallback.",
+            stacklevel=2,
+        )
+    for idx, role in enumerate(appdef.roles):
         original_roles.append(
             {
                 "entrypoint": role.entrypoint,
@@ -328,12 +346,28 @@ def serve(
             }
         )
 
+        # Only the first role is used by SPMDJob._state (which inspects
+        # status.roles[0]). Generating IDs for other roles would leave workers
+        # with fixed identities that the client never uses, so restrict to idx==0.
+        if idx == 0:
+            service_proc_ids = SPMDJob._allocate_service_proc_ids(role.num_replicas)
+            service_proc_ids_by_role[role.name] = service_proc_ids
+            role.env[SERVICE_PROC_IDS_ENV] = serialize_service_proc_ids(
+                service_proc_ids
+            )
+            role.env[SERVICE_PROC_RANK_ENV] = specs.macros.replica_id
+
         role.args = [
             "python",
             "-X",
             "faulthandler",
             "-c",
-            f'import socket; from monarch.actor import run_worker_loop_forever; run_worker_loop_forever(ca="trust_all_connections", address=f"{scheme}://{{socket.getfqdn()}}:26600")',
+            "import os, socket; "
+            "from monarch._src.job.service_identity import ranked_service_proc_id_from_env, service_proc_addr; "
+            "from monarch.actor import run_worker_loop_forever; "
+            f'run_worker_loop_forever(ca="trust_all_connections", address=service_proc_addr('
+            f'f"{scheme}://{{socket.getfqdn()}}:26600", '
+            f"ranked_service_proc_id_from_env() if {SERVICE_PROC_IDS_ENV!r} in os.environ else None))",
         ]
 
     # Fall back to cwd if no workspace defined in appdef
@@ -360,9 +394,87 @@ def serve(
         scheduler=scheduler,
         workspace=workspace,
         original_roles=original_roles,
+        service_proc_ids=(
+            service_proc_ids_by_role[appdef.roles[0].name] if appdef.roles else None
+        ),
     )
 
     return job
+
+
+class StoreJob(JobTrait):
+    """Job API adapter for a torchrun-style distributed store rendezvous.
+
+    Call :meth:`from_store` collectively on every SPMD rank. Each local rank 0
+    spawns and publishes one Monarch worker. Global rank 0 receives a
+    ``StoreJob``; other ranks receive ``None``. Configure job components on
+    that returned job before calling :meth:`state`.
+
+    The enclosing SPMD allocation owns the worker subprocesses. ``kill()``
+    stops Job API sidecars but leaves workers running until their parent ranks
+    exit.
+    """
+
+    def __init__(self, worker_addrs: list[str], name: str) -> None:
+        super().__init__()
+        self._worker_addrs = worker_addrs
+        self._name = name
+
+    @classmethod
+    def from_store(
+        cls,
+        store: StoreLike,
+        *,
+        monarch_port: int = 0,
+        name: str = "monarch_worker",
+        transport: str = "ipc",
+        rank: int | None = None,
+        local_rank: int | None = None,
+        world_size: int | None = None,
+        local_world_size: int | None = None,
+    ) -> "StoreJob | None":
+        """Create a store-backed job, returning it only on global rank 0.
+
+        Rank topology defaults to ``RANK``, ``LOCAL_RANK``, ``WORLD_SIZE``,
+        and ``LOCAL_WORLD_SIZE``. Each value can be overridden by the matching
+        keyword argument.
+        """
+        worker_addrs = _worker_addrs_from_store(
+            store,
+            monarch_port=monarch_port,
+            name=name,
+            transport=transport,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            local_world_size=local_world_size,
+        )
+        if worker_addrs is None:
+            return None
+        return cls(worker_addrs, name)
+
+    def state(self, cached_path: str | None = None) -> JobState:
+        """Attach to workers and start configured components without caching."""
+        return super().state(cached_path)
+
+    def _create(self, client_script: str | None = None) -> None:
+        pass
+
+    def _state(self) -> JobState:
+        workers: list[str | Future[str]] = []
+        workers.extend(self._worker_addrs)
+        host_mesh = attach_to_workers(
+            ca="trust_all_connections",
+            workers=workers,
+            name=self._name,
+        )
+        return JobState({self._name: host_mesh})
+
+    def can_run(self, spec: JobTrait) -> bool:
+        return False
+
+    def _kill(self) -> None:
+        pass
 
 
 class SPMDJob(JobTrait):
@@ -372,18 +484,24 @@ class SPMDJob(JobTrait):
     This job type wraps a torchx Runner and job handle, providing monarch job tracking.
     """
 
+    @staticmethod
+    def _allocate_service_proc_ids(num_replicas: int) -> list[ProcId]:
+        return allocate_service_proc_ids(num_replicas)
+
     def __init__(
         self,
         handle: str,
         scheduler: str,
         workspace: Optional[str] = None,
         original_roles: Optional[List[Dict[str, Any]]] = None,
+        service_proc_ids: list[ProcId] | None = None,
     ):
         super().__init__()
         self._app_handle = handle
         self._scheduler = scheduler
         self._workspace = workspace
         self._original_roles = original_roles or []
+        self._service_proc_ids = service_proc_ids
         self._hostnames: Optional[List[str]] = None
 
     def _get_runner(self) -> Runner:
@@ -459,16 +577,20 @@ class SPMDJob(JobTrait):
         assert status is not None and status.roles and status.roles[0].replicas
 
         # Extract hostnames from status
-        hostnames = [
-            replica.hostname
-            for replica in sorted(status.roles[0].replicas, key=lambda r: r.id)
-        ]
+        replicas = sorted(status.roles[0].replicas, key=lambda r: r.id)
+        hostnames = [replica.hostname for replica in replicas]
         self._hostnames = hostnames
 
         configure(default_transport=_get_channel_transport(self._scheduler))
+        worker_addrs = [_get_worker_addr(self._scheduler, h) for h in hostnames]
+        service_proc_ids = (
+            [self._service_proc_ids[replica.id] for replica in replicas]
+            if self._service_proc_ids is not None
+            else None
+        )
         workers = attach_to_workers(
             ca="trust_all_connections",
-            workers=[_get_worker_addr(self._scheduler, h) for h in hostnames],
+            workers=service_proc_addrs(worker_addrs, service_proc_ids),
         )
 
         return JobState({"workers": workers})

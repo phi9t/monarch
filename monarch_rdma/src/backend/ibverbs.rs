@@ -10,15 +10,16 @@
 
 use hyperactor::ActorRef;
 use hyperactor::actor::Referable;
-use serde::Deserialize;
-use serde::Serialize;
 use typeuri::Named;
 
+mod cq_actor;
+mod cq_pool;
 pub mod device;
 pub mod device_selection;
 pub(crate) mod domain;
 pub mod efa_device;
 pub mod efa_domain;
+pub mod efa_queue_pair;
 pub mod manager_actor;
 pub mod memory_region;
 pub mod mlx_device;
@@ -28,6 +29,7 @@ pub mod primitives;
 pub mod queue_pair;
 
 use manager_actor::IbvManagerActor;
+use memory_region::IbvRemoteMemoryRegionView;
 use mlx_device::MlxDevice;
 pub use queue_pair::IbvQueuePair;
 pub use queue_pair::PollTarget;
@@ -42,34 +44,6 @@ mod mlx5dv_tests;
 use crate::RdmaOpType;
 use crate::local_memory::KeepaliveLocalMemory;
 
-/// Lazily-initialized ibverbs transport details for a registered memory
-/// region. Retrieved on demand from the [`IbvManagerActor`] via
-/// [`IbvManagerMessage::RequestBuffer`].
-#[derive(Debug, Clone, Serialize, Deserialize, Named)]
-pub struct IbvBuffer {
-    pub lkey: u32,
-    pub rkey: u32,
-    /// RDMA address (may differ from virtual address for CUDA memory).
-    pub addr: usize,
-    pub size: usize,
-    /// Name of the RDMA device this buffer is associated with (e.g., "mlx5_0").
-    pub device_name: String,
-}
-
-impl From<&memory_region::IbvMemoryRegionView> for IbvBuffer {
-    /// The wire transport details are fully derived from the registered MR
-    /// view: the keys, the RDMA address, the size, and the device name.
-    fn from(view: &memory_region::IbvMemoryRegionView) -> Self {
-        Self {
-            lkey: view.lkey,
-            rkey: view.rkey,
-            addr: view.rdma_addr,
-            size: view.size,
-            device_name: view.device_name.clone(),
-        }
-    }
-}
-
 /// A single RDMA op for the [`IbvBackend`](manager_actor::IbvBackend).
 ///
 /// Generic over the manager actor type so unit tests can swap in a
@@ -78,7 +52,9 @@ impl From<&memory_region::IbvMemoryRegionView> for IbvBuffer {
 pub struct IbvOp<M: Referable = IbvManagerActor<MlxDevice>> {
     pub op_type: RdmaOpType,
     pub local_memory: KeepaliveLocalMemory,
-    pub remote_buffer: IbvBuffer,
+    /// One memory registration for each NIC that the target memory
+    /// on the remote can be reached through.
+    pub remote_buffers: Vec<IbvRemoteMemoryRegionView>,
     pub remote_manager: ActorRef<M>,
 }
 
@@ -89,7 +65,7 @@ impl<M: Referable> Clone for IbvOp<M> {
         Self {
             op_type: self.op_type,
             local_memory: self.local_memory.clone(),
-            remote_buffer: self.remote_buffer.clone(),
+            remote_buffers: self.remote_buffers.clone(),
             remote_manager: self.remote_manager.clone(),
         }
     }

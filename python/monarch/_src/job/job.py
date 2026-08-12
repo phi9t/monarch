@@ -21,17 +21,23 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Sequence
 
+from monarch._rust_bindings.monarch_hyperactor.proc import ProcId
 from monarch._src.actor.bootstrap import attach_to_workers
 from monarch._src.job._batch_env import in_batch_job, MONARCH_BATCH_JOB_ENV
 from monarch._src.job._telemetry_query_client import QueryEngineClient
 from monarch._src.job.job_components import JobComponents, MeshAdminConfig
-from monarch._src.job.job_sidecar import stop_job_sidecar
+from monarch._src.job.job_sidecar import create_job_sidecar, stop_job_sidecar
+from monarch._src.job.service_identity import (
+    allocate_service_proc_ids,
+    service_proc_addr,
+)
 from monarch._src.job.telemetry_config import TelemetryConfig
 
 # note: the jobs api is intended as a library so it should
 # only be importing _public_ monarch API functions.
 from monarch.actor import (
     Actor,
+    attach,
     current_rank,
     enable_transport,
     endpoint,
@@ -393,6 +399,7 @@ class JobTrait(ABC):
         self._status: Literal["running", "not_running"] | CachedRunning = "not_running"
         self._components: JobComponents = JobComponents()
         self._apply_id: Optional[str] = None
+        self._client_attached_to: str | None = None
 
     def _should_spawn_telemetry_worker_collector_actors(self) -> bool:
         """Whether sidecar telemetry should spawn per-host worker collectors.
@@ -402,6 +409,46 @@ class JobTrait(ABC):
         local fan-out.
         """
         return True
+
+    def _sidecar_attach_to(self) -> str | None:
+        """Duplex gateway address the job sidecar should attach through."""
+        return self._client_attached_to
+
+    def _requires_sidecar_gateway(self) -> bool:
+        """Whether a sidecar must join the client's scheduler gateway.
+
+        Scheduler jobs override this when their workers advertise addresses
+        that the independently running sidecar cannot reach directly. The
+        gateway must then be resolved before the sidecar starts its actor
+        context.
+        """
+        return False
+
+    def _prepare_client_gateway(self) -> None:
+        """Resolve and attach through a scheduler-provided client gateway."""
+        return None
+
+    def _attach_client(self, attach_to: str | None) -> None:
+        """Attach the process-global client context; detaching requires exit."""
+        if attach_to is None:
+            return
+        if self._client_attached_to is not None:
+            if self._client_attached_to != attach_to:
+                raise RuntimeError(
+                    "client is already attached through "
+                    f"{self._client_attached_to}, not {attach_to}; detaching is "
+                    "not supported, so use a new process to attach through a "
+                    "different address"
+                )
+            logger.debug(
+                "Client gateway is already attached via duplex address: %s",
+                attach_to,
+            )
+            return
+
+        logger.info("Attaching client gateway via duplex address: %s", attach_to)
+        attach(attach_to)
+        self._client_attached_to = attach_to
 
     def _connect_host_meshes(self, running_job: "JobTrait") -> Dict[str, HostMesh]:
         """Run the connect phases and return the final host meshes.
@@ -415,6 +462,18 @@ class JobTrait(ABC):
         the raw host meshes (``self``, a cached job, or the wrapped
         CachedRunning job).
         """
+        if running_job._requires_sidecar_gateway() and self._components.needs_sidecar():
+            # The sidecar runs in a separate process, so attaching the client
+            # does not make cluster-only worker addresses routable from the
+            # sidecar. Start it through the same scheduler gateway before any
+            # component initializes the sidecar's actor context.
+            running_job._prepare_client_gateway()
+            attach_to = running_job._sidecar_attach_to()
+            if self.apply_id is not None and attach_to is not None:
+                create_job_sidecar(
+                    self.apply_id,
+                    attach_to=attach_to,
+                )
         self._components.before_connect(self)
         host_meshes = dict(running_job._state()._hosts)
         return self._components.connect(self, host_meshes)
@@ -1046,10 +1105,14 @@ class BatchJob(JobTrait):
     def _should_spawn_telemetry_worker_collector_actors(self) -> bool:
         return self._job._should_spawn_telemetry_worker_collector_actors()
 
-    def _connect_host_meshes(self, running_job: "JobTrait") -> Dict[str, HostMesh]:
-        self._components.before_connect(self)
-        host_meshes = dict(running_job._state()._hosts)
-        return self._components.connect(self, host_meshes)
+    def _prepare_client_gateway(self) -> None:
+        self._job._prepare_client_gateway()
+
+    def _sidecar_attach_to(self) -> str | None:
+        return self._job._sidecar_attach_to()
+
+    def _requires_sidecar_gateway(self) -> bool:
+        return self._job._requires_sidecar_gateway()
 
     def state(
         self, cached_path: Optional[str] = ".monarch/job_state.pkl"
@@ -1188,17 +1251,36 @@ class SSHJob(LoginJob):
             "metatls" if transport in ("metatls", "metatls-hostname") else "tcp"
         )
         super().__init__()
+        self._service_proc_ids_by_host: Dict[str, ProcId] = {}
+
+    @staticmethod
+    def _allocate_service_proc_ids(num_hosts: int) -> list[ProcId]:
+        return allocate_service_proc_ids(num_hosts)
+
+    def _create(self, client_script: Optional[str]) -> None:
+        self._service_proc_ids_by_host = {}
+        for hosts in self._meshes.values():
+            self._service_proc_ids_by_host.update(
+                zip(hosts, self._allocate_service_proc_ids(len(hosts)))
+            )
+        super()._create(client_script)
 
     def _start_host(self, host: str) -> ProcessState:
         addr = f"{self._scheme}://{host}:{self._port}"
-        startup = f'from monarch.actor import run_worker_loop_forever; run_worker_loop_forever(address={repr(addr)}, ca="trust_all_connections")'
+        service_proc_id = self._service_proc_ids_by_host[host]
+        proc_addr = service_proc_addr(addr, service_proc_id)
+        startup = (
+            "from monarch.actor import run_worker_loop_forever; "
+            f"run_worker_loop_forever(address={proc_addr!r}, "
+            'ca="trust_all_connections")'
+        )
 
         command = f"{shlex.quote(self._python_exe)} -c {shlex.quote(startup)}"
         proc = subprocess.Popen(
             ["ssh", *self._ssh_args, host, "-n", command],
             start_new_session=True,
         )
-        return ProcessState(proc.pid, addr)
+        return ProcessState(proc.pid, proc_addr)
 
     def can_run(self, spec):
         return (

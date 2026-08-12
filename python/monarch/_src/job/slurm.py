@@ -16,10 +16,17 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence
 
 from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
 from monarch._rust_bindings.monarch_hyperactor.config import configure
+from monarch._rust_bindings.monarch_hyperactor.proc import ProcId
 from monarch._src.actor.bootstrap import attach_to_workers
 from monarch._src.job._batch_env import in_batch_job
 from monarch._src.job._slurm_batch import _WORKER_BOOTSTRAP
 from monarch._src.job.job import BatchJob, JobState, JobTrait
+from monarch._src.job.service_identity import (
+    allocate_service_proc_ids,
+    serialize_service_proc_ids,
+    service_proc_addrs,
+    SERVICE_PROC_IDS_ENV,
+)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -67,6 +74,8 @@ class SlurmJob(JobTrait):
         job_start_timeout: Optional[int] = None,
         account: Optional[str] = None,
         qos: Optional[str] = None,
+        out_of_cluster: bool = False,
+        attach_to: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -87,6 +96,12 @@ class SlurmJob(JobTrait):
                       This should account for potential queueing delays. If None (default), waits indefinitely.
             account: SLURM account to charge the job to (``#SBATCH --account``). If None, uses the cluster default.
             qos: SLURM quality-of-service to request (``#SBATCH --qos``). If None, uses the cluster default.
+            out_of_cluster: Whether the client runs outside the cluster network.
+                      The client attaches through the first allocated worker so
+                      workers can route messages back through that gateway.
+            attach_to: ZMQ-style address of the worker gateway for out-of-cluster
+                      access. When omitted in out-of-cluster mode, the first
+                      allocated worker's Monarch address is used.
         """
         configure(default_transport=ChannelTransport.TcpWithHostname)
         self._meshes = meshes
@@ -105,10 +120,17 @@ class SlurmJob(JobTrait):
         self._job_start_timeout = job_start_timeout
         self._account = account
         self._qos = qos
+        self._out_of_cluster = out_of_cluster
+        self._attach_to = attach_to
         # Track the single SLURM job ID and all allocated hostnames
         self._slurm_job_id: Optional[str] = None
         self._all_hostnames: List[str] = []
+        self._service_proc_ids: list[ProcId] = []
         super().__init__()
+
+    @staticmethod
+    def _allocate_service_proc_ids(num_nodes: int) -> list[ProcId]:
+        return allocate_service_proc_ids(num_nodes)
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         # In batch mode the in-allocation client rehydrates this object via
@@ -117,7 +139,35 @@ class SlurmJob(JobTrait):
         # address remote workers can dial back, instead of an abstract unix
         # socket whose namespace is local to the original (head) node.
         self.__dict__.update(state)
+        # Attachment belongs to this process's global client context, not the
+        # serialized job state.
+        self._client_attached_to = None
         configure(default_transport=ChannelTransport.TcpWithHostname)
+
+    def _resolve_attach_to(self) -> str | None:
+        if self._attach_to is not None:
+            return self._attach_to
+        if self._out_of_cluster:
+            return f"tcp://{self._all_hostnames[0]}:{self._port}"
+        return None
+
+    def _requires_sidecar_gateway(self) -> bool:
+        return self._out_of_cluster or self._attach_to is not None
+
+    def _prepare_client_gateway(self) -> None:
+        if not self._jobs_active():
+            raise RuntimeError("SLURM job is no longer active")
+
+        if not self._all_hostnames:
+            job_id = self._resolved_job_id()
+            if job_id is None:
+                raise RuntimeError("SLURM job ID is not set")
+            total_nodes = sum(self._meshes.values())
+            self._all_hostnames = self._wait_for_job_start(
+                job_id, total_nodes, timeout=self._job_start_timeout
+            )
+
+        self._attach_client(self._resolve_attach_to())
 
     def add_mesh(self, name: str, num_nodes: int) -> None:
         self._meshes[name] = num_nodes
@@ -140,6 +190,7 @@ class SlurmJob(JobTrait):
         instead of submitting a new one.
         """
         total_nodes = sum(self._meshes.values())
+        self._ensure_service_proc_ids(total_nodes)
         if client_script is not None:
             # Dumped before submit: the job id isn't known yet, and the client
             # resolves it from $SLURM_JOB_ID anyway.
@@ -152,6 +203,7 @@ class SlurmJob(JobTrait):
         self, num_nodes: int, client_script: Optional[str] = None
     ) -> str:
         """Submit a SLURM job for all nodes."""
+        self._ensure_service_proc_ids(num_nodes)
         unique_job_name = f"{self._job_name}_{os.getpid()}"
 
         # Create log directory if it doesn't exist
@@ -215,6 +267,10 @@ class SlurmJob(JobTrait):
                 sbatch_directives.append(f"#SBATCH {arg}")
 
         batch_script = "\n".join(sbatch_directives)
+        batch_script += (
+            f"\nexport {SERVICE_PROC_IDS_ENV}="
+            f"{shlex.quote(serialize_service_proc_ids(self._service_proc_ids))}\n"
+        )
         if client_script is None:
             # Workers only; an external controller attaches and manages the
             # lifetime. Shares _WORKER_BOOTSTRAP with the batch runner.
@@ -259,6 +315,14 @@ class SlurmJob(JobTrait):
 
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to submit SLURM job: {e.stderr}") from e
+
+    def _ensure_service_proc_ids(self, num_nodes: int) -> None:
+        if len(self._service_proc_ids) != num_nodes:
+            self._service_proc_ids = [
+                proc_id
+                for mesh_nodes in self._meshes.values()
+                for proc_id in self._allocate_service_proc_ids(mesh_nodes)
+            ]
 
     def _get_job_info_json(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Get job information using squeue --json."""
@@ -339,6 +403,7 @@ class SlurmJob(JobTrait):
             raise
 
     def _state(self) -> JobState:
+        self._prepare_client_gateway()
         if not self._jobs_active():
             raise RuntimeError("SLURM job is no longer active")
 
@@ -347,26 +412,32 @@ class SlurmJob(JobTrait):
             job_id = self._resolved_job_id()
             if job_id is None:
                 raise RuntimeError("SLURM job ID is not set")
+
             total_nodes = sum(self._meshes.values())
             self._all_hostnames = self._wait_for_job_start(
                 job_id, total_nodes, timeout=self._job_start_timeout
             )
+
+        attach_to = self._attach_to
+        if self._out_of_cluster and attach_to is None:
+            attach_to = f"tcp://{self._all_hostnames[0]}:{self._port}"
+        self._attach_client(attach_to)
 
         # Distribute the allocated hostnames among meshes
         host_meshes = {}
         hostname_idx = 0
 
         for mesh_name, num_nodes in self._meshes.items():
-            mesh_hostnames = self._all_hostnames[
-                hostname_idx : hostname_idx + num_nodes
-            ]
-            hostname_idx += num_nodes
+            next_hostname_idx = hostname_idx + num_nodes
+            mesh_hostnames = self._all_hostnames[hostname_idx:next_hostname_idx]
+            service_proc_ids = self._service_proc_ids[hostname_idx:next_hostname_idx]
+            hostname_idx = next_hostname_idx
 
             workers = [f"tcp://{hostname}:{self._port}" for hostname in mesh_hostnames]
             host_mesh = attach_to_workers(
                 name=mesh_name,
                 ca="trust_all_connections",
-                workers=workers,  # type: ignore[arg-type]
+                workers=service_proc_addrs(workers, service_proc_ids),
             )
 
             host_meshes[mesh_name] = host_mesh
@@ -391,6 +462,8 @@ class SlurmJob(JobTrait):
             and spec._job_start_timeout == self._job_start_timeout
             and spec._account == self._account
             and spec._qos == self._qos
+            and spec._out_of_cluster == self._out_of_cluster
+            and spec._attach_to == self._attach_to
             and self._jobs_active()
         )
 
@@ -445,7 +518,7 @@ class SlurmJob(JobTrait):
 
         No-op in batch mode: ``BatchJob`` registers this as an ``atexit`` hook on
         the in-allocation client, but the sbatch runner owns teardown there, so
-        the client must not scancel its own allocation. The external-controller
+        the client must not scancel its own allocation. The external-client
         path scancels as before.
         """
         if in_batch_job():

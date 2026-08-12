@@ -8,5 +8,5 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dev-dependencies]
-criterion = { version = "0.5.1", features = ["async_tokio", "csv_output"] }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+criterion = { version = "0.8.2", features = ["async_tokio", "csv_output"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }

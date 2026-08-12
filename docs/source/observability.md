@@ -4,13 +4,14 @@ Monarch provides one observability setup with three complementary job-local
 surfaces: distributed telemetry for SQL analysis, the Monarch Dashboard for
 visual monitoring, and the Mesh Admin TUI for live diagnostics. Enable
 telemetry on a job to start all three data paths consistently. OpenTelemetry
-provides a separate export path for external backends.
+supplies metrics to distributed telemetry and can independently export metrics
+and logs to external backends.
 
 ## Choose a surface
 
 | Use case | Surface | What it provides |
 |----------|---------|------------------|
-| Query actor, mesh, message, and trace history | [Distributed telemetry](distributed-telemetry) | DataFusion SQL across host-local collectors |
+| Query actor, mesh, message, trace, and metric history | [Distributed telemetry](distributed-telemetry) | DataFusion SQL across host-local collectors |
 | Monitor topology, status, failures, and traffic in a browser | [Monarch Dashboard](monarch-dashboard) | Live summaries, hierarchy views, and a job DAG |
 | Diagnose a running mesh from a terminal | [Mesh Admin TUI](admin-tui) | Live topology, health checks, and py-spy stack traces |
 | Export metrics and logs to an external backend | [OpenTelemetry and Grafana](./generated/examples/otel_collector) | OTLP export to systems such as Prometheus and Loki |
@@ -20,8 +21,7 @@ Periodic mesh-admin snapshots also flow into telemetry so the dashboard can
 show the live administrative topology.
 
 Distributed telemetry is a job-scoped, in-memory query system. OpenTelemetry
-export is the external aggregation path for metrics and logs. You can use both
-on the same job.
+export to an external backend can run alongside it on the same job.
 
 ## Enable observability
 
@@ -32,7 +32,7 @@ from monarch.job import ProcessJob, TelemetryConfig
 
 job = ProcessJob({"workers": 2}).enable_telemetry(
     TelemetryConfig(
-        retention_secs=600,
+        retention_secs=3600,
         include_dashboard=True,
         dashboard_port=8265,
         snapshot_interval_secs=30,
@@ -65,12 +65,31 @@ print(result["rows"])
 Use `state.dashboard_url` in a browser. Pass `state.admin_url` to
 `monarch-tui --addr`.
 
+## Metrics
+
+Monarch records its built-in metrics through one process-global OpenTelemetry
+meter provider. Libraries record counters, gauges, and histograms without
+choosing a destination. Independent readers can send the same instruments to
+job-local distributed telemetry, an external OTLP endpoint, or both.
+
+| Path | Enablement | Destination | Primary use |
+|------|------------|-------------|-------------|
+| Distributed telemetry | `job.enable_telemetry(...)` | Job-local SQL tables | Debugging and analysis within the current job |
+| OTLP | `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry Collector over OTLP/HTTP | External aggregation, monitoring, and visualization |
+
+See [Metrics](metrics) for provider scope, collection and flushing behavior,
+configuration, and both export paths.
+
 ## Data flow
 
 ```text
 actor and proc events ──> host-local collectors ──> distributed query engine
                                                         ├─> SQL query client
                                                         └─> Monarch Dashboard
+
+OTel instruments ──> process-global meter provider ──┬─> UDS metric exporter
+                                                      │        └─> host-local collectors
+                                                      └─> external metric exporter
 
 live mesh ──> Mesh Admin API ──────────────────────────────> Mesh Admin TUI
      └──────> periodic snapshots ──> distributed telemetry ─> Dashboard DAG
@@ -85,7 +104,7 @@ are not a durable event archive.
 
 | `TelemetryConfig` field | Default | Effect |
 |-------------------------|---------|--------|
-| `retention_secs` | `600` | Retention window for message and trace tables; `0` disables retention |
+| `retention_secs` | `3600` | Retention window for message, trace, and metric tables; `0` disables retention |
 | `include_dashboard` | `False` | Advertise the browser dashboard |
 | `dashboard_port` | `8265` | Preferred dashboard port; use `0` for an ephemeral port |
 | `snapshot_interval_secs` | `30` | Mesh-introspection snapshot interval; `0` disables periodic snapshots |
@@ -95,6 +114,7 @@ That supports the TUI, but it does not provide the dashboard or SQL history.
 
 ## Next steps
 
+- [Understand metric collection and export](metrics)
 - [Query distributed telemetry](distributed-telemetry)
 - [Use the Monarch Dashboard](monarch-dashboard)
 - [Diagnose a mesh with the Admin TUI](admin-tui)
@@ -104,6 +124,7 @@ That supports the TUI, but it does not provide the dashboard or SQL history.
 :maxdepth: 1
 :hidden:
 distributed-telemetry
+metrics
 admin-tui
 monarch-dashboard
 ```
