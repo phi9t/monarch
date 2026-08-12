@@ -7,12 +7,33 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 DEFAULT_CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _require_controlled_domain() -> None:
+    """Refuse to run the verifier outside a controlled execution domain.
+
+    Loads the shared contract adapter by file path so the pure parsing helpers
+    above stay importable in unit tests without triggering the guard.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "monarch._rootfs_contract",
+        _REPO_ROOT / "python" / "monarch" / "_rootfs_contract.py",
+    )
+    if spec is None or spec.loader is None:
+        return
+    contract = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = contract
+    spec.loader.exec_module(contract)
+    contract.require_checkout(_REPO_ROOT)
 
 
 class CudaVisibleDevicesError(ValueError):
@@ -136,6 +157,7 @@ def _cmd_pytest_failures(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _require_controlled_domain()
     parser = argparse.ArgumentParser(description="8-GPU verifier helpers")
     subparsers = parser.add_subparsers(required=True)
 

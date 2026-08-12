@@ -141,3 +141,134 @@ def test_cargo_config_wires_the_build_wrapper() -> None:
     with config.open("rb") as fh:
         parsed = tomllib.load(fh)
     assert parsed["build"]["rustc-wrapper"] == "scripts/rootfs/rustc-wrapper.sh"
+
+
+def _fake_tool_env(tmp_path: Path, tool: str, sentinel: Path) -> dict:
+    """A PATH whose first `tool` writes a sentinel, atop an uncontrolled env.
+
+    A correctly guarded seam exits 2 before this fake tool can run, so the
+    sentinel must never appear.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake = fake_bin / tool
+    fake.write_text(f'#!/bin/sh\necho ran > "{sentinel}"\n')
+    fake.chmod(0o755)
+    return {**_UNCONTROLLED, "PATH": f"{fake_bin}:/usr/bin:/bin"}
+
+
+def test_docs_builder_rejects_before_fake_uv_runs(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    env = _fake_tool_env(tmp_path, "uv", sentinel)
+    result = subprocess.run(
+        [str(REPO_ROOT / "scripts/build_monarch_for_docs.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_profile_compile_obligations_rejects_before_cargo_runs(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    env = _fake_tool_env(tmp_path, "cargo", sentinel)
+    result = subprocess.run(
+        [str(REPO_ROOT / "scripts/profile_compile_obligations.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_cert_generation_rejects_before_openssl_runs(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    env = _fake_tool_env(tmp_path, "openssl", sentinel)
+    result = subprocess.run(
+        [str(REPO_ROOT / "monarch_mini/test_certs/generate.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_liveness_fixture_rejects_before_test_binary_runs(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    fake_bin = tmp_path / "test-binary"
+    fake_bin.write_text(f'#!/bin/sh\necho ran > "{sentinel}"\n')
+    fake_bin.chmod(0o755)
+    result = _run_uncontrolled(
+        [
+            str(REPO_ROOT / "hyperactor_mesh/test/hyperactor_mesh_proxy_liveness_test.sh"),
+            str(fake_bin),
+        ]
+    )
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_remote_spawner_rejects_before_cargo_runs(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    env = _fake_tool_env(tmp_path, "cargo", sentinel)
+    result = subprocess.run(
+        [str(REPO_ROOT / "hyperactor_remote/example/remote_spawner.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_fetch_disabled_tests_main_rejects_outside_controlled_domain() -> None:
+    result = _run_uncontrolled(
+        [sys.executable, str(REPO_ROOT / "scripts/fetch_disabled_tests.py")],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 2
+    assert "hermetic bwrap rootfs" in result.stderr
+
+
+def test_capacity_helper_main_rejects_outside_controlled_domain() -> None:
+    result = _run_uncontrolled(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/local_8gpu_capacity.py"),
+            "cuda-visible-devices",
+        ],
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 2
+    assert "hermetic bwrap rootfs" in result.stderr
+
+
+def test_common_setup_linux_requires_github_linux(tmp_path: Path) -> None:
+    # Sourced outside GitHub Linux CI, common-setup.sh must refuse; its guard
+    # runs at source time before any function body.
+    sentinel = tmp_path / "sentinel"
+    script = tmp_path / "probe.sh"
+    script.write_text(
+        f'. "{REPO_ROOT}/scripts/common-setup.sh"\necho ran > "{sentinel}"\n'
+    )
+    result = _run_uncontrolled(["bash", str(script)], cwd=REPO_ROOT)
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_common_setup_macos_requires_darwin(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    script = tmp_path / "probe.sh"
+    script.write_text(
+        f'. "{REPO_ROOT}/scripts/common-setup-macos.sh"\necho ran > "{sentinel}"\n'
+    )
+    result = _run_uncontrolled(["bash", str(script)], cwd=REPO_ROOT)
+    assert result.returncode == 2
+    assert not sentinel.exists()

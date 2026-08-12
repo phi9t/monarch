@@ -7,6 +7,12 @@
 
 set -e  # Exit on any error
 
+# The docs build compiles Monarch and imports it, so it must run inside a
+# controlled domain (the hermetic bwrap rootfs, GitHub Linux, or Darwin) before
+# any uv/pip install or torch/monarch import.
+_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+"$_repo_root/scripts/rootfs/execution_contract.sh" require-controlled
+
 echo "========================================="
 echo "Building Monarch for Documentation"
 echo "========================================="
