@@ -272,3 +272,21 @@ def test_common_setup_macos_requires_darwin(tmp_path: Path) -> None:
     result = _run_uncontrolled(["bash", str(script)], cwd=REPO_ROOT)
     assert result.returncode == 2
     assert not sentinel.exists()
+
+
+def test_frontend_builder_rejects_before_fake_npm_runs(tmp_path: Path) -> None:
+    # The dashboard builder must abort in the controlled-domain guard before it
+    # ever resolves or invokes npm.
+    sentinel = tmp_path / "sentinel"
+    env = _fake_tool_env(tmp_path, "npm", sentinel)
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts/build_dashboard_frontend.py")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 2
+    assert "hermetic bwrap rootfs" in result.stderr
+    assert not sentinel.exists()

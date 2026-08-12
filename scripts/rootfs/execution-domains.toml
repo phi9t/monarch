@@ -35,6 +35,7 @@ patterns = [
     "scripts/run_local_8gpu_capacity.sh",
     "scripts/local_8gpu_capacity.py",
     "scripts/build_monarch_for_docs.sh",
+    "scripts/build_dashboard_frontend.py",
     "scripts/profile_compile_obligations.sh",
     "scripts/fetch_disabled_tests.py",
     "scripts/rootfs/sync_test_environment.sh",

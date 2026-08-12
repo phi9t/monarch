@@ -529,47 +529,24 @@ class BuildFrontend(Command):
             "monarch_dashboard",
             "frontend",
         )
-        build_dir = os.path.join(frontend_dir, "build")
-        build_index = os.path.join(build_dir, "index.html")
 
-        # Skip npm if pre-built assets already exist (e.g. from CI).
-        if os.path.isfile(build_index):
-            print(">> Pre-built frontend found, skipping npm build")
-            return
-
-        if not os.path.exists(frontend_dir):
-            print(f"Frontend directory not found: {frontend_dir}")
-            return
-
-        # Use real npm, bypassing any system wrappers
-        npm_cmd = "/usr/bin/npm" if os.path.exists("/usr/bin/npm") else "npm"
+        # Load the fail-closed builder by file path so a source build cannot
+        # package stale or partial assets; failures propagate to the caller.
+        helper_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "scripts",
+            "build_dashboard_frontend.py",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_build_dashboard_frontend", helper_path
+        )
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
 
         print("Building dashboard frontend...")
-        try:
-            subprocess.check_call([npm_cmd, "ci"], cwd=frontend_dir)
-            os.makedirs(os.path.join(build_dir, "static", "css"), exist_ok=True)
-            subprocess.check_call([npm_cmd, "run", "build"], cwd=frontend_dir)
-            # esbuild puts CSS next to JS; move it to static/css/
-            js_css = os.path.join(build_dir, "static", "js", "main.css")
-            if os.path.isfile(js_css):
-                shutil.move(
-                    js_css,
-                    os.path.join(build_dir, "static", "css", "main.css"),
-                )
-            # Copy the shared index.html template into the build output.
-            shutil.copy(
-                os.path.join(frontend_dir, "public", "index.html"),
-                build_index,
-            )
-            print("Frontend build completed successfully")
-        except FileNotFoundError:
-            print("WARNING: npm not found. Skipping frontend build.")
-            print(
-                "Install Node.js to build the dashboard frontend, "
-                "or use pre-built assets."
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError("frontend build failed") from e
+        helper.build_dashboard_frontend(Path(frontend_dir))
+        print("Frontend build completed successfully")
 
 
 # Clean command
