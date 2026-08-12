@@ -41,6 +41,8 @@ from monarch._src.actor.proc_mesh import (
 from monarch._src.job.process import ProcessJob
 from scoped_state import scoped_state
 
+pytestmark = pytest.mark.control_plane
+
 
 _proc_rank = -1
 _BOOTSTRAP_FAILURE = "stage 3.4 bootstrap failure"

@@ -55,3 +55,4 @@ scripts/rootfs/.rootfs.stage.*
 scripts/rootfs/*.tar
 .venv-rootfs/
 .venv-rootfs/**
+control-plane-results/

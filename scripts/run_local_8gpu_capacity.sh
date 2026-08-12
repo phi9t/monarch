@@ -12,9 +12,10 @@
 #   scripts/run_local_8gpu_capacity.sh
 #
 # The script re-execs through scripts/rootfs/enter_rootfs.sh unless already
-# inside the sandbox. It creates/reuses .venv-rootfs, installs Monarch editable
-# with test dependencies, runs an 8-rank tensor-engine smoke, and then runs the
-# local control-plane suites with all eight GPUs exposed.
+# inside the sandbox. It creates/reuses .venv-rootfs, synchronizes the locked
+# test dependencies, installs Monarch editable using the rootfs-pinned build
+# tools, runs an 8-rank tensor-engine smoke, and then runs the local
+# control-plane suites with all eight GPUs exposed.
 
 set -euo pipefail
 
@@ -67,9 +68,8 @@ fi
 source "$VENV/bin/activate"
 
 log "build: editable tensor-engine install"
-echo "installing monarch (-e .[test]) with tensor engine"
-uv pip install setuptools setuptools-rust wheel "numpy>=1.26"
-uv pip install --no-build-isolation -e ".[test]"
+echo "synchronizing locked dependencies and installing monarch editable"
+"$REPO_ROOT/scripts/rootfs/sync_test_environment.sh"
 
 log "unit-level smoke: 8-gpu tensor engine"
 set +e
@@ -125,6 +125,10 @@ set -e
 echo "unit-level smoke outcome: PASS"
 
 log "integration: control-plane suites over 8 GPUs"
+integration_started_ns="$(date +%s%N)"
+python_junit="$REPO_ROOT/control-plane-results/control-plane-python.xml"
+rust_junit="$REPO_ROOT/target/nextest/ci/junit.xml"
+rm -f -- "$python_junit" "$rust_junit"
 control_args=(--keep-going)
 if [[ "$DEFAULTED_CUDA_VISIBLE_DEVICES" -eq 1 ]]; then
   control_args=(--gpus 8 "${control_args[@]}")
@@ -142,8 +146,9 @@ if [[ "$control_rc" -eq 0 ]]; then
 fi
 
 rust_status="unknown"
-if [[ -f "$REPO_ROOT/target/nextest/ci/junit.xml" ]]; then
-  rust_status="$("$VENV/bin/python" "$REPO_ROOT/scripts/local_8gpu_capacity.py" nextest-status "$REPO_ROOT/target/nextest/ci/junit.xml")"
+if [[ -f "$rust_junit" ]]; then
+  rust_status="$("$VENV/bin/python" "$REPO_ROOT/scripts/local_8gpu_capacity.py" nextest-status \
+    "$rust_junit" --not-before-ns "$integration_started_ns")"
 fi
 
 log "summary"
@@ -151,9 +156,10 @@ echo "8-gpu tensor-engine smoke : PASS"
 echo "control-plane suites      : FAIL (exit $control_rc)"
 echo "rust control-plane        : $rust_status"
 
-if [[ "$rust_status" == "pass" && -f "$REPO_ROOT/control-plane-results/control-plane-python.xml" ]]; then
+if [[ "$rust_status" == "pass" && -f "$python_junit" ]]; then
   log "failure classification: Python full-run failures"
-  failed_python_output="$("$VENV/bin/python" "$REPO_ROOT/scripts/local_8gpu_capacity.py" pytest-failures "$REPO_ROOT/control-plane-results/control-plane-python.xml")" || \
+  failed_python_output="$("$VENV/bin/python" "$REPO_ROOT/scripts/local_8gpu_capacity.py" pytest-failures \
+    "$python_junit" --not-before-ns "$integration_started_ns")" || \
     exit "$control_rc"
   failed_python_tests=()
   if [[ -n "$failed_python_output" ]]; then

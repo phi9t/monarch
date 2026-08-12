@@ -162,7 +162,11 @@ The 8-GPU verifier's acceptance ladder is explicit:
   `0,1,2,3,4,5,6,7` when unset or empty, reject explicit lists that do not have
   exactly eight non-empty entries, require `CUDA_HOME`, `uv`, and `.venv-rootfs`.
 - **Build:** install Monarch editable with test dependencies and the tensor
-  engine enabled.
+  engine enabled. Synchronize the frozen `uv.lock` test dependencies, then
+  replace its Linux-only `torchx-nightly==2021.10.28` selection with the
+  hash-pinned `2026.7.27` wheel already recorded in that lock, and install the
+  project editable without resolving project dependencies so the
+  rootfs-provided torch and pinned build tools remain authoritative.
 - **Unit-level smoke:** require `has_tensor_engine()`, require
   `torch.cuda.device_count() == 8`, spawn
   `this_host().spawn_procs(per_host={"gpus": 8})`, fetch shards `gpus=0..7`, and require ranks
@@ -179,8 +183,9 @@ when an intermediate Python full-suite command exits nonzero and is later
 classified as Suite-Ordering Fragility. Its Contract Artifacts are
 `control-plane-results/control-plane-python.xml`,
 `control-plane-results/control-plane-python-isolation.txt` when classification
-runs, and `target/nextest/ci/junit.xml`. Build caches, virtualenv contents, and
-logs are incidental artifacts.
+runs, and `target/nextest/ci/junit.xml`. The verifier removes the primary JUnit
+paths before integration and accepts only reports created after that run starts.
+Build caches, virtualenv contents, and logs are incidental artifacts.
 
 Local Run ownership is split deliberately: scripts own executable behavior,
 `AGENTS.md` owns repo-level policy, and repo-local skills under `.agents/skills/`
@@ -260,6 +265,10 @@ fragility rather than a rootfs regression.
 
 - Rust build fails with a Python linking error → activate the Python env first
   (or use `uv run cargo ...`).
+- `uv lock` rewrites many unrelated packages → the checked-in lockfile is
+  generated with Meta's vendored-version overrides. Use `uv sync --frozen` for
+  OSS local runs; do not regenerate `uv.lock` with plain `uv lock` unless you
+  intend to replace that policy.
 - Import errors for RDMA/distributed tensors → rebuild with tensor engine enabled
   (`USE_TENSOR_ENGINE=1`, default).
 - Ensure your CUDA install matches the PyTorch index (cu132 = CUDA 13.2); C++11

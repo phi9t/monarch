@@ -8,8 +8,11 @@
 
 from unittest import TestCase
 
+import pytest
 from monarch._rust_bindings.monarch_hyperactor.shape import Shape, Slice
 from monarch._rust_bindings.monarch_hyperactor.value_mesh import ValueMesh
+
+pytestmark = pytest.mark.control_plane
 
 
 class TestValueMesh(TestCase):

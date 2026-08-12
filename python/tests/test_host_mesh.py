@@ -39,6 +39,8 @@ from monarch._src.job.service_identity import new_service_proc_id, service_proc_
 from monarch.config import configured
 from scoped_state import scoped_state
 
+pytestmark = pytest.mark.control_plane
+
 
 @pytest.mark.timeout(60)
 def test_process_job_host_mesh() -> None:

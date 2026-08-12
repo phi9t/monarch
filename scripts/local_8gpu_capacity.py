@@ -36,19 +36,27 @@ def _int_attr(element: ET.Element, name: str) -> int:
     return int(element.attrib.get(name, "0"))
 
 
-def parse_nextest_junit(path: str | Path) -> str:
+def parse_nextest_junit(
+    path: str | Path, *, not_before_ns: int | None = None
+) -> str:
     try:
+        _require_fresh_artifact(path, not_before_ns)
         root = ET.parse(path).getroot()
-        failures = sum(
-            _int_attr(element, "failures") for element in _suite_elements(root)
-        )
-        errors = sum(_int_attr(element, "errors") for element in _suite_elements(root))
+        suites = _suite_elements(root)
+        tests = sum(_int_attr(element, "tests") for element in suites)
+        failures = sum(_int_attr(element, "failures") for element in suites)
+        errors = sum(_int_attr(element, "errors") for element in suites)
     except Exception:
+        return "unknown"
+    if tests == 0:
         return "unknown"
     return "pass" if failures == 0 and errors == 0 else "fail"
 
 
-def failed_pytest_node_ids(path: str | Path) -> list[str]:
+def failed_pytest_node_ids(
+    path: str | Path, *, not_before_ns: int | None = None
+) -> list[str]:
+    _require_fresh_artifact(path, not_before_ns)
     root = ET.parse(path).getroot()
     failed_tests = []
     for testcase in root.iter("testcase"):
@@ -64,6 +72,16 @@ def failed_pytest_node_ids(path: str | Path) -> list[str]:
             )
         failed_tests.append(_pytest_node_id(classname, name))
     return failed_tests
+
+
+def _require_fresh_artifact(path: str | Path, not_before_ns: int | None) -> None:
+    if not_before_ns is None:
+        return
+    modified_ns = Path(path).stat().st_mtime_ns
+    if modified_ns < not_before_ns:
+        raise ValueError(
+            f"stale artifact: modified at {modified_ns}, run started at {not_before_ns}"
+        )
 
 
 def _suite_elements(root: ET.Element) -> list[ET.Element]:
@@ -101,13 +119,15 @@ def _cmd_cuda_visible_devices(_args: argparse.Namespace) -> int:
 
 
 def _cmd_nextest_status(args: argparse.Namespace) -> int:
-    print(parse_nextest_junit(args.junit))
+    print(parse_nextest_junit(args.junit, not_before_ns=args.not_before_ns))
     return 0
 
 
 def _cmd_pytest_failures(args: argparse.Namespace) -> int:
     try:
-        for node_id in failed_pytest_node_ids(args.junit):
+        for node_id in failed_pytest_node_ids(
+            args.junit, not_before_ns=args.not_before_ns
+        ):
             print(node_id)
     except Exception as error:
         print(f"cannot parse Python JUnit: {error}", file=sys.stderr)
@@ -124,10 +144,12 @@ def main(argv: list[str] | None = None) -> int:
 
     nextest_parser = subparsers.add_parser("nextest-status")
     nextest_parser.add_argument("junit", type=Path)
+    nextest_parser.add_argument("--not-before-ns", type=int)
     nextest_parser.set_defaults(func=_cmd_nextest_status)
 
     pytest_parser = subparsers.add_parser("pytest-failures")
     pytest_parser.add_argument("junit", type=Path)
+    pytest_parser.add_argument("--not-before-ns", type=int)
     pytest_parser.set_defaults(func=_cmd_pytest_failures)
 
     args = parser.parse_args(argv)

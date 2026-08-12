@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,6 +15,8 @@ import pytest
 HELPER_PATH = (
     Path(__file__).resolve().parents[2] / "scripts" / "local_8gpu_capacity.py"
 )
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOTFS_BUILDER = REPO_ROOT / "scripts" / "rootfs" / "build_rootfs.sh"
 spec = importlib.util.spec_from_file_location("local_8gpu_capacity", HELPER_PATH)
 assert spec is not None
 assert spec.loader is not None
@@ -95,6 +99,27 @@ def test_nextest_junit_unknown_for_unparseable_file(tmp_path: Path) -> None:
     assert parse_nextest_junit(write_xml(tmp_path, "<testsuite>")) == "unknown"
 
 
+@pytest.mark.parametrize(
+    "xml",
+    [
+        '<testsuite tests="0" failures="0" errors="0" />',
+        '<testsuite failures="0" errors="0" />',
+        "<testsuites />",
+    ],
+)
+def test_nextest_junit_unknown_without_tests(tmp_path: Path, xml: str) -> None:
+    assert parse_nextest_junit(write_xml(tmp_path, xml)) == "unknown"
+
+
+def test_nextest_junit_unknown_for_stale_artifact(tmp_path: Path) -> None:
+    path = write_xml(
+        tmp_path, '<testsuite tests="1" failures="0" errors="0" />'
+    )
+    modified_ns = path.stat().st_mtime_ns
+
+    assert parse_nextest_junit(path, not_before_ns=modified_ns + 1) == "unknown"
+
+
 def test_pytest_junit_extracts_failures_and_errors(tmp_path: Path) -> None:
     path = write_xml(
         tmp_path,
@@ -133,3 +158,43 @@ def test_pytest_junit_rejects_unmapped_classname(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="cannot map JUnit testcase"):
         failed_pytest_node_ids(path)
+
+
+def test_pytest_junit_rejects_stale_artifact(tmp_path: Path) -> None:
+    path = write_xml(
+        tmp_path,
+        """\
+<testsuite>
+  <testcase classname="python.tests.test_actor_error" name="test_crash">
+    <failure message="failed" />
+  </testcase>
+</testsuite>
+""",
+    )
+    modified_ns = path.stat().st_mtime_ns
+
+    with pytest.raises(ValueError, match="stale artifact"):
+        failed_pytest_node_ids(path, not_before_ns=modified_ns + 1)
+
+
+@pytest.mark.parametrize(
+    "dest",
+    [
+        "/",
+        "/tmp/rootfs-experiment",
+        str(REPO_ROOT),
+        str(REPO_ROOT / "scripts" / "rootfs"),
+        str(REPO_ROOT / "scripts" / "rootfs" / "experiment"),
+    ],
+)
+def test_rootfs_builder_rejects_unmanaged_destination(dest: str) -> None:
+    result = subprocess.run(
+        [ROOTFS_BUILDER, "--dest", dest],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PATH": "/usr/bin:/bin"},
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "--dest must be a managed rootfs path" in result.stderr

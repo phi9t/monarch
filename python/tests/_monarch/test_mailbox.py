@@ -20,6 +20,7 @@ from typing import (
     TypeVar,
 )
 
+import pytest
 from monarch._rust_bindings.monarch_hyperactor.actor import (
     MethodSpecifier,
     PythonMessage,
@@ -44,6 +45,8 @@ from monarch._rust_bindings.monarch_hyperactor.mailbox import (
 )
 from monarch._rust_bindings.monarch_hyperactor.proc_mesh import ProcMesh
 from monarch._src.actor.actor_mesh import context, Instance
+
+pytestmark = pytest.mark.control_plane
 
 
 def _to_frozen_buffer(data: bytes) -> FrozenBuffer:

@@ -183,6 +183,8 @@ packages = {find = {where = ["python"]}}
 [tool.pytest.ini_options]
 markers = [
     "oss_skip: marks tests to skip in OSS CI",
+    "control_plane: marks control-plane (host/proc/actor mesh + supervision) tests",
+    "gpu: marks tests that require a local GPU",
 ]
 asyncio_mode = "auto"
 # Default timeout of 5 minutes

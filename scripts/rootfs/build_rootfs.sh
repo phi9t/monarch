@@ -26,8 +26,8 @@
 # Options:
 #   --rebuild       Force a docker rebuild even if the image tag exists.
 #   --tag TAG       Docker image tag to build/use (default: monarch-rootfs:local).
-#   --dest DIR      Directory to export the flattened rootfs into
-#                   (default: scripts/rootfs/rootfs).
+#   --dest DIR      Managed directory under scripts/rootfs/ named rootfs or
+#                   rootfs-* (default: scripts/rootfs/rootfs).
 #   -h, --help      Show this help and exit.
 
 set -euo pipefail
@@ -38,7 +38,15 @@ ROOTFS_DIR="$REPO_ROOT/scripts/rootfs"
 TAG="monarch-rootfs:local"
 DEST="$ROOTFS_DIR/rootfs"
 REBUILD=0
-BASE_IMAGE="ghcr.io/pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime"
+BASE_IMAGE="ghcr.io/pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime@sha256:7492928e093d67276716440161f694a0e4ea27796d599d64b23cb76cdd665e71"
+UV_IMAGE="ghcr.io/astral-sh/uv:0.12.2@sha256:069a51314a7bb6031777a9273205fe1b0b19e914ef418207d1338b268df641dd"
+NEXTEST_VERSION="0.9.143"
+CUDA_NVCC_VERSION="13.3.73"
+CUDA_CCCL_VERSION="13.3.3.4.1"
+SETUPTOOLS_VERSION="81.0.0"
+SETUPTOOLS_RUST_VERSION="1.12.0"
+WHEEL_VERSION="0.47.0"
+SEMANTIC_VERSION="2.10.0"
 
 usage() { sed -n '9,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -56,6 +64,16 @@ done
 
 log() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 die() { printf '\033[1;31merror: %s\033[0m\n' "$*" >&2; exit 1; }
+usage_error() { printf 'error: %s\n' "$*" >&2; exit 2; }
+
+ROOTFS_DIR="$(realpath -e "$ROOTFS_DIR")"
+dest_parent="$(realpath -m "$(dirname -- "$DEST")")"
+dest_name="$(basename -- "$DEST")"
+if [[ "$dest_parent" != "$ROOTFS_DIR" || ! "$dest_name" =~ ^rootfs(-[A-Za-z0-9._-]+)?$ ]]; then
+  usage_error "--dest must be a managed rootfs path under $ROOTFS_DIR named rootfs or rootfs-*"
+fi
+DEST="$dest_parent/$dest_name"
+[[ ! -L "$DEST" ]] || usage_error "--dest must not be a symbolic link: $DEST"
 
 command -v docker >/dev/null || die "docker not found on host"
 
@@ -75,10 +93,28 @@ else
   docker build -t "$TAG" \
     --build-arg RUST_CHANNEL="$RUST_CHANNEL" \
     --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg UV_IMAGE="$UV_IMAGE" \
+    --build-arg NEXTEST_VERSION="$NEXTEST_VERSION" \
+    --build-arg CUDA_NVCC_VERSION="$CUDA_NVCC_VERSION" \
+    --build-arg CUDA_CCCL_VERSION="$CUDA_CCCL_VERSION" \
+    --build-arg SETUPTOOLS_VERSION="$SETUPTOOLS_VERSION" \
+    --build-arg SETUPTOOLS_RUST_VERSION="$SETUPTOOLS_RUST_VERSION" \
+    --build-arg WHEEL_VERSION="$WHEEL_VERSION" \
+    --build-arg SEMANTIC_VERSION="$SEMANTIC_VERSION" \
     -f - "$ROOTFS_DIR" <<'DOCKERFILE'
 ARG BASE_IMAGE
+ARG UV_IMAGE
+FROM ${UV_IMAGE} AS uv
+
 FROM ${BASE_IMAGE}
 ARG RUST_CHANNEL
+ARG NEXTEST_VERSION
+ARG CUDA_NVCC_VERSION
+ARG CUDA_CCCL_VERSION
+ARG SETUPTOOLS_VERSION
+ARG SETUPTOOLS_RUST_VERSION
+ARG WHEEL_VERSION
+ARG SEMANTIC_VERSION
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -91,8 +127,8 @@ RUN apt-get update -y && \
         protobuf-compiler pkg-config git curl ca-certificates rsync && \
     rm -rf /var/lib/apt/lists/*
 
-# uv: copy the standalone binaries from the official image.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+# uv: copy pinned standalone binaries from the official image.
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 # Pinned Rust toolchain via rustup, reading the repo's rust-toolchain channel.
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
@@ -105,17 +141,22 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 
 # cargo-nextest: the Rust control-plane suite runs under nextest for process
 # isolation. Install the prebuilt binary into CARGO_HOME/bin (fast + hermetic).
-RUN curl -LsSf https://get.nexte.st/latest/linux | \
+RUN curl -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/linux" | \
         tar -C /opt/cargo/bin -xzf - && \
     cargo nextest --version
 
-# CUDA nvcc: the runtime baseline ships CUDA headers + libs under
-# nvidia/cu13/{include,lib} but no compiler. The canonical nvidia-cuda-nvcc
-# wheel adds nvidia/cu13/bin/nvcc (+ crt/nvvm) into the same tree, so CUDA_HOME
-# can point straight at nvidia/cu13. setup.py get_cuda_home() and torch
+# CUDA nvcc and Python build tools: the runtime baseline ships CUDA headers +
+# libs under nvidia/cu13/{include,lib} but no compiler. The canonical
+# nvidia-cuda-nvcc wheel adds nvidia/cu13/bin/nvcc (+ crt/nvvm) into the same
+# tree, so CUDA_HOME can point straight at nvidia/cu13. setup.py get_cuda_home() and torch
 # cpp_extension expect bin/nvcc, include/, and lib64/, so symlink lib64 -> lib.
 RUN pip install --break-system-packages --no-cache-dir \
-        nvidia-cuda-nvcc nvidia-cuda-cccl
+        "nvidia-cuda-nvcc==${CUDA_NVCC_VERSION}" \
+        "nvidia-cuda-cccl==${CUDA_CCCL_VERSION}" \
+        "setuptools==${SETUPTOOLS_VERSION}" \
+        "setuptools-rust==${SETUPTOOLS_RUST_VERSION}" \
+        "wheel==${WHEEL_VERSION}" \
+        "semantic-version==${SEMANTIC_VERSION}"
 RUN set -euo pipefail; \
     site="$(python -c 'import site;print(site.getsitepackages()[0])')"; \
     cu="$site/nvidia/cu13"; \
@@ -132,14 +173,29 @@ fi
 # Export the image filesystem to a flattened directory. Export to a temp dir and
 # swap into place so an interrupted run never leaves a half-populated rootfs.
 log "exporting $TAG to $DEST"
-mkdir -p "$(dirname "$DEST")"
-STAGE="$(mktemp -d "${DEST%/*}/.rootfs.stage.XXXXXX")"
+mkdir -p "$ROOTFS_DIR"
+STAGE="$(mktemp -d "$ROOTFS_DIR/.rootfs.stage.XXXXXX")"
+[[ -d "$STAGE" && ! -L "$STAGE" && "$(dirname -- "$STAGE")" == "$ROOTFS_DIR" ]] || \
+  die "mktemp produced an invalid stage directory: $STAGE"
 cid="$(docker create "$TAG")"
-trap 'docker rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$STAGE"' EXIT
+[[ "$cid" =~ ^[0-9a-f]+$ ]] || die "docker create returned an invalid container id"
+cleanup() {
+  docker rm -f -- "${cid:?}" >/dev/null 2>&1 || true
+  if [[ -d "${STAGE:-}" && ! -L "$STAGE" && \
+        "$(dirname -- "$STAGE")" == "$ROOTFS_DIR" && \
+        "$(basename -- "$STAGE")" == .rootfs.stage.* ]]; then
+    rm -rf -- "${STAGE:?}"
+  fi
+}
+trap cleanup EXIT
 docker export "$cid" | tar -C "$STAGE" -xf -
 [[ -x "$STAGE/bin/bash" ]] || die "export produced an unusable rootfs (no bin/bash)"
-rm -rf "$DEST"
+[[ "$(dirname -- "$DEST")" == "$ROOTFS_DIR" && ! -L "$DEST" ]] || \
+  die "refusing to replace invalid rootfs destination: $DEST"
+if [[ -e "$DEST" ]]; then
+  [[ -d "$DEST" ]] || die "rootfs destination is not a directory: $DEST"
+  rm -rf -- "${DEST:?}"
+fi
 mv "$STAGE" "$DEST"
-trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
 log "rootfs ready: $DEST"

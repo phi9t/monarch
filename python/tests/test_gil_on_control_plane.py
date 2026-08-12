@@ -33,6 +33,8 @@ from monarch.actor import Actor, endpoint, this_host
 from monarch.rdma import RDMABuffer
 from rdma_test_utils import rdma_backends
 
+pytestmark = pytest.mark.control_plane
+
 
 needs_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),

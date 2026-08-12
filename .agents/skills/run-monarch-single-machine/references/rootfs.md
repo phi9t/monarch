@@ -18,9 +18,15 @@ single-machine bwrap rootfs. The source of truth lives in the Monarch repo under
   `--unshare-all --share-net --die-with-parent`, and `MONARCH_IN_ROOTFS=1`.
   It auto-builds the rootfs if missing.
 - `scripts/rootfs/run_in_rootfs.sh` runs inside bwrap: creates/reuses
-  `.venv-rootfs` with `uv venv --python 3.12 --system-site-packages`, installs
-  build backend deps, runs `uv pip install --no-build-isolation -e ".[test]"`,
-  then delegates to `scripts/run_local_control_plane.sh`.
+  `.venv-rootfs` with `uv venv --python 3.12 --system-site-packages`, synchronizes
+  the test environment through `scripts/rootfs/sync_test_environment.sh`, then
+  delegates to `scripts/run_local_control_plane.sh`.
+- `scripts/rootfs/sync_test_environment.sh` synchronizes the frozen `uv.lock`,
+  replaces its Linux-only `torchx-nightly==2021.10.28` selection with the
+  hash-pinned `2026.7.27` wheel already present in the lock, and installs the
+  project editable with dependency resolution disabled using the build tools
+  pinned in the rootfs. The override is required because the vendored 2021
+  TorchX release cannot import on Python 3.12.
 
 `scripts/run_local_control_plane.sh --rootfs` re-execs through
 `enter_rootfs.sh -- scripts/rootfs/run_in_rootfs.sh`. The
@@ -28,12 +34,16 @@ single-machine bwrap rootfs. The source of truth lives in the Monarch repo under
 `prepare_rust_toolchain()` should be a no-op because the rootfs `cc`/`clang`
 already targets the same loader/glibc as `rustc`.
 
+The checked-in `uv.lock` is generated with Meta's vendored-version overrides.
+Use frozen syncs inside the rootfs; plain `uv lock` cannot reproduce the file
+and rewrites unrelated dependency versions.
+
 ## Image contents
 
 Base image:
 
 ```text
-ghcr.io/pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime
+ghcr.io/pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime@sha256:7492928e093d67276716440161f694a0e4ea27796d599d64b23cb76cdd665e71
 ```
 
 Verified baseline facts: Python 3.12.3, torch 2.13.0+cu132, glibc 2.39. It is
@@ -48,8 +58,17 @@ libibverbs-dev librdmacm-dev protobuf-compiler pkg-config git curl
 ca-certificates rsync
 ```
 
-It also installs standalone `uv`, the Rust channel from repo `rust-toolchain`
-via rustup, `cargo-nextest`, and CUDA nvcc from pip wheels.
+The baseline and `uv` images are digest-pinned. The build also installs pinned
+`uv` 0.12.2, the Rust channel from repo
+`rust-toolchain` via rustup, pinned `cargo-nextest` 0.9.143, and CUDA nvcc from
+the pinned `nvidia-cuda-nvcc==13.3.73` and
+`nvidia-cuda-cccl==13.3.3.4.1` wheels. Editable builds use pinned
+`setuptools==81.0.0`, `setuptools-rust==1.12.0`, `wheel==0.47.0`, and
+`semantic-version==2.10.0` from the rootfs system site-packages.
+
+Ubuntu build packages follow the current Noble package repositories and are not
+snapshot-pinned. A rebuild can therefore incorporate newer security updates
+even though the container bases and application-level build tools are pinned.
 
 ## Synthetic CUDA_HOME
 
@@ -87,7 +106,8 @@ scripts/rootfs/build_rootfs.sh --rebuild
 rm -rf .venv-rootfs
 ```
 
-For custom image tags or destinations:
+For custom image tags or destinations, the destination must be a direct child
+of `scripts/rootfs/` named `rootfs` or `rootfs-*`:
 
 ```sh
 scripts/rootfs/build_rootfs.sh --tag monarch-rootfs:experiment --dest scripts/rootfs/rootfs-experiment

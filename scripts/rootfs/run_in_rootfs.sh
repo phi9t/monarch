@@ -47,10 +47,12 @@ log "building monarch (-e .) with tensor engine (CUDA_HOME=$CUDA_HOME)"
 # torch is provided by the inherited system site-packages; setup.py detects it
 # and the baked CUDA_HOME at build time. Build without isolation so the extension
 # links the rootfs torch (rather than a fresh download), which means the build
-# backend deps must be present in the venv first (torch comes from the inherited
-# system site-packages; the rest are not in the base image).
-uv pip install setuptools setuptools-rust wheel "numpy>=1.26"
-uv pip install --no-build-isolation -e ".[test]"
+# backend deps must be present in the environment first. They and torch come
+# from the inherited, version-pinned system site-packages. Synchronize the test
+# dependencies from uv.lock, apply the rootfs compatibility override, then
+# install the project separately without dependency resolution so the rootfs
+# torch remains authoritative.
+"$REPO_ROOT/scripts/rootfs/sync_test_environment.sh"
 
 log "delegating to run_local_control_plane.sh"
 exec "$REPO_ROOT/scripts/run_local_control_plane.sh" "$@"

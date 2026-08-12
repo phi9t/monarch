@@ -75,11 +75,14 @@ scripts/run_local_8gpu_capacity.sh
 ```
 
 It always re-enters through `scripts/rootfs/enter_rootfs.sh`, creates or reuses
-`.venv-rootfs`, installs Monarch editable with test dependencies, requires
-`torch.cuda.device_count() == 8`, and runs an 8-rank tensor smoke before running
+`.venv-rootfs`, synchronizes the frozen `uv.lock` test dependencies, applies the
+hash-pinned TorchX compatibility override described below, and installs Monarch
+editable without resolving project dependencies. The editable build uses the
+build tools and torch pinned in the rootfs. It requires
+`torch.cuda.device_count() == 8` and runs an 8-rank tensor smoke before running
 the control-plane suites with all eight GPUs exposed. If the caller sets
-`CUDA_VISIBLE_DEVICES`, it must name exactly eight devices and the verifier will
-preserve that explicit device list.
+`CUDA_VISIBLE_DEVICES`, it must name exactly eight devices and the verifier
+preserves that explicit device list.
 
 Read the verifier output as a validation ladder:
 
@@ -103,7 +106,8 @@ accepts every failed node. Contract Artifacts are
 `control-plane-results/control-plane-python.xml`,
 `control-plane-results/control-plane-python-isolation.txt` when classification
 runs, and `target/nextest/ci/junit.xml`; treat build caches and logs as
-incidental.
+incidental. The verifier removes the Python and Rust JUnit paths before the
+integration run and accepts only reports created after that run starts.
 
 For future Capacity Verifiers, keep behavior in scripts, repo policy in
 `AGENTS.md`, and agent procedure in this skill. Reuse the Local Run Ladder unless
@@ -132,8 +136,7 @@ scripts/rootfs/enter_rootfs.sh -- bash -lc '
   cd /workspace/monarch
   [ -x .venv-rootfs/bin/python ] || uv venv --python 3.12 --system-site-packages .venv-rootfs
   source .venv-rootfs/bin/activate
-  uv pip install setuptools setuptools-rust wheel "numpy>=1.26"
-  uv pip install --no-build-isolation -e ".[test]"
+  scripts/rootfs/sync_test_environment.sh
   python your_single_machine_script.py
 '
 ```
@@ -156,6 +159,15 @@ The rootfs directory (`scripts/rootfs/rootfs/`), intermediate rootfs stage dirs,
 export tarballs, and `.venv-rootfs` should stay gitignored. For image contents,
 CUDA `nvcc` assembly, version bumps, and troubleshooting, read
 [references/rootfs.md](references/rootfs.md).
+
+Use `uv sync --frozen` in this workflow. The checked-in `uv.lock` carries
+Meta-generated vendored-version overrides, so plain `uv lock` causes unrelated
+lockfile churn and must not be used as a local setup step.
+
+The generated lock selects `torchx-nightly==2021.10.28` on Linux, which cannot
+import under the rootfs Python 3.12. `sync_test_environment.sh` replaces only
+that distribution with the `2026.7.27` wheel and hash already recorded in the
+same lock. Keep this exception centralized in the helper.
 
 ## Interpret results
 
