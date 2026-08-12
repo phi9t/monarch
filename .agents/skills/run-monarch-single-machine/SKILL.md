@@ -11,21 +11,35 @@ under. On Nix-provisioned or otherwise mismatched hosts, that invariant is
 violated and the build can fail during proc-macro loading or produce `.so`
 files with unresolved `__isoc23_*` symbols.
 
-For this skill, always run single-machine Monarch work through the bwrap rootfs:
-use `scripts/run_local_control_plane.sh --rootfs` for the control-plane suites
-and `scripts/rootfs/enter_rootfs.sh -- <command>` for ad hoc Python, cargo, or
-diagnostic commands. Do not fall back to the host toolchain unless the user
-explicitly asks to bypass the sandbox.
+`scripts/run` is the sole Linux-local gateway into the hermetic bwrap rootfs and
+the default for every single-machine command. It re-execs into the sandbox, maps
+the caller's directory to the matching checkout-relative directory, activates the
+rootfs virtual environment, and preserves arguments and exit status; it
+auto-builds the rootfs on first use. Run all local build, test, run, and docs
+work through it.
+
+## Choosing a branch
+
+- **Any Linux-local command** — actor tests, a proc-mesh script, `cargo`, `uv`,
+  `pytest`, docs — runs through `scripts/run <command> [args...]`. This is the
+  default branch; take it unless the request names one of the domains below.
+- **Control-plane or 8-GPU capacity** — run the committed verifiers, which enter
+  the same rootfs (see the sections below).
+- **GitHub Linux CI, native macOS, or a remote worker** — these are separate
+  execution domains and never nest the local bwrap. GitHub runners already run on
+  a controlled Ubuntu image; macOS has no bwrap; remote workers run under their
+  own scheduler. Do not wrap their commands in `scripts/run`, and do not suggest
+  host toolchain overrides to force a local build in those domains.
+
+Do not fall back to the host toolchain unless the user explicitly asks to bypass
+the sandbox.
 
 ## Repository
 
-This skill is written for the Monarch checkout at:
-
-```sh
-/data02/home/philip.yang/workspace/monarch
-```
-
-Run commands from that repo root unless the user gives a different checkout.
+Run commands from the Monarch checkout root, using repo-relative paths such as
+`scripts/run` and `scripts/run_local_8gpu_capacity.sh`. The rootfs mounts the
+checkout at `/workspace/monarch`, so the sandbox path layout — not the host path
+— is what the gateway and verifiers depend on.
 
 ## Host prerequisites
 
@@ -42,22 +56,26 @@ command -v bwrap docker
 nvidia-smi -L
 ```
 
+Building `bwrap`/`docker`/driver availability and entering the rootfs is host
+bootstrap — the only Linux-local work outside the `scripts/run` gateway.
+
 ## Run the control-plane suites
 
-The single entrypoint re-execs itself into the sandbox, builds `-e .`, and runs
-both the Python crash-recovery and Rust nextest control-plane suites:
+The runner re-execs itself through `scripts/run` when invoked outside the rootfs,
+builds `-e .`, and runs both the Python crash-recovery and Rust nextest
+control-plane suites:
 
 ```sh
-scripts/run_local_control_plane.sh --rootfs
+scripts/run scripts/run_local_control_plane.sh
 ```
 
 The rootfs is built automatically on first use if missing, so this is a single
 command from a clean checkout. Useful variants:
 
 ```sh
-scripts/run_local_control_plane.sh --rootfs --rust-only
-scripts/run_local_control_plane.sh --rootfs --python-only
-scripts/run_local_control_plane.sh --rootfs --keep-going
+scripts/run scripts/run_local_control_plane.sh --rust-only
+scripts/run scripts/run_local_control_plane.sh --python-only
+scripts/run scripts/run_local_control_plane.sh --keep-going
 ```
 
 Results:
@@ -71,11 +89,10 @@ For capacity checks that must prove the tensor engine runs across all eight
 local GPUs, prefer the committed verifier:
 
 ```sh
-scripts/run_local_8gpu_capacity.sh
+scripts/run scripts/run_local_8gpu_capacity.sh
 ```
 
-It always re-enters through `scripts/rootfs/enter_rootfs.sh`, creates or reuses
-`.venv-rootfs`, synchronizes the frozen `uv.lock` test dependencies, applies the
+It re-enters through `scripts/run`, creates or reuses `.venv-rootfs`, synchronizes the frozen `uv.lock` test dependencies, applies the
 hash-pinned TorchX compatibility override described below, and installs Monarch
 editable without resolving project dependencies. The editable build uses the
 build tools and torch pinned in the rootfs. It requires
@@ -118,33 +135,30 @@ The Hermetic Rootfs may be auto-built and reused.
 
 ## Run ad hoc Monarch commands
 
-`enter_rootfs.sh` enters the sandbox with the repo mounted at
-`/workspace/monarch`, local GPUs bound in, and the host NVIDIA driver userspace
-read-only bound into the rootfs. It auto-builds the rootfs if missing.
+`scripts/run <command>` runs any single command inside the sandbox with the repo
+mounted at `/workspace/monarch`, local GPUs bound in, the host NVIDIA driver
+userspace read-only bound, and `.venv-rootfs` activated. `scripts/run` with no
+arguments opens an interactive rootfs shell. It auto-builds the rootfs if missing.
 
 ```sh
-scripts/rootfs/enter_rootfs.sh
-scripts/rootfs/enter_rootfs.sh -- nvidia-smi -L
-scripts/rootfs/enter_rootfs.sh -- python -c 'import torch; print(torch.cuda.is_available())'
+scripts/run                      # interactive shell inside the rootfs
+scripts/run nvidia-smi -L
+scripts/run python -c 'import torch; print(torch.cuda.is_available())'
+scripts/run pytest python/tests/test_actor.py -q
+scripts/run cargo test -p hyperactor
 ```
 
-To build the extension and run custom single-machine Python, reuse the
-in-sandbox venv at `.venv-rootfs`:
+To build the extension and run a custom single-machine script, chain the build
+and run through the gateway:
 
 ```sh
-scripts/rootfs/enter_rootfs.sh -- bash -lc '
-  cd /workspace/monarch
-  [ -x .venv-rootfs/bin/python ] || uv venv --python 3.12 --system-site-packages .venv-rootfs
-  source .venv-rootfs/bin/activate
-  scripts/rootfs/sync_test_environment.sh
-  python your_single_machine_script.py
-'
+scripts/run uv pip install -e .
+scripts/run python your_single_machine_script.py
 ```
 
-Everything should run on `this_host()` / local in-process meshes. Do not assume
-CI variables or remote execution. `CUDA_VISIBLE_DEVICES` is honored from the
-caller; an empty value hides all GPUs and the control-plane preflight should
-abort.
+Everything runs on `this_host()` / local in-process meshes. Do not assume CI
+variables or remote execution. `CUDA_VISIBLE_DEVICES` is honored from the caller;
+an empty value hides all GPUs and the control-plane preflight aborts.
 
 ## Build and maintain the rootfs
 
@@ -178,10 +192,7 @@ code-sync rsync daemon). Before treating such a failure as a rootfs regression,
 re-run the specific test in isolation inside the same rootfs:
 
 ```sh
-scripts/rootfs/enter_rootfs.sh -- bash -lc '
-  cd /workspace/monarch && source .venv-rootfs/bin/activate
-  python -m pytest "python/tests/<file>::<test>" -q -m "control_plane and not oss_skip"
-'
+scripts/run python -m pytest "python/tests/<file>::<test>" -q -m "control_plane and not oss_skip"
 ```
 
 If it passes alone, treat the full-run failure as pre-existing suite-ordering

@@ -28,11 +28,12 @@ single-machine bwrap rootfs. The source of truth lives in the Monarch repo under
   pinned in the rootfs. The override is required because the vendored 2021
   TorchX release cannot import on Python 3.12.
 
-`scripts/run_local_control_plane.sh --rootfs` re-execs through
-`enter_rootfs.sh -- scripts/rootfs/run_in_rootfs.sh`. The
-`MONARCH_IN_ROOTFS=1` marker prevents recursion. Inside the rootfs,
-`prepare_rust_toolchain()` should be a no-op because the rootfs `cc`/`clang`
-already targets the same loader/glibc as `rustc`.
+`scripts/run` re-execs into the sandbox via `enter_rootfs.sh` and activates
+`.venv-rootfs`; `scripts/run_local_control_plane.sh` re-execs itself through
+`scripts/run` when invoked outside the rootfs. The `MONARCH_IN_ROOTFS=1` marker
+prevents recursion. Inside the rootfs, `prepare_rust_toolchain()` should be a
+no-op because the rootfs `cc`/`clang` already targets the same loader/glibc as
+`rustc`.
 
 The checked-in `uv.lock` is generated with Meta's vendored-version overrides.
 Use frozen syncs inside the rootfs; plain `uv lock` cannot reproduce the file
@@ -95,7 +96,7 @@ or bumping the repo `rust-toolchain` channel:
 ```sh
 scripts/rootfs/build_rootfs.sh --rebuild
 rm -rf .venv-rootfs
-scripts/run_local_control_plane.sh --rootfs --rust-only
+scripts/run scripts/run_local_control_plane.sh --rust-only
 ```
 
 For a fully clean rootfs export as well:
@@ -123,7 +124,7 @@ scripts/rootfs/enter_rootfs.sh --rootfs scripts/rootfs/rootfs-experiment -- nvid
 - **GPUs not visible**: confirm host `/dev/nvidia*`, host driver libs, and that
   `CUDA_VISIBLE_DEVICES` is not set to an empty string.
 - **Build links against host/Nix toolchain**: ensure the command is run through
-  `--rootfs` or `enter_rootfs.sh`. Do not pass `CC`, `LIBCLANG_PATH`, or
+  `scripts/run` (or `enter_rootfs.sh`). Do not pass `CC`, `LIBCLANG_PATH`, or
   `BINDGEN_EXTRA_CLANG_ARGS` unless deliberately debugging.
 - **Python full-suite failures that pass alone**: treat as cross-test state
   fragility in the unprivileged user namespace, not as rootfs build failure.
@@ -133,7 +134,7 @@ scripts/rootfs/enter_rootfs.sh --rootfs scripts/rootfs/rootfs-experiment -- nvid
 ## Quick verification
 
 ```sh
-scripts/rootfs/enter_rootfs.sh -- nvidia-smi -L
-scripts/rootfs/enter_rootfs.sh -- python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())'
-scripts/run_local_control_plane.sh --rootfs --rust-only
+scripts/run nvidia-smi -L
+scripts/run python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())'
+scripts/run scripts/run_local_control_plane.sh --rust-only
 ```

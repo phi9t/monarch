@@ -51,34 +51,50 @@ keeping synthesis in the main thread.
 
 ## Build & Commands
 
+Every Linux-local Monarch command runs through `scripts/run`, the sole gateway
+into the hermetic bwrap rootfs. `scripts/run <command> [args...]` re-execs inside
+the sandbox, maps the caller's directory to the matching checkout-relative
+directory, activates the rootfs virtual environment, and preserves the command's
+arguments and exit status; `scripts/run` with no arguments opens an interactive
+rootfs shell. The rootfs carries a validated PyTorch-CUDA baseline (Ubuntu glibc
+2.39, system gcc/clang, Python 3.12, torch 2.13.0+cu132) and pinned Rust, so
+`uv`, `cargo`, `pytest`, `make`, `npm`, and checkout Python all build with no
+toolchain hacks. `enter_rootfs.sh` auto-builds the rootfs on first use, so
+`scripts/run` is a single command from a clean checkout.
+
 Monarch uses `uv` for Python and `setuptools-rust` to build the Rust extension.
-An active Python environment is **required** even for `cargo` commands, because
-PyO3 links against Python (missing it yields `could not find native static
-library python3.12`).
+PyO3 links against Python, so the rootfs venv must be active for `cargo`
+commands; `scripts/run` activates it (running `cargo` outside the gateway on a
+bare host yields `could not find native static library python3.12`).
 
 ```sh
 # Development install (GPU/tensor engine auto-detected)
-uv sync
+scripts/run uv sync
 
 # CPU-only / actors-only (no torch, CUDA, or RDMA needed)
-USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
 
 # Rebuild after Rust changes
-uv pip install -e .            # or: USE_TENSOR_ENGINE=0 uv pip install -e .
+scripts/run uv pip install -e .
 
 # Build a wheel (reuses cached rust builds)
-uv build --wheel --no-build-isolation
+scripts/run uv build --wheel --no-build-isolation
 
 # Verify
-uv run python -c "from monarch import actor; print('ok')"
+scripts/run uv run python -c "from monarch import actor; print('ok')"
 ```
 
-Docs: `cd docs && pip install -r requirements.txt && make html` (auto-generates
-Python API + `cargo doc`, and processes `examples/` via Sphinx Gallery).
+The following Linux-local work is exempt from `scripts/run` because it names a
+separate execution domain: **host bootstrap** (building and entering the rootfs
+via `scripts/rootfs/`), **GitHub Actions** and other controlled CI, **native
+macOS**, **installed wheels** (`pip install torchmonarch`), Meta-internal builds,
+and **remote workers**. None nest the local bwrap.
+
+Docs build inside the rootfs; see the [Documentation](#documentation) section.
 
 Meta-internal tooling (not available in OSS) includes `./check`
 (lint/typecheck/test), `arc f`, `arc autocargo -p monarch`, `arc pyre`, and
-`buck2`. Use the `uv`/`cargo`/`pytest` commands above for OSS work.
+`buck2`. Use the `scripts/run` commands above for OSS work.
 
 ### Build Environment Variables
 
@@ -113,12 +129,13 @@ From `MONARCH_INFO.md` (authoritative) plus tool configs:
 - **Rust formatting** (`rustfmt.toml`): edition 2024, `imports_granularity=Item`,
   `group_imports=StdExternalCrate`, `merge_derives=false`,
   `use_field_init_shorthand=true`, `format_code_in_doc_comments=true`. Run
-  `cargo fmt`.
-- **Rust lint:** `cargo clippy`. `clippy.toml` sets `too-many-lines-threshold=200`
-  and disallows `await`-holding `tracing` span guards. `.cargo/config.toml`
-  mirrors the internal allowed-lint set — keep both in sync.
+  `scripts/run cargo fmt`.
+- **Rust lint:** `scripts/run cargo clippy`. `clippy.toml` sets
+  `too-many-lines-threshold=200` and disallows `await`-holding `tracing` span
+  guards. `.cargo/config.toml` mirrors the internal allowed-lint set — keep both
+  in sync.
 - **Python formatting:** ufmt/ruff (`ruff-api`), target `py310`. Linting via
-  flake8 (`.flake8`, `max-line-length=256`). Run `flake8 python/`.
+  flake8 (`.flake8`, `max-line-length=256`). Run `scripts/run flake8 python/`.
 - **Toolchain:** Rust pinned to `nightly-2026-05-22` (`rust-toolchain`); Python
   3.10–3.13 (repo pins 3.12 for wheels/docker; `.python-version` is 3.12).
 - Never commit code that fails the type checkers (rustc / pyre / pyright).
@@ -131,13 +148,13 @@ isolation; Python uses `pytest`.
 
 ```sh
 # Python — install test deps then run (skip Meta-only tests)
-uv sync --extra test
-uv run pytest python/tests/ -v -m "not oss_skip"
-uv run pytest python/tests/ -v -m "not oss_skip" -n auto   # parallel
+scripts/run uv sync --extra test
+scripts/run uv run pytest python/tests/ -v -m "not oss_skip"
+scripts/run uv run pytest python/tests/ -v -m "not oss_skip" -n auto   # parallel
 
-# Rust — activate the Python env first (PyO3 linking)
-uv sync
-uv run cargo nextest run          # install: cargo install cargo-nextest --locked
+# Rust — the gateway activates the Python env for PyO3 linking
+scripts/run uv sync
+scripts/run uv run cargo nextest run          # install: scripts/run cargo install cargo-nextest --locked
 ```
 
 ### Local control-plane test run
@@ -237,6 +254,25 @@ fragility rather than a rootfs regression.
 - CI workflows are in `.github/workflows/` (CPU/GPU × Python/Rust, macOS, docs,
   wheels, docker).
 
+## Documentation
+
+Documentation builds from rootfs-controlled tools; run each format through
+`scripts/run`. The docs `Makefile` guards its own targets, so `make -C docs html`
+aborts outside the rootfs.
+
+```sh
+scripts/run uv sync --frozen --inexact --group docs --extra kubernetes --no-dev --no-install-project
+scripts/run bash scripts/build_monarch_for_docs.sh
+scripts/run cargo doc --locked --workspace --no-deps
+scripts/run mdbook build docs/source/books/hyperactor-book
+scripts/run mdbook build docs/source/books/hyperactor-mesh-book
+scripts/run make -C docs html
+```
+
+`make -C docs html` runs the Sphinx Gallery pass and copies the Cargo docs from
+`$CARGO_TARGET_DIR/doc`, but it does not itself run `cargo doc` or the mdBook
+builds; run those first. See `docs/DOCUMENTATION_GUIDE.md` for the full workflow.
+
 ## Security
 
 - Security practices follow PyTorch Distributed; see
@@ -268,12 +304,12 @@ fragility rather than a rootfs regression.
 
 ## Common Pitfalls
 
-- Rust build fails with a Python linking error → activate the Python env first
-  (or use `uv run cargo ...`).
+- Rust build fails with a Python linking error → run through `scripts/run`, which
+  activates the rootfs Python env; a bare-host `cargo` cannot find libpython.
 - `uv lock` rewrites many unrelated packages → the checked-in lockfile is
-  generated with Meta's vendored-version overrides. Use `uv sync --frozen` for
-  OSS local runs; do not regenerate `uv.lock` with plain `uv lock` unless you
-  intend to replace that policy.
+  generated with Meta's vendored-version overrides. Use `scripts/run uv sync
+  --frozen` for OSS local runs; do not regenerate `uv.lock` with plain `uv lock`
+  unless you intend to replace that policy.
 - Import errors for RDMA/distributed tensors → rebuild with tensor engine enabled
   (`USE_TENSOR_ENGINE=1`, default).
 - Ensure your CUDA install matches the PyTorch index (cu132 = CUDA 13.2); C++11

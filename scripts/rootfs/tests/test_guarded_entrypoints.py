@@ -290,3 +290,29 @@ def test_frontend_builder_rejects_before_fake_npm_runs(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert "hermetic bwrap rootfs" in result.stderr
     assert not sentinel.exists()
+
+
+def test_docs_make_rejects_before_fake_sphinx_runs(tmp_path: Path) -> None:
+    # make -C docs html must abort in the guard before an overridden
+    # SPHINXBUILD can run.
+    sentinel = tmp_path / "sentinel"
+    fake = tmp_path / "fake-sphinx"
+    fake.write_text(f'#!/bin/sh\necho ran > "{sentinel}"\n')
+    fake.chmod(0o755)
+    result = _run_uncontrolled(
+        ["make", "-C", str(REPO_ROOT / "docs"), "html", f"SPHINXBUILD={fake}"],
+    )
+    assert result.returncode == 2
+    assert not sentinel.exists()
+
+
+def test_docs_clean_rejects_before_deleting_output(tmp_path: Path) -> None:
+    output = REPO_ROOT / "docs/build/guard-sentinel"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("keep")
+    try:
+        result = _run_uncontrolled(["make", "-C", str(REPO_ROOT / "docs"), "clean"])
+        assert result.returncode == 2
+        assert output.read_text() == "keep"
+    finally:
+        output.unlink()

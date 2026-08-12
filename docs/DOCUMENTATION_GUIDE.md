@@ -6,23 +6,28 @@ This guide explains how the Monarch project's documentation system works and how
 
 ### Building Locally
 
-For most users, this is all you need to get started:
+Documentation builds from rootfs-controlled tools; run each step through
+`scripts/run`, the sole Linux-local gateway into the hermetic bwrap rootfs. The
+docs `Makefile` guards its own targets, so `make -C docs html` aborts outside the
+rootfs. Run the steps from the project root in order:
 
 ```bash
 # From project root
-cd docs
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Build all documentation
-make html
+scripts/run uv sync --frozen --inexact --group docs --extra kubernetes --no-dev --no-install-project
+scripts/run bash scripts/build_monarch_for_docs.sh
+scripts/run cargo doc --locked --workspace --no-deps
+scripts/run mdbook build docs/source/books/hyperactor-book
+scripts/run mdbook build docs/source/books/hyperactor-mesh-book
+scripts/run make -C docs html
 
 # View the results
-open build/html/index.html
+open docs/build/html/index.html
 ```
 
-The generated documentation will be available in `docs/build/html/`.
+`make -C docs html` runs the Sphinx Gallery pass and copies the Cargo docs from
+`$CARGO_TARGET_DIR/doc`, but it does not itself run `cargo doc` or the mdBook
+builds; run those first, as shown above. The generated documentation lands in
+`docs/build/html/`.
 
 ### CI/CD Builds
 
@@ -38,13 +43,13 @@ For faster iteration during development:
 
 ```bash
 # Clean previous builds
-make clean
+scripts/run make -C docs clean
 
 # Build with CI environment (if you have full Monarch built)
-CI=true make html
+scripts/run env CI=true make -C docs html
 
 # Standard build (uses mocked imports for unavailable Rust bindings)
-make html
+scripts/run make -C docs html
 ```
 
 ## Overview
@@ -98,7 +103,7 @@ Rust documentation is generated using `cargo doc` and integrated into the Sphinx
 **Build Process:**
 ```bash
 # Generate Rust documentation
-cargo doc --workspace --no-deps
+scripts/run cargo doc --locked --workspace --no-deps
 
 # Copy to docs directory
 mkdir -p docs/source/target docs/build/html/rust-api
@@ -180,7 +185,7 @@ Python examples are automatically processed by **Sphinx Gallery**:
    //! Description of what this crate does.
    ```
 
-3. **Rebuild Rust docs**: Run `cargo doc --workspace --no-deps` to regenerate documentation.
+3. **Rebuild Rust docs**: Run `scripts/run cargo doc --locked --workspace --no-deps` to regenerate documentation.
 
 ### Adding to Books
 
@@ -196,7 +201,7 @@ Python examples are automatically processed by **Sphinx Gallery**:
    - [New Chapter](new_chapter.md)
    ```
 
-4. **Build the book**: Run `mdbook build` in the book directory to generate HTML.
+4. **Build the book**: Run `scripts/run mdbook build docs/source/books/hyperactor-book` to generate HTML.
 
 ### Adding Examples
 
@@ -265,10 +270,10 @@ Key configuration sections:
 
 ### Common Issues
 
-1. **Import Errors**: Ensure Monarch is properly installed with `python -m pip install -e .`
-2. **Missing Rust Docs**: Run `cargo doc --workspace --no-deps` before building
+1. **Import Errors**: Ensure Monarch is properly installed with `scripts/run uv pip install -e .`
+2. **Missing Rust Docs**: Run `scripts/run cargo doc --locked --workspace --no-deps` before building
 3. **Theme Issues**: Check that all theme dependencies are installed
-4. **Build Failures**: Use `make clean` then `make html` for a fresh build
+4. **Build Failures**: Use `scripts/run make -C docs clean` then `scripts/run make -C docs html` for a fresh build
 
 ### Environment Differences
 
