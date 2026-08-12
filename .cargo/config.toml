@@ -1,4 +1,8 @@
 [build]
+# Guard every rustc invocation through the shared execution contract so cargo
+# refuses to compile outside a controlled domain. RUSTC_WRAPPER (sccache in CI)
+# overrides this, and that wrapper carries its own guard.
+rustc-wrapper = "scripts/rootfs/rustc-wrapper.sh"
 rustflags = [
     "--cfg",
     "tracing_unstable",
