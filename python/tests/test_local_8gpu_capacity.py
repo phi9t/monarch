@@ -17,6 +17,7 @@ HELPER_PATH = (
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ROOTFS_BUILDER = REPO_ROOT / "scripts" / "rootfs" / "build_rootfs.sh"
+CAPACITY_SCRIPT = REPO_ROOT / "scripts" / "run_local_8gpu_capacity.sh"
 spec = importlib.util.spec_from_file_location("local_8gpu_capacity", HELPER_PATH)
 assert spec is not None
 assert spec.loader is not None
@@ -198,3 +199,16 @@ def test_rootfs_builder_rejects_unmanaged_destination(dest: str) -> None:
 
     assert result.returncode == 2
     assert "--dest must be a managed rootfs path" in result.stderr
+
+
+def test_capacity_script_delegates_before_python_or_cuda_work() -> None:
+    text = CAPACITY_SCRIPT.read_text()
+    delegation = text.index('exec "$REPO_ROOT/scripts/run"')
+    for later in (
+        "HOST_PYTHON=",
+        "scripts/local_8gpu_capacity.py",
+        "CUDA_VISIBLE_DEVICES",
+    ):
+        assert delegation < text.index(later), (
+            f"scripts/run delegation must precede {later!r}"
+        )

@@ -17,7 +17,7 @@
 # tensor engine, and at least one local GPU are all required.
 #
 # Usage:
-#   scripts/run_local_control_plane.sh [options]
+#   scripts/run scripts/run_local_control_plane.sh [options]
 #
 # Options:
 #   --python-only   Run only the Python control-plane suite.
@@ -25,25 +25,33 @@
 #   --gpus N        Restrict the run to the first N local GPUs (sets
 #                   CUDA_VISIBLE_DEVICES). Honors a caller-set value otherwise.
 #   --keep-going    Run both suites even if the first one fails.
-#   --rootfs        Re-exec inside the hermetic bubblewrap rootfs (see
-#                   scripts/rootfs/) before running. Use on hosts whose default
-#                   cc/clang targets a mismatched loader/glibc (e.g. Nix). No-op
-#                   once already inside the rootfs.
 #   -h, --help      Show this help and exit.
+#
+# This script must run inside the hermetic bwrap rootfs. Invoke it through
+# scripts/run, which enters the sandbox and activates .venv-rootfs; when run
+# outside the rootfs it re-execs itself through scripts/run automatically.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Route through the canonical gateway before any Python, CUDA, build, or test
+# work when we are not already inside a valid rootfs. Hand the gateway the
+# in-rootfs mount path so the re-exec resolves inside the sandbox regardless of
+# the host checkout location.
+if ! "$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs >/dev/null 2>&1; then
+  exec "$REPO_ROOT/scripts/run" /workspace/monarch/scripts/run_local_control_plane.sh "$@"
+fi
+"$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs python uv cargo >/dev/null
+
 PYTHON_ONLY=0
 RUST_ONLY=0
 KEEP_GOING=0
 GPUS=""
-ROOTFS=0
 
 usage() {
-  sed -n '8,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '19,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -51,7 +59,6 @@ while [[ $# -gt 0 ]]; do
     --python-only) PYTHON_ONLY=1; shift ;;
     --rust-only) RUST_ONLY=1; shift ;;
     --keep-going) KEEP_GOING=1; shift ;;
-    --rootfs) ROOTFS=1; shift ;;
     --gpus)
       [[ $# -ge 2 ]] || { echo "error: --gpus requires an argument" >&2; exit 2; }
       GPUS="$2"; shift 2 ;;
@@ -64,19 +71,6 @@ done
 if [[ "$PYTHON_ONLY" -eq 1 && "$RUST_ONLY" -eq 1 ]]; then
   echo "error: --python-only and --rust-only are mutually exclusive" >&2
   exit 2
-fi
-
-# --rootfs: re-exec through the bubblewrap sandbox unless we are already inside
-# it. Inside, run_in_rootfs.sh builds the extension and calls back into this
-# script without --rootfs, so the MONARCH_IN_ROOTFS guard prevents a loop.
-if [[ "$ROOTFS" -eq 1 && "${MONARCH_IN_ROOTFS:-0}" != "1" ]]; then
-  reexec_args=()
-  [[ "$PYTHON_ONLY" -eq 1 ]] && reexec_args+=(--python-only)
-  [[ "$RUST_ONLY" -eq 1 ]] && reexec_args+=(--rust-only)
-  [[ "$KEEP_GOING" -eq 1 ]] && reexec_args+=(--keep-going)
-  [[ -n "$GPUS" ]] && reexec_args+=(--gpus "$GPUS")
-  exec "$REPO_ROOT/scripts/rootfs/enter_rootfs.sh" -- \
-    scripts/rootfs/run_in_rootfs.sh "${reexec_args[@]}"
 fi
 
 OUT="$REPO_ROOT/control-plane-results"
@@ -279,7 +273,7 @@ run_rust_suite() {
   prepare_rust_toolchain
   log "rust control-plane tests (local in-process meshes)"
   RUSTFLAGS="--cfg tracing_unstable --cfg hyperactor_verify_auto_traits ${RUSTFLAGS:-}" \
-    cargo nextest run --profile ci \
+    cargo nextest run --locked --profile ci \
       -p hyperactor -p hyperactor_mesh -p hyperactor_cast \
       -p hyperactor_config -p ndslice \
       -E "$NEXTEST_FILTER"
@@ -309,6 +303,7 @@ if [[ "$ran_python" -eq 1 ]]; then
 fi
 if [[ "$ran_rust" -eq 1 ]]; then
   if [[ "$rust_rc" -eq 0 ]]; then echo "rust   : PASS"; else echo "rust   : FAIL (exit $rust_rc)"; overall=1; fi
+  echo "rust junit: ${CARGO_TARGET_DIR:-$REPO_ROOT/target}/nextest/ci/junit.xml"
 fi
 echo "results: $OUT"
 exit "$overall"

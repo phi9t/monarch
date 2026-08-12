@@ -9,13 +9,14 @@
 # verify that this host can run a local Monarch mesh across exactly eight GPUs.
 #
 # Usage:
-#   scripts/run_local_8gpu_capacity.sh
+#   scripts/run scripts/run_local_8gpu_capacity.sh
 #
-# The script re-execs through scripts/rootfs/enter_rootfs.sh unless already
-# inside the sandbox. It creates/reuses .venv-rootfs, synchronizes the locked
-# test dependencies, installs Monarch editable using the rootfs-pinned build
-# tools, runs an 8-rank tensor-engine smoke, and then runs the local
-# control-plane suites with all eight GPUs exposed.
+# When run outside the rootfs the script re-execs through scripts/run, which
+# enters the hermetic bwrap sandbox and activates .venv-rootfs. Inside, it
+# creates/reuses .venv-rootfs, synchronizes the locked test dependencies,
+# installs Monarch editable using the rootfs-pinned build tools, runs an 8-rank
+# tensor-engine smoke, and then runs the local control-plane suites with all
+# eight GPUs exposed.
 
 set -euo pipefail
 
@@ -24,6 +25,17 @@ cd "$REPO_ROOT"
 
 log() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 die() { printf '\033[1;31merror: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Route through the canonical gateway before any Python, CUDA, build, or test
+# work when we are not already inside a valid rootfs. Hand the gateway the
+# in-rootfs mount path so the re-exec resolves inside the sandbox regardless of
+# the host checkout location.
+if ! "$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs >/dev/null 2>&1; then
+  log "environment: rootfs entry"
+  echo "entering hermetic bwrap rootfs via scripts/run"
+  exec "$REPO_ROOT/scripts/run" /workspace/monarch/scripts/run_local_8gpu_capacity.sh "$@"
+fi
+"$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs python uv cargo >/dev/null
 
 DEFAULTED_CUDA_VISIBLE_DEVICES=0
 HOST_PYTHON="$(command -v python3 || command -v python || true)"
@@ -40,12 +52,6 @@ if [[ "${cuda_visibility[1]}" == "defaulted" ]]; then
   echo "defaulted CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 else
   echo "honoring caller CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-fi
-
-if [[ "${MONARCH_IN_ROOTFS:-0}" != "1" ]]; then
-  log "environment: rootfs entry"
-  echo "entering hermetic bwrap rootfs"
-  exec "$REPO_ROOT/scripts/rootfs/enter_rootfs.sh" -- scripts/run_local_8gpu_capacity.sh
 fi
 
 log "environment: rootfs"
@@ -127,7 +133,7 @@ echo "unit-level smoke outcome: PASS"
 log "integration: control-plane suites over 8 GPUs"
 integration_started_ns="$(date +%s%N)"
 python_junit="$REPO_ROOT/control-plane-results/control-plane-python.xml"
-rust_junit="$REPO_ROOT/target/nextest/ci/junit.xml"
+rust_junit="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/nextest/ci/junit.xml"
 rm -f -- "$python_junit" "$rust_junit"
 control_args=(--keep-going)
 if [[ "$DEFAULTED_CUDA_VISIBLE_DEVICES" -eq 1 ]]; then

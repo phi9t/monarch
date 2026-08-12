@@ -10,12 +10,16 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-[[ "${MONARCH_IN_ROOTFS:-0}" == "1" ]] || {
-  echo "error: test environment must be synchronized inside the rootfs" >&2
+# Frozen uv operations must run inside the validated rootfs against the
+# canonical rootfs virtual environment. Fail loudly rather than mutating a host
+# or stray environment.
+"$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs python uv >/dev/null
+[[ "${VIRTUAL_ENV:-}" == "/workspace/monarch/.venv-rootfs" ]] || {
+  echo "error: activate the rootfs virtual environment (VIRTUAL_ENV=/workspace/monarch/.venv-rootfs) first" >&2
   exit 1
 }
-[[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]] || {
-  echo "error: activate the rootfs virtual environment first" >&2
+[[ -x "${VIRTUAL_ENV}/bin/python" ]] || {
+  echo "error: ${VIRTUAL_ENV}/bin/python is missing; create .venv-rootfs first" >&2
   exit 1
 }
 
