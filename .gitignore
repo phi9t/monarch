@@ -53,6 +53,9 @@ scripts/rootfs/rootfs/
 scripts/rootfs/rootfs/**
 scripts/rootfs/.rootfs.stage.*
 scripts/rootfs/*.tar
+scripts/rootfs/cache/
+scripts/rootfs/cache/**
+scripts/rootfs/tests/__pycache__/
 .venv-rootfs/
 .venv-rootfs/**
 control-plane-results/

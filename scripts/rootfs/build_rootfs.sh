@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Build a flattened rootfs directory for hermetic control-plane runs.
+# Build a flattened, provenance-stamped rootfs directory for hermetic local runs.
 #
 # Some hosts (notably Nix-provisioned ones) ship a default cc/clang that targets
 # a different dynamic loader and glibc than the system loader rustc runs under.
@@ -15,17 +15,21 @@
 # image and exports it to a plain directory that enter_rootfs.sh runs under
 # bwrap. Inside it, `uv pip install -e .` builds with no toolchain hacks.
 #
-# The image adds the same system build deps as the repo Dockerfile, uv, the
-# pinned Rust toolchain (from rust-toolchain), and a synthetic CUDA_HOME
-# assembled from pip nvidia-cu13 wheels so setup.py / torch cpp_extension accept
-# a real nvcc even though the baseline is a runtime (not devel) image.
+# The image adds the same system build deps as the repo Dockerfile, uv, Node 20
+# and npm, the pinned Rust toolchain (from rust-toolchain), pinned mdBook, and a
+# synthetic CUDA_HOME assembled from pip nvidia-cu13 wheels so setup.py / torch
+# cpp_extension accept a real nvcc even though the baseline is a runtime image.
+#
+# All image digests and tool pins come from contract.env. The recipe digest
+# (contract.env + this builder + rust-toolchain) labels the image and is written
+# into /etc/monarch-rootfs-contract so entry can detect a stale rootfs.
 #
 # Usage:
 #   scripts/rootfs/build_rootfs.sh [options]
 #
 # Options:
 #   --rebuild       Force a docker rebuild even if the image tag exists.
-#   --tag TAG       Docker image tag to build/use (default: monarch-rootfs:local).
+#   --tag TAG       Docker image tag to build/use (default: derived from recipe).
 #   --dest DIR      Managed directory under scripts/rootfs/ named rootfs or
 #                   rootfs-* (default: scripts/rootfs/rootfs).
 #   -h, --help      Show this help and exit.
@@ -35,20 +39,16 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROOTFS_DIR="$REPO_ROOT/scripts/rootfs"
 
-TAG="monarch-rootfs:local"
+# shellcheck source=scripts/rootfs/contract.env
+source "$ROOTFS_DIR/contract.env"
+# shellcheck source=scripts/rootfs/execution_contract.sh
+source "$ROOTFS_DIR/execution_contract.sh"
+
+TAG=""
 DEST="$ROOTFS_DIR/rootfs"
 REBUILD=0
-BASE_IMAGE="ghcr.io/pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime@sha256:7492928e093d67276716440161f694a0e4ea27796d599d64b23cb76cdd665e71"
-UV_IMAGE="ghcr.io/astral-sh/uv:0.12.2@sha256:069a51314a7bb6031777a9273205fe1b0b19e914ef418207d1338b268df641dd"
-NEXTEST_VERSION="0.9.143"
-CUDA_NVCC_VERSION="13.3.73"
-CUDA_CCCL_VERSION="13.3.3.4.1"
-SETUPTOOLS_VERSION="81.0.0"
-SETUPTOOLS_RUST_VERSION="1.12.0"
-WHEEL_VERSION="0.47.0"
-SEMANTIC_VERSION="2.10.0"
 
-usage() { sed -n '9,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '9,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,6 +66,15 @@ log() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 die() { printf '\033[1;31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 usage_error() { printf 'error: %s\n' "$*" >&2; exit 2; }
 
+# Architecture gate: the first rootfs implementation is x86_64 only.
+host_arch="$(uname -m)"
+[[ "$host_arch" == "$MONARCH_ROOTFS_ARCH" ]] || \
+  die "unsupported architecture $host_arch: this rootfs supports $MONARCH_ROOTFS_ARCH only"
+
+ROOTFS_RECIPE_SHA256="$(monarch_rootfs_recipe_sha256 "$REPO_ROOT")"
+[[ -n "$ROOTFS_RECIPE_SHA256" ]] || die "could not compute rootfs recipe digest"
+[[ -n "$TAG" ]] || TAG="monarch-rootfs:${ROOTFS_RECIPE_SHA256:0:16}"
+
 ROOTFS_DIR="$(realpath -e "$ROOTFS_DIR")"
 dest_parent="$(realpath -m "$(dirname -- "$DEST")")"
 dest_name="$(basename -- "$DEST")"
@@ -81,40 +90,66 @@ command -v docker >/dev/null || die "docker not found on host"
 RUST_CHANNEL="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain")"
 [[ -n "$RUST_CHANNEL" ]] || die "could not parse channel from rust-toolchain"
 log "pinned rust channel: $RUST_CHANNEL"
+log "rootfs recipe: $ROOTFS_RECIPE_SHA256"
 
-image_exists() { docker image inspect "$TAG" >/dev/null 2>&1; }
+# Reuse an existing image only when its recipe label matches the current recipe.
+image_recipe() {
+  docker image inspect --format '{{ index .Config.Labels "org.pytorch.monarch.rootfs-recipe" }}' \
+    "$TAG" 2>/dev/null
+}
 
-if image_exists && [[ "$REBUILD" -eq 0 ]]; then
-  log "image $TAG already exists (use --rebuild to force)"
+if [[ "$REBUILD" -eq 0 && "$(image_recipe)" == "$ROOTFS_RECIPE_SHA256" ]]; then
+  log "image $TAG already matches recipe (use --rebuild to force)"
 else
-  log "building $TAG from $BASE_IMAGE"
+  log "building $TAG from $MONARCH_BASE_IMAGE"
   # Inline Dockerfile via stdin. Keep the build layer minimal: only build deps,
-  # uv, the pinned Rust toolchain, and a synthetic CUDA_HOME from pip wheels.
+  # uv, Node/npm, the pinned Rust toolchain, mdBook, and a synthetic CUDA_HOME.
   docker build -t "$TAG" \
     --build-arg RUST_CHANNEL="$RUST_CHANNEL" \
-    --build-arg BASE_IMAGE="$BASE_IMAGE" \
-    --build-arg UV_IMAGE="$UV_IMAGE" \
-    --build-arg NEXTEST_VERSION="$NEXTEST_VERSION" \
-    --build-arg CUDA_NVCC_VERSION="$CUDA_NVCC_VERSION" \
-    --build-arg CUDA_CCCL_VERSION="$CUDA_CCCL_VERSION" \
-    --build-arg SETUPTOOLS_VERSION="$SETUPTOOLS_VERSION" \
-    --build-arg SETUPTOOLS_RUST_VERSION="$SETUPTOOLS_RUST_VERSION" \
-    --build-arg WHEEL_VERSION="$WHEEL_VERSION" \
-    --build-arg SEMANTIC_VERSION="$SEMANTIC_VERSION" \
+    --build-arg BASE_IMAGE="$MONARCH_BASE_IMAGE" \
+    --build-arg UV_IMAGE="$MONARCH_UV_IMAGE" \
+    --build-arg NODE_IMAGE="$MONARCH_NODE_IMAGE" \
+    --build-arg NEXTEST_VERSION="$MONARCH_NEXTEST_VERSION" \
+    --build-arg MDBOOK_VERSION="$MONARCH_MDBOOK_VERSION" \
+    --build-arg NODE_VERSION="$MONARCH_NODE_VERSION" \
+    --build-arg NPM_VERSION="$MONARCH_NPM_VERSION" \
+    --build-arg CUDA_NVCC_VERSION="$MONARCH_CUDA_NVCC_VERSION" \
+    --build-arg CUDA_CCCL_VERSION="$MONARCH_CUDA_CCCL_VERSION" \
+    --build-arg SETUPTOOLS_VERSION="$MONARCH_SETUPTOOLS_VERSION" \
+    --build-arg SETUPTOOLS_RUST_VERSION="$MONARCH_SETUPTOOLS_RUST_VERSION" \
+    --build-arg WHEEL_VERSION="$MONARCH_WHEEL_VERSION" \
+    --build-arg SEMANTIC_VERSION="$MONARCH_SEMANTIC_VERSION" \
+    --build-arg ROOTFS_SCHEMA="$MONARCH_ROOTFS_SCHEMA" \
+    --build-arg ROOTFS_ARCH="$MONARCH_ROOTFS_ARCH" \
+    --build-arg PYTHON_VERSION="$MONARCH_PYTHON_VERSION" \
+    --build-arg UV_VERSION="$MONARCH_UV_VERSION" \
+    --build-arg ROOTFS_RECIPE_SHA256="$ROOTFS_RECIPE_SHA256" \
+    --label "org.pytorch.monarch.rootfs-recipe=$ROOTFS_RECIPE_SHA256" \
     -f - "$ROOTFS_DIR" <<'DOCKERFILE'
 ARG BASE_IMAGE
 ARG UV_IMAGE
+ARG NODE_IMAGE
 FROM ${UV_IMAGE} AS uv
+FROM ${NODE_IMAGE} AS node
 
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ARG RUST_CHANNEL
 ARG NEXTEST_VERSION
+ARG MDBOOK_VERSION
+ARG NODE_VERSION
+ARG NPM_VERSION
 ARG CUDA_NVCC_VERSION
 ARG CUDA_CCCL_VERSION
 ARG SETUPTOOLS_VERSION
 ARG SETUPTOOLS_RUST_VERSION
 ARG WHEEL_VERSION
 ARG SEMANTIC_VERSION
+ARG ROOTFS_SCHEMA
+ARG ROOTFS_ARCH
+ARG PYTHON_VERSION
+ARG UV_VERSION
+ARG ROOTFS_RECIPE_SHA256
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -129,6 +164,13 @@ RUN apt-get update -y && \
 
 # uv: copy pinned standalone binaries from the official image.
 COPY --from=uv /uv /uvx /usr/local/bin/
+
+# Node 20 and npm: copy the runtime and the bundled npm from the official image,
+# then recreate the npm/npx launchers the slim image ships as symlinks.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 # Pinned Rust toolchain via rustup, reading the repo's rust-toolchain channel.
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
@@ -145,11 +187,16 @@ RUN curl -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/linux" | \
         tar -C /opt/cargo/bin -xzf - && \
     cargo nextest --version
 
+# mdBook: the hyperactor books build with mdbook. Install the pinned version.
+RUN cargo install --locked --version "${MDBOOK_VERSION}" mdbook && \
+    mdbook --version
+
 # CUDA nvcc and Python build tools: the runtime baseline ships CUDA headers +
 # libs under nvidia/cu13/{include,lib} but no compiler. The canonical
 # nvidia-cuda-nvcc wheel adds nvidia/cu13/bin/nvcc (+ crt/nvvm) into the same
-# tree, so CUDA_HOME can point straight at nvidia/cu13. setup.py get_cuda_home() and torch
-# cpp_extension expect bin/nvcc, include/, and lib64/, so symlink lib64 -> lib.
+# tree, so CUDA_HOME can point straight at nvidia/cu13. setup.py get_cuda_home()
+# and torch cpp_extension expect bin/nvcc, include/, and lib64/, so symlink
+# lib64 -> lib.
 RUN pip install --break-system-packages --no-cache-dir \
         "nvidia-cuda-nvcc==${CUDA_NVCC_VERSION}" \
         "nvidia-cuda-cccl==${CUDA_CCCL_VERSION}" \
@@ -167,6 +214,39 @@ RUN set -euo pipefail; \
     /opt/cuda-synth/bin/nvcc --version
 ENV CUDA_HOME=/opt/cuda-synth CUDA_PATH=/opt/cuda-synth
 ENV PATH=/opt/cuda-synth/bin:$PATH
+
+# Verify every reviewed tool pin during the build so a drifted base image fails
+# closed rather than producing an unstamped rootfs.
+RUN set -euo pipefail; \
+    test "$(python --version 2>&1 | awk '{print $2}')" = "${PYTHON_VERSION}"; \
+    test "$(uv --version | awk '{print $2}')" = "${UV_VERSION}"; \
+    test "$(node --version)" = "v${NODE_VERSION}"; \
+    test "$(npm --version)" = "${NPM_VERSION}"; \
+    test "$(mdbook --version)" = "mdbook v${MDBOOK_VERSION}"; \
+    cargo nextest --version | grep -q "${NEXTEST_VERSION}"; \
+    /opt/cuda-synth/bin/nvcc --version | grep -q "${CUDA_NVCC_VERSION}"
+
+# Provenance: stamp the reviewed contract into the image so entry can detect a
+# stale rootfs. The recipe digest is the authoritative identity.
+RUN printf '%s\n' \
+        "MONARCH_ROOTFS_SCHEMA=${ROOTFS_SCHEMA}" \
+        "MONARCH_ROOTFS_RECIPE_SHA256=${ROOTFS_RECIPE_SHA256}" \
+        "MONARCH_ROOTFS_ARCH=${ROOTFS_ARCH}" \
+        "MONARCH_PYTHON_VERSION=${PYTHON_VERSION}" \
+        "MONARCH_UV_VERSION=${UV_VERSION}" \
+        "MONARCH_NODE_VERSION=${NODE_VERSION}" \
+        "MONARCH_NPM_VERSION=${NPM_VERSION}" \
+        "MONARCH_MDBOOK_VERSION=${MDBOOK_VERSION}" \
+        "MONARCH_NEXTEST_VERSION=${NEXTEST_VERSION}" \
+        "MONARCH_CUDA_NVCC_VERSION=${CUDA_NVCC_VERSION}" \
+        > /etc/monarch-rootfs-contract
+
+# Pre-create the read-only mount points bwrap binds over: the checkout mount,
+# and the writable tmpfs where host NVIDIA driver libraries are injected. A
+# read-only root cannot have mkdir applied at entry.
+RUN mkdir -p /workspace/monarch /run/nvidia-host
+
+LABEL org.pytorch.monarch.rootfs-recipe=${ROOTFS_RECIPE_SHA256}
 DOCKERFILE
 fi
 
@@ -190,6 +270,7 @@ cleanup() {
 trap cleanup EXIT
 docker export "$cid" | tar -C "$STAGE" -xf -
 [[ -x "$STAGE/bin/bash" ]] || die "export produced an unusable rootfs (no bin/bash)"
+[[ -r "$STAGE/etc/monarch-rootfs-contract" ]] || die "export is missing the stamped contract"
 [[ "$(dirname -- "$DEST")" == "$ROOTFS_DIR" && ! -L "$DEST" ]] || \
   die "refusing to replace invalid rootfs destination: $DEST"
 if [[ -e "$DEST" ]]; then

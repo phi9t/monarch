@@ -106,10 +106,12 @@ def test_checkout_matches_exact_mount() -> None:
 
 
 def test_require_rootfs_uses_the_common_status_two_diagnostic() -> None:
-    """A bare marker never proves rootfs entry; the diagnostic points at
-    ``scripts/run``."""
+    """A marker without a controlled toolchain never proves rootfs entry; the
+    diagnostic points at ``scripts/run``. Requesting ``cargo`` with a PATH that
+    cannot resolve it fails the tool-path check even when this test runs inside
+    a real rootfs, so the negative case is deterministic everywhere."""
     result = subprocess.run(
-        [CONTRACT, "require-rootfs"],
+        [CONTRACT, "require-rootfs", "cargo"],
         check=False,
         capture_output=True,
         text=True,
@@ -153,6 +155,36 @@ def test_require_controlled_rejects_bare_host() -> None:
 def test_darwin_predicate() -> None:
     assert bash("monarch_is_darwin", env={"PATH": "/usr/bin:/bin", "OSTYPE": "darwin23"}).returncode == 0
     assert bash("monarch_is_darwin", env={"PATH": "/usr/bin:/bin", "OSTYPE": "linux-gnu"}).returncode != 0
+
+
+def test_builder_uses_every_reviewed_tool_pin() -> None:
+    builder = (REPO_ROOT / "scripts/rootfs/build_rootfs.sh").read_text()
+    for name in (
+        "MONARCH_BASE_IMAGE",
+        "MONARCH_UV_IMAGE",
+        "MONARCH_NODE_IMAGE",
+        "MONARCH_NEXTEST_VERSION",
+        "MONARCH_MDBOOK_VERSION",
+    ):
+        assert name in builder, name
+    # The builder must source the reviewed contract rather than re-declare pins.
+    assert "contract.env" in builder
+    # Provenance: recipe label and the stamped contract file.
+    assert "org.pytorch.monarch.rootfs-recipe" in builder
+    assert "/etc/monarch-rootfs-contract" in builder
+
+
+def test_entry_uses_read_only_root_and_clear_environment() -> None:
+    entry = (REPO_ROOT / "scripts/rootfs/enter_rootfs.sh").read_text()
+    assert '--ro-bind "$ROOTFS" /' in entry
+    assert "--clearenv" in entry
+    assert "--chdir" in entry
+    assert "--setenv CARGO_TARGET_DIR" in entry
+    assert "--setenv UV_CACHE_DIR" in entry
+    assert "--setenv npm_config_cache" in entry
+    # Host compiler and Python variables never cross the boundary.
+    assert "--setenv CC" not in entry
+    assert "--setenv PYTHONPATH" not in entry
 
 
 def test_contract_env_holds_the_reviewed_pins() -> None:
