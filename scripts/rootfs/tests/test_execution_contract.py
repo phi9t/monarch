@@ -57,16 +57,25 @@ def test_github_linux_requires_the_complete_identity() -> None:
     )
 
 
-def test_uid_map_must_be_a_single_id(tmp_path: Path) -> None:
+def test_uid_map_accepts_controlled_namespaces(tmp_path: Path) -> None:
+    """The uid map proves a controlled namespace when it is the rootfs single-id
+    identity map, or empty because a nested unprivileged user namespace wrote no
+    mapping. The broad host map (length 2^32) and multi-line maps are rejected.
+
+    A nested user namespace is exactly how the crash-recovery worker isolates a
+    test run inside the rootfs, so an empty map must remain controlled."""
     single = tmp_path / "single"
     single.write_text("      1018          0          1\n")
+    nested_userns = tmp_path / "nested"
+    nested_userns.write_text("")
     broad = tmp_path / "broad"
     broad.write_text("         0          0 4294967295\n")
     multi = tmp_path / "multi"
     multi.write_text("      1018          0          1\n      2000          2          5\n")
-    assert bash('monarch_uid_map_is_single_id "$1"', str(single)).returncode == 0
-    assert bash('monarch_uid_map_is_single_id "$1"', str(broad)).returncode != 0
-    assert bash('monarch_uid_map_is_single_id "$1"', str(multi)).returncode != 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(single)).returncode == 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(nested_userns)).returncode == 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(broad)).returncode != 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(multi)).returncode != 0
 
 
 def test_recipe_digest_is_location_independent(tmp_path: Path) -> None:

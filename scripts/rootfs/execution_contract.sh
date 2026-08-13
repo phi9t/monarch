@@ -59,9 +59,16 @@ monarch_checkout_matches() {
 }
 
 # A hermetic rootfs runs in an unprivileged user namespace whose uid map is a
-# single identity mapping of length one. A broad host map (length 2^32) is not.
-monarch_uid_map_is_single_id() {
-  awk 'NF != 3 { exit 1 } NR > 1 { exit 1 } { count = $3 } END { exit !(NR == 1 && count == 1) }' "$1"
+# single identity mapping of length one. A nested unprivileged user namespace
+# created for test isolation inside the rootfs (e.g. the crash-recovery worker)
+# writes no mapping, so its uid map is empty; that is still controlled. A broad
+# host map (length 2^32) or any multi-line map is not.
+monarch_uid_map_is_controlled() {
+  awk '
+    { lines++; count = $3 }
+    NF != 3 { exit 1 }
+    END { if (lines == 0) exit 0; exit !(lines == 1 && count == 1) }
+  ' "$1"
 }
 
 # GitHub Linux exemption: the complete identity, never CI=true alone.
@@ -113,7 +120,7 @@ monarch_in_valid_rootfs() {
   expected="$(monarch_rootfs_recipe_sha256 "$repo_root")" || return 1
   grep -qx "MONARCH_ROOTFS_RECIPE_SHA256=$expected" "$MONARCH_ROOTFS_CONTRACT_PATH" || return 1
   [[ -r /proc/self/uid_map ]] || return 1
-  monarch_uid_map_is_single_id /proc/self/uid_map || return 1
+  monarch_uid_map_is_controlled /proc/self/uid_map || return 1
   local tool
   for tool in "$@"; do
     monarch_controlled_tool_path_ok "$tool" || return 1

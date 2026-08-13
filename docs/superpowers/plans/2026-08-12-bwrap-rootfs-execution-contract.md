@@ -79,7 +79,7 @@ Tasks are sequential because every guard consumes the identity and diagnostics d
 - Produces: `monarch_rootfs_recipe_sha256 REPO_ROOT -> stdout digest`
 - Produces: `monarch_contract_files_match EXPECTED ACTUAL -> status`
 - Produces: `monarch_checkout_matches EXPECTED ACTUAL -> status`
-- Produces: `monarch_uid_map_is_single_id FILE -> status`
+- Produces: `monarch_uid_map_is_controlled FILE -> status`
 - Produces: `monarch_rootfs_contract_current ROOTFS REPO_ROOT -> status`
 - Produces: `monarch_in_valid_rootfs REPO_ROOT TOOLS -> status`
 - Produces: `monarch_require_rootfs REPO_ROOT TOOLS -> status 0 or diagnostic/status 2`
@@ -126,13 +126,16 @@ def test_github_linux_requires_the_complete_identity() -> None:
     assert bash("monarch_is_github_linux_ci", env={**complete, "GITHUB_RUN_ID": "0"}).returncode != 0
 
 
-def test_uid_map_must_be_a_single_id(tmp_path: Path) -> None:
+def test_uid_map_accepts_controlled_namespaces(tmp_path: Path) -> None:
     single = tmp_path / "single"
     single.write_text("1018 0 1\n")
+    nested_userns = tmp_path / "nested"
+    nested_userns.write_text("")
     broad = tmp_path / "broad"
     broad.write_text("0 0 4294967295\n")
-    assert bash('monarch_uid_map_is_single_id "$1"', str(single)).returncode == 0
-    assert bash('monarch_uid_map_is_single_id "$1"', str(broad)).returncode != 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(single)).returncode == 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(nested_userns)).returncode == 0
+    assert bash('monarch_uid_map_is_controlled "$1"', str(broad)).returncode != 0
 
 
 def test_require_rootfs_uses_the_common_status_two_diagnostic() -> None:
@@ -195,8 +198,12 @@ monarch_rootfs_recipe_sha256() {
   ) | sha256sum | awk '{print $1}'
 }
 
-monarch_uid_map_is_single_id() {
-  awk 'NF != 3 { exit 1 } NR > 1 { exit 1 } { count = $3 } END { exit !(NR == 1 && count == 1) }' "$1"
+monarch_uid_map_is_controlled() {
+  awk '
+    { lines++; count = $3 }
+    NF != 3 { exit 1 }
+    END { if (lines == 0) exit 0; exit !(lines == 1 && count == 1) }
+  ' "$1"
 }
 
 monarch_is_github_linux_ci() {
@@ -546,7 +553,7 @@ fi
 "$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs python uv cargo
 ```
 
-Use the corresponding 8-GPU script path in its file. Run environment synchronization inside the validated control-plane script, retain existing GPU and failure-classification behavior, add `--locked` to nextest, and resolve nextest JUnit as `${CARGO_TARGET_DIR}/nextest/ci/junit.xml`.
+Use the corresponding 8-GPU script path in its file. Run environment synchronization inside the validated control-plane script, retain existing GPU and failure-classification behavior, add `--locked` to nextest, and report nextest JUnit at `$REPO_ROOT/target/nextest/ci/junit.xml` (cargo-nextest resolves its store from the workspace-root default target directory and ignores `CARGO_TARGET_DIR`).
 
 - [ ] **Step 6: Run focused and real gateway checks**
 
@@ -1258,7 +1265,7 @@ scripts/run scripts/run_local_control_plane.sh --keep-going
 scripts/run scripts/run_local_8gpu_capacity.sh
 ```
 
-Expected: the control-plane runner emits `control-plane-results/control-plane-python.xml` and `${CARGO_TARGET_DIR}/nextest/ci/junit.xml`. On the eight-GPU host, the capacity verifier observes ranks `[0, 1, 2, 3, 4, 5, 6, 7]` and accepts Python full-suite failures only when every failed node passes its identical-environment isolation rerun.
+Expected: the control-plane runner emits `control-plane-results/control-plane-python.xml` and `$REPO_ROOT/target/nextest/ci/junit.xml` (cargo-nextest resolves its store from the workspace-root default target directory and ignores `CARGO_TARGET_DIR`). On the eight-GPU host, the capacity verifier observes ranks `[0, 1, 2, 3, 4, 5, 6, 7]` and accepts Python full-suite failures only when every failed node passes its identical-environment isolation rerun.
 
 - [ ] **Step 5: Confirm rootfs and host-boundary behavior**
 

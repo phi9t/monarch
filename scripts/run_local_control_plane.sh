@@ -303,7 +303,9 @@ if [[ "$ran_python" -eq 1 ]]; then
 fi
 if [[ "$ran_rust" -eq 1 ]]; then
   if [[ "$rust_rc" -eq 0 ]]; then echo "rust   : PASS"; else echo "rust   : FAIL (exit $rust_rc)"; overall=1; fi
-  echo "rust junit: ${CARGO_TARGET_DIR:-$REPO_ROOT/target}/nextest/ci/junit.xml"
+  # cargo-nextest resolves its store from the workspace-root default target
+  # directory and ignores CARGO_TARGET_DIR, so its JUnit is always here.
+  echo "rust junit: $REPO_ROOT/target/nextest/ci/junit.xml"
 fi
 echo "results: $OUT"
 exit "$overall"

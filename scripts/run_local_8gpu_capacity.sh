@@ -133,7 +133,9 @@ echo "unit-level smoke outcome: PASS"
 log "integration: control-plane suites over 8 GPUs"
 integration_started_ns="$(date +%s%N)"
 python_junit="$REPO_ROOT/control-plane-results/control-plane-python.xml"
-rust_junit="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/nextest/ci/junit.xml"
+# cargo-nextest resolves its store from the workspace-root default target
+# directory and ignores CARGO_TARGET_DIR, so its JUnit is always here.
+rust_junit="$REPO_ROOT/target/nextest/ci/junit.xml"
 rm -f -- "$python_junit" "$rust_junit"
 control_args=(--keep-going)
 if [[ "$DEFAULTED_CUDA_VISIBLE_DEVICES" -eq 1 ]]; then
