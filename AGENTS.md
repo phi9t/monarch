@@ -44,6 +44,11 @@ same Monarch-specific workflows. The `run-monarch-single-machine` skill is the
 canonical guide for running Monarch on one host through the hermetic bwrap
 rootfs and for building or maintaining that rootfs.
 
+For broad, multi-area codebase exploration or distributed-training design work,
+use the `.agents/skills/subagent-exploration` skill to split read-heavy
+investigation and disjoint implementation slices across focused subagents while
+keeping synthesis in the main thread.
+
 ## Build & Commands
 
 Monarch uses `uv` for Python and `setuptools-rust` to build the Rust extension.
