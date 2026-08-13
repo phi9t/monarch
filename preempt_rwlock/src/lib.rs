@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(future_join)]
+#![cfg_attr(test, feature(future_join))]
 
 use std::sync::Arc;
 
