@@ -38,4 +38,3 @@ edits; stop it with Ctrl+C.
 
 - The source is located in src/, with structure defined in SUMMARY.md.
 - The book auto-reloads in the browser on edits.
-

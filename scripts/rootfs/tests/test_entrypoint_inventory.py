@@ -146,4 +146,3 @@ def test_development_docs_route_local_commands_through_scripts_run() -> None:
     assert not offenders, "direct local commands must use scripts/run:\n" + "\n".join(
         offenders
     )
-
