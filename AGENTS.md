@@ -4,6 +4,14 @@ Guidance for agents and developers working in the Monarch repository. For deeper
 build/architecture detail see `MONARCH_INFO.md`; for using the Python API see
 `docs/DOCS_INDEX.md`.
 
+## Constitution
+
+Read and follow `CONSTITUTION.md` at the repository root before acting. It sets
+the default operating principles for coding agents; direct user instructions and
+the more specific guidance in this file override it. The copy is pinned to a
+reviewed release tag (`v2026.08.11`) — update it through normal pull-request
+review, not by fetching a newer version at startup.
+
 ## Project Overview
 
 Monarch (`torchmonarch`) is a distributed programming framework for PyTorch
