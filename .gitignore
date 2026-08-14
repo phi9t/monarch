@@ -48,6 +48,9 @@ disabled_tests.txt
 # whittle
 .whittle.json
 
+# Local teaching workspace (agent-authored lessons/reference/notes)
+.agents/teach/
+
 # Hermetic control-plane rootfs (scripts/rootfs/)
 scripts/rootfs/rootfs/
 scripts/rootfs/rootfs/**
