@@ -34,6 +34,9 @@ SGLANG_CACHE_SANDBOX_PATH = "/cache/glm52/sglang"
 SGLANG_PREPARE_PACKAGES = ["sglang[all]"]
 SGLANG_PREPARE_RUN_ID = "prepare-venv"
 MODEL_CACHE_PREPARE_RUN_ID = "prepare-model"
+SGLANG_OFFLOADER_PATCH_ID = "glm52-offloader-v1-plain-tensor-attrs-v1"
+SGLANG_OFFLOADER_PATH = f"{SGLANG_VENV_SANDBOX_PATH}/lib/python3.12/site-packages/sglang/srt/utils/offloader.py"
+SGLANG_OFFLOADER_PATCH_SCRIPT = "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py"
 SGLANG_VENV_PROBE_SCRIPT = (
     "import importlib.metadata as metadata, json, sys; "
     "packages = {}; "
@@ -54,6 +57,14 @@ MODEL_CACHE_PREPARE_SCRIPT = (
 
 class RuntimeConfigError(RuntimeError):
     """Raised when a runtime configuration file violates the schema."""
+
+
+class GpuOccupancyError(RuntimeConfigError):
+    """Raised when visible GPUs are occupied by non-owned processes."""
+
+    def __init__(self, message: str, *, blocked_gpus: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.blocked_gpus = blocked_gpus
 
 
 class RuntimeLaunchError(RuntimeError):
@@ -211,6 +222,7 @@ class ObservabilitySpec:
     debug_mode: bool
     leave_running_on_failure: bool
     log_level: str
+    crash_dump_folder: str
     telemetry: TelemetrySpec
 
 
@@ -225,8 +237,11 @@ class LocalPathsSpec:
 @dataclass(frozen=True)
 class ProbeSpec:
     startup_timeout_seconds: int
+    chat_timeout_seconds: int
     models_required: bool
     chat_required: bool
+    prompt: str
+    max_new_tokens: int
     chat_template_kwargs: dict[str, Any]
 
 
@@ -515,7 +530,11 @@ def _parse_sglang_rootfs_overlay(data: Any) -> SglangRootfsOverlaySpec:
 
 def _parse_observability(data: Any) -> ObservabilitySpec:
     mapping = _require_mapping(data, "observability")
-    _reject_unknown(mapping, {"debug_mode", "leave_running_on_failure", "log_level", "telemetry"}, "observability")
+    _reject_unknown(
+        mapping,
+        {"debug_mode", "leave_running_on_failure", "log_level", "crash_dump_folder", "telemetry"},
+        "observability",
+    )
 
     telemetry = _require_mapping(mapping.get("telemetry"), "observability.telemetry")
     _reject_unknown(telemetry, {"local_artifacts", "remote_export"}, "observability.telemetry")
@@ -523,11 +542,15 @@ def _parse_observability(data: Any) -> ObservabilitySpec:
     leave_running_on_failure = _required_bool(mapping, "leave_running_on_failure", "observability")
     if leave_running_on_failure and not debug_mode:
         raise RuntimeConfigError("leave_running_on_failure requires debug_mode")
+    crash_dump_folder = _required_str(mapping, "crash_dump_folder", "observability")
+    if not crash_dump_folder.startswith("/run/glm52/"):
+        raise RuntimeConfigError("observability.crash_dump_folder must be under /run/glm52/")
 
     return ObservabilitySpec(
         debug_mode=debug_mode,
         leave_running_on_failure=leave_running_on_failure,
         log_level=_required_str(mapping, "log_level", "observability"),
+        crash_dump_folder=crash_dump_folder,
         telemetry=TelemetrySpec(
             local_artifacts=_required_bool(telemetry, "local_artifacts", "observability.telemetry"),
             remote_export=_required_bool(telemetry, "remote_export", "observability.telemetry"),
@@ -549,16 +572,43 @@ def _parse_local_paths(data: Any) -> LocalPathsSpec:
 
 def _parse_probes(data: Any) -> ProbeSpec:
     mapping = _require_mapping(data, "probes")
-    _reject_unknown(mapping, {"startup_timeout_seconds", "models_required", "chat_required", "chat_template_kwargs"}, "probes")
+    _reject_unknown(
+        mapping,
+        {
+            "startup_timeout_seconds",
+            "chat_timeout_seconds",
+            "models_required",
+            "chat_required",
+            "prompt",
+            "max_new_tokens",
+            "chat_template_kwargs",
+        },
+        "probes",
+    )
 
+    prompt = _required_str(mapping, "prompt", "probes")
+    if not prompt.strip():
+        raise RuntimeConfigError("probes.prompt must be non-empty")
+    max_new_tokens = _required_int(mapping, "max_new_tokens", "probes")
+    if max_new_tokens <= 0:
+        raise RuntimeConfigError("probes.max_new_tokens must be positive")
     chat_template_kwargs = _require_mapping(mapping.get("chat_template_kwargs"), "probes.chat_template_kwargs")
     if chat_template_kwargs.get("enable_thinking") is not False:
         raise RuntimeConfigError("probes.chat_template_kwargs.enable_thinking must be false")
+    startup_timeout_seconds = _required_int(mapping, "startup_timeout_seconds", "probes")
+    chat_timeout_seconds = _required_int(mapping, "chat_timeout_seconds", "probes")
+    if startup_timeout_seconds <= 0:
+        raise RuntimeConfigError("probes.startup_timeout_seconds must be positive")
+    if chat_timeout_seconds <= 0:
+        raise RuntimeConfigError("probes.chat_timeout_seconds must be positive")
 
     return ProbeSpec(
-        startup_timeout_seconds=_required_int(mapping, "startup_timeout_seconds", "probes"),
+        startup_timeout_seconds=startup_timeout_seconds,
+        chat_timeout_seconds=chat_timeout_seconds,
         models_required=_required_bool(mapping, "models_required", "probes"),
         chat_required=_required_bool(mapping, "chat_required", "probes"),
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
         chat_template_kwargs=dict(chat_template_kwargs),
     )
 
@@ -750,6 +800,8 @@ def materialize_runtime_config(
         str(declared.runtime.max_running_requests),
         "--cpu-offload-gb",
         str(declared.runtime.cpu_offload_gb),
+        "--crash-dump-folder",
+        declared.observability.crash_dump_folder,
         *declared.runtime.extra_args,
     ]
     outer_argv = [
@@ -809,6 +861,7 @@ def materialize_runtime_config(
             "debug_mode": declared.observability.debug_mode,
             "leave_running_on_failure": declared.observability.leave_running_on_failure,
             "log_level": declared.observability.log_level,
+            "crash_dump_folder": declared.observability.crash_dump_folder,
             "telemetry": {
                 "local_artifacts": declared.observability.telemetry.local_artifacts,
                 "remote_export": declared.observability.telemetry.remote_export,
@@ -863,11 +916,28 @@ def materialize_runtime_config(
         },
         probes={
             "models_url": f"{base_url}/models",
+            "generate_url": f"http://{declared.port_policy.bind_host}:{selected_port}/generate",
+            "completions_url": f"{base_url}/completions",
             "chat_url": f"{base_url}/chat/completions",
+            "startup_timeout_seconds": declared.probes.startup_timeout_seconds,
+            "chat_timeout_seconds": declared.probes.chat_timeout_seconds,
+            "generate_payload": {
+                "text": declared.probes.prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": declared.probes.max_new_tokens,
+                },
+            },
+            "completion_payload": {
+                "model": declared.model.served_model_name,
+                "prompt": declared.probes.prompt,
+                "max_tokens": declared.probes.max_new_tokens,
+                "temperature": 0,
+            },
             "chat_payload": {
                 "model": declared.model.served_model_name,
-                "messages": [{"role": "user", "content": "Reply with the exact string: monarch-sglang-ready"}],
-                "max_tokens": 32,
+                "messages": [{"role": "user", "content": declared.probes.prompt}],
+                "max_tokens": declared.probes.max_new_tokens,
                 "temperature": 0,
                 "chat_template_kwargs": dict(declared.probes.chat_template_kwargs),
             },
@@ -881,6 +951,8 @@ def materialize_runtime_config(
             "teardown_summary": "run://teardown-summary.json",
             "resolved_rootfs_plan": "run://sandbox/resolved-bwrap-plan.yaml",
             "models_probe": "run://probes/models.json",
+            "generate_probe": "run://probes/generate.json",
+            "completion_probe": "run://probes/completions.json",
             "chat_probe": "run://probes/chat-completions.json",
             "stdout_log": "run://logs/stdout.log",
             "stderr_log": "run://logs/stderr.log",
@@ -949,6 +1021,12 @@ def validate_materialized_config(config: MaterializedSglangRuntimeConfig) -> Non
         raise RuntimeConfigError("runtime.max_running_requests must match launch.inner_argv --max-running-requests")
     if _argv_value(inner, "--cpu-offload-gb") != str(_required_section_int(config.runtime, "cpu_offload_gb", "runtime")):
         raise RuntimeConfigError("runtime.cpu_offload_gb must match launch.inner_argv --cpu-offload-gb")
+    if _argv_value(inner, "--crash-dump-folder") != _required_section_str(
+        config.observability,
+        "crash_dump_folder",
+        "observability",
+    ):
+        raise RuntimeConfigError("observability.crash_dump_folder must match launch.inner_argv --crash-dump-folder")
     if inner[:3] != [SGLANG_VENV_PYTHON, "-m", "sglang.launch_server"]:
         raise RuntimeConfigError("launch.inner_argv must use the rootfs-owned SGLang venv Python")
 
@@ -1039,7 +1117,7 @@ def run_sglang_help_preflight(config: MaterializedSglangRuntimeConfig) -> str:
         capture_output=True,
         text=True,
         check=False,
-        cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+        cwd=_runtime_subprocess_cwd(config),
         env=_runtime_subprocess_env(config),
     )
     help_text = process.stdout + process.stderr
@@ -1067,12 +1145,18 @@ def prepare_sglang_venv(
     )
     inner_argv = _sglang_venv_prepare_command()
     install_argv = [
-        SGLANG_VENV_PYTHON,
-        "-m",
         "uv",
         "pip",
         "install",
+        "--python",
+        SGLANG_VENV_PYTHON,
         "sglang[all]",
+    ]
+    patch_argv = [
+        SGLANG_VENV_PYTHON,
+        SGLANG_OFFLOADER_PATCH_SCRIPT,
+        "--offloader",
+        SGLANG_OFFLOADER_PATH,
     ]
     probe_argv = [
         SGLANG_VENV_PYTHON,
@@ -1087,8 +1171,14 @@ def prepare_sglang_venv(
     ]
 
     outputs: list[dict[str, Any]] = []
-    plan_evidence = _preparation_plan_evidence(config, inner_argv, run=run, plan_emitter=plan_emitter)
-    for command in (inner_argv, install_argv, probe_argv, help_argv):
+    plan_evidence = _preparation_plan_evidence(
+        config,
+        "sglang_venv_record",
+        inner_argv,
+        run=run,
+        plan_emitter=plan_emitter,
+    )
+    for command in (inner_argv, install_argv, patch_argv, probe_argv, help_argv):
         completed = _run_preparation_command(config, command, run=run)
         outputs.append(
             {
@@ -1098,7 +1188,10 @@ def prepare_sglang_venv(
             }
         )
 
-    probe = _parse_prepare_versions(outputs[2]["stdout"])
+    offloader_patch = _parse_offloader_patch_output(outputs[2]["stdout"])
+    if _required_section_str(offloader_patch, "patch_id", "offloader patch evidence") != SGLANG_OFFLOADER_PATCH_ID:
+        raise RuntimeConfigError("SGLang offloader patch evidence has wrong patch id")
+    probe = _parse_prepare_versions(outputs[3]["stdout"])
     if _required_section_str(probe, "python", "sglang venv probe") != SGLANG_VENV_PYTHON:
         raise RuntimeConfigError("SGLang venv preparation used the wrong Python executable")
     sys_prefix = _required_section_str(probe, "sys_prefix", "sglang venv probe")
@@ -1122,6 +1215,7 @@ def prepare_sglang_venv(
         "bwrap_plan": plan_evidence,
         "checks": {
             "served_model_name_flag": True,
+            "offloader_patch": offloader_patch,
         },
         "commands": outputs,
     }
@@ -1150,6 +1244,7 @@ def prepare_model_cache(
     model_cache_prepare_env = _model_cache_prepare_env()
     plan_evidence = _preparation_plan_evidence(
         config,
+        "model_cache_record",
         command,
         run=run,
         env=model_cache_prepare_env,
@@ -1208,6 +1303,11 @@ def validate_preparation_records(
     checks = _require_mapping(venv_record.get("checks"), "sglang_venv_record.checks")
     if checks.get("served_model_name_flag") is not True:
         raise RuntimeConfigError("SGLang venv preparation record missing served_model_name_flag")
+    offloader_patch = _require_mapping(checks.get("offloader_patch"), "sglang_venv_record.checks.offloader_patch")
+    if _required_section_str(offloader_patch, "patch_id", "sglang_venv_record.checks.offloader_patch") != SGLANG_OFFLOADER_PATCH_ID:
+        raise RuntimeConfigError("SGLang venv preparation record has wrong offloader patch id")
+    if not _required_section_str(offloader_patch, "sha256_after", "sglang_venv_record.checks.offloader_patch"):
+        raise RuntimeConfigError("SGLang venv preparation record missing offloader patch hash")
 
     model_cache = _require_mapping(model_record.get("model_cache"), "model_cache_record.model_cache")
     snapshot_path = _required_section_str(model_cache, "snapshot_path", "model_cache_record.model_cache")
@@ -1217,24 +1317,15 @@ def validate_preparation_records(
         raise RuntimeConfigError("model cache preparation record has missing shard files")
 
     expected_digest = _rootfs_recipe_digest(config)
-    expected_plan_digests = {
-        "SGLang venv": _preparation_plan_digest_for(
-            config,
-            _sglang_venv_prepare_command(),
-        ),
-        "model cache": _preparation_plan_digest_for(
-            config,
-            _model_cache_prepare_command(config),
-            env=_model_cache_prepare_env(),
-        ),
-    }
-    for name, record in (("SGLang venv", venv_record), ("model cache", model_record)):
+    for name, key, record, inner_command, env in (
+        ("SGLang venv", "sglang_venv_record", venv_record, _sglang_venv_prepare_command(), None),
+        ("model cache", "model_cache_record", model_record, _model_cache_prepare_command(config), _model_cache_prepare_env()),
+    ):
         rootfs = _require_mapping(record.get("rootfs"), f"{name} preparation record rootfs")
         if _required_section_str(rootfs, "recipe_sha256", f"{name} preparation record rootfs") != expected_digest:
             raise RuntimeConfigError(f"{name} preparation record rootfs recipe digest mismatch")
-        bwrap_plan = _require_mapping(record.get("bwrap_plan"), f"{name} preparation record bwrap_plan")
-        if _required_section_str(bwrap_plan, "plan_sha256", f"{name} preparation record bwrap_plan") != expected_plan_digests[name]:
-            raise RuntimeConfigError(f"{name} preparation record bwrap plan digest mismatch")
+        preparation_config = _preparation_config_for_record(config, key)
+        _validate_preparation_record_plan(preparation_config, key, record, inner_command, env=env)
 
     return {
         "sglang_venv": venv_record,
@@ -1244,6 +1335,89 @@ def validate_preparation_records(
 
 def preflight_model_cache(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
     return validate_preparation_records(config=config)["model_cache"]
+
+
+def preflight_gpu_occupancy(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    visible = _visible_gpu_indices(_required_section_str(config.runtime, "cuda_visible_devices", "runtime"))
+    if not visible:
+        raise RuntimeConfigError("runtime.cuda_visible_devices must name at least one GPU")
+    uuid_by_index = _nvidia_gpu_uuid_by_index()
+    busy_by_uuid = {app["gpu_uuid"]: app for app in _nvidia_compute_apps()}
+
+    checked: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for index in visible:
+        gpu_uuid = uuid_by_index.get(index)
+        if gpu_uuid is None:
+            raise RuntimeConfigError(f"visible GPU {index} is not reported by nvidia-smi")
+        app = busy_by_uuid.get(gpu_uuid)
+        if app is not None:
+            blocked.append(
+                {
+                    "index": index,
+                    "uuid": gpu_uuid,
+                    "pid": app["pid"],
+                    "process_name": app["process_name"],
+                    "used_memory": app["used_memory"],
+                }
+            )
+            continue
+        checked.append({"index": index, "uuid": gpu_uuid, "status": "free"})
+    if blocked:
+        first = blocked[0]
+        raise GpuOccupancyError(
+            f"visible GPU {first['index']} is already occupied by pid {first['pid']} "
+            f"({first['process_name']}, {first['used_memory']} MiB)",
+            blocked_gpus=blocked,
+        )
+    return {"status": "free", "checked_gpus": checked}
+
+
+def wait_for_gpu_free_window(
+    config: MaterializedSglangRuntimeConfig,
+    *,
+    timeout_seconds: int,
+    stable_seconds: int = 0,
+    poll_seconds: float = 5.0,
+) -> dict[str, Any]:
+    if timeout_seconds < 0:
+        raise RuntimeConfigError("GPU-free wait seconds must be non-negative")
+    if stable_seconds < 0:
+        raise RuntimeConfigError("GPU-free stable seconds must be non-negative")
+    if timeout_seconds == 0 and stable_seconds == 0:
+        return preflight_gpu_occupancy(config)
+    deadline = time.time() + timeout_seconds
+    last_error: RuntimeConfigError | None = None
+    last_blocked_gpus: list[dict[str, Any]] = []
+    first_free_at: float | None = None
+    last_result: dict[str, Any] | None = None
+    while True:
+        try:
+            result = preflight_gpu_occupancy(config)
+        except RuntimeConfigError as error:
+            last_error = error
+            if isinstance(error, GpuOccupancyError):
+                last_blocked_gpus = list(error.blocked_gpus)
+            first_free_at = None
+            now = time.time()
+            if now >= deadline:
+                message = f"GPU-free wait timed out after {timeout_seconds}s: {last_error}"
+                if last_blocked_gpus:
+                    raise GpuOccupancyError(message, blocked_gpus=last_blocked_gpus) from error
+                raise RuntimeConfigError(message) from error
+            time.sleep(min(poll_seconds, max(0.0, deadline - now)))
+            continue
+        now = time.time()
+        if first_free_at is None:
+            first_free_at = now
+        last_result = result
+        if stable_seconds == 0 or now - first_free_at >= stable_seconds:
+            if stable_seconds:
+                return {**last_result, "stable_seconds": stable_seconds}
+            return last_result
+        if now >= deadline:
+            raise RuntimeConfigError(f"GPU-free wait timed out after {timeout_seconds}s: stable window not reached")
+        time.sleep(min(poll_seconds, max(0.0, deadline - now)))
 
 
 def _run_preparation_command(
@@ -1261,7 +1435,7 @@ def _run_preparation_command(
             capture_output=True,
             text=True,
             check=False,
-            cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+            cwd=_runtime_subprocess_cwd(config),
             env={**_runtime_subprocess_env(config), **command_env},
         )
     else:
@@ -1270,12 +1444,74 @@ def _run_preparation_command(
             capture_output=True,
             text=True,
             check=False,
-            cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+            cwd=_runtime_subprocess_cwd(config),
             env={**_runtime_subprocess_env(config), **command_env},
         )
     if completed.returncode != 0:
         raise RuntimeConfigError(f"rootfs command failed: {' '.join(inner_command)}\n{completed.stderr}")
     return completed
+
+
+def _visible_gpu_indices(cuda_visible_devices: str) -> list[int]:
+    indices: list[int] = []
+    for item in cuda_visible_devices.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        if not value.isdecimal():
+            raise RuntimeConfigError("runtime.cuda_visible_devices must be a comma-separated GPU index list")
+        indices.append(int(value))
+    return indices
+
+
+def _nvidia_gpu_uuid_by_index() -> dict[int, str]:
+    completed = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeConfigError(f"nvidia-smi GPU inventory failed: {completed.stderr.strip()}")
+    mapping: dict[int, str] = {}
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",", 1)]
+        if len(parts) != 2 or not parts[0].isdecimal() or not parts[1]:
+            raise RuntimeConfigError(f"nvidia-smi GPU inventory returned malformed row: {line}")
+        mapping[int(parts[0])] = parts[1]
+    return mapping
+
+
+def _nvidia_compute_apps() -> list[dict[str, Any]]:
+    completed = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,process_name,gpu_uuid,used_memory", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeConfigError(f"nvidia-smi compute-app query failed: {completed.stderr.strip()}")
+    apps: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",", 3)]
+        if len(parts) != 4 or not parts[0].isdecimal() or not parts[2]:
+            raise RuntimeConfigError(f"nvidia-smi compute-app query returned malformed row: {line}")
+        used_memory = parts[3]
+        if used_memory.endswith(" MiB"):
+            used_memory = used_memory.removesuffix(" MiB").strip()
+        apps.append(
+            {
+                "pid": int(parts[0]),
+                "process_name": parts[1],
+                "gpu_uuid": parts[2],
+                "used_memory": used_memory,
+            }
+        )
+    return apps
 
 
 def _rootfs_preparation_argv(
@@ -1305,6 +1541,58 @@ def _preparation_record_path(config: MaterializedSglangRuntimeConfig, name: str)
     return Path(_required_section_str(preparation, name, "resolved_paths.preparation"))
 
 
+def _preparation_plan_path_for_record(config: MaterializedSglangRuntimeConfig, name: str) -> Path:
+    return _preparation_record_path(config, name).parent / "sandbox" / f"{name}-bwrap-plan.yaml"
+
+
+def _preparation_config_for_record(
+    config: MaterializedSglangRuntimeConfig,
+    name: str,
+) -> MaterializedSglangRuntimeConfig:
+    record_path = _preparation_record_path(config, name)
+    run_id = record_path.parent.name
+    host_layout = dict(config.host_layout)
+    results_root = _required_section_str(host_layout, "results_root", "host_layout")
+    host_layout["run_dir"] = f"{results_root.rstrip('/')}/{run_id}"
+    host_layout["tmp_dir"] = f"temp://{run_id}"
+    sandbox = dict(config.sandbox)
+    mounts = sandbox.get("mounts")
+    if not isinstance(mounts, list):
+        raise RuntimeConfigError("sandbox.mounts must be a list")
+    sandbox["mounts"] = [
+        {
+            **mount,
+            "host_path_ref": "run://" if mount.get("sandbox_path") == "/run/glm52" else f"temp://{run_id}" if mount.get("sandbox_path") == "/tmp/glm52" else mount["host_path_ref"],
+        }
+        for mount in mounts
+        if isinstance(mount, dict)
+    ]
+    artifacts = dict(config.artifacts)
+    if "preparation" in artifacts:
+        artifacts = {**artifacts, "preparation": dict(_require_mapping(artifacts["preparation"], "artifacts.preparation"))}
+    resolved_paths = dict(config.resolved_paths)
+    preparation = dict(_require_mapping(resolved_paths.get("preparation"), "resolved_paths.preparation"))
+    preparation[name] = str(record_path)
+    resolved_paths["preparation"] = preparation
+    return MaterializedSglangRuntimeConfig(
+        schema_version=config.schema_version,
+        run_id=run_id,
+        run_group=config.run_group,
+        fail_fast=config.fail_fast,
+        allow_fallback=config.allow_fallback,
+        service=config.service,
+        model=config.model,
+        runtime=config.runtime,
+        observability=config.observability,
+        host_layout=host_layout,
+        sandbox=sandbox,
+        launch=config.launch,
+        probes=config.probes,
+        artifacts=artifacts,
+        resolved_paths=resolved_paths,
+    )
+
+
 def _load_preparation_record(config: MaterializedSglangRuntimeConfig, name: str, missing_message: str) -> dict[str, Any]:
     path = _preparation_record_path(config, name)
     if not path.exists():
@@ -1326,6 +1614,7 @@ def _sglang_venv_prepare_command() -> list[str]:
         SGLANG_VENV_SANDBOX_PATH,
         "--python",
         "3.12",
+        "--clear",
     ]
 
 
@@ -1342,6 +1631,7 @@ def _model_cache_prepare_env() -> dict[str, str]:
 
 def _preparation_plan_evidence(
     config: MaterializedSglangRuntimeConfig,
+    name: str,
     inner_command: list[str],
     *,
     run: Any | None = None,
@@ -1353,6 +1643,9 @@ def _preparation_plan_evidence(
     else:
         plan = plan_emitter(config, inner_command, env=env)
     validate_sglang_rootfs_overlay(config=config, plan=plan, expected_inner_argv=inner_command)
+    plan_path = _preparation_plan_path_for_record(config, name)
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
     return {
         "plan_sha256": _stable_json_digest(plan),
     }
@@ -1372,6 +1665,30 @@ def _preparation_plan_digest_for(
     plan["inner_argv"] = list(inner_command)
     plan["env"] = {**dict(config.launch["env"]), **dict(env or {})}
     return _stable_json_digest(plan)
+
+
+def _validate_preparation_record_plan(
+    config: MaterializedSglangRuntimeConfig,
+    name: str,
+    record: dict[str, Any],
+    inner_command: list[str],
+    *,
+    env: dict[str, str] | None,
+) -> None:
+    bwrap_plan = _require_mapping(record.get("bwrap_plan"), f"{name} preparation record bwrap_plan")
+    recorded_digest = _required_section_str(bwrap_plan, "plan_sha256", f"{name} preparation record bwrap_plan")
+    plan_path = _preparation_plan_path_for_record(config, name)
+    if not plan_path.exists():
+        raise RuntimeConfigError(f"{name} preparation record missing emitted bwrap plan: {plan_path}")
+    plan = load_yaml_mapping(plan_path)
+    validate_sglang_rootfs_overlay(config=config, plan=plan, expected_inner_argv=inner_command)
+    expected_env = {**dict(config.launch["env"]), **dict(env or {})}
+    plan_env = _require_mapping(plan.get("env"), "preparation bwrap plan env")
+    for key, value in expected_env.items():
+        if plan_env.get(key) != value:
+            raise RuntimeConfigError(f"{name} preparation bwrap plan env mismatch: {key}")
+    if _stable_json_digest(plan) != recorded_digest:
+        raise RuntimeConfigError(f"{name} preparation record bwrap plan digest mismatch")
 
 
 def _emit_preparation_rootfs_plan(
@@ -1395,7 +1712,7 @@ def _emit_preparation_rootfs_plan(
         capture_output=True,
         text=True,
         check=False,
-        cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+        cwd=_runtime_subprocess_cwd(config),
         env=process_env,
     )
     if completed.returncode != 0:
@@ -1461,7 +1778,7 @@ def _run_in_runtime_rootfs(
         capture_output=True,
         text=True,
         check=False,
-        cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+        cwd=_runtime_subprocess_cwd(config),
         env=_runtime_subprocess_env(config),
     )
     if completed.returncode != 0:
@@ -1475,6 +1792,14 @@ def _parse_prepare_versions(stdout: str) -> dict[str, Any]:
     except json.JSONDecodeError as error:
         raise RuntimeConfigError("SGLang venv version probe did not emit JSON") from error
     return _require_mapping(versions, "sglang prepare version probe")
+
+
+def _parse_offloader_patch_output(stdout: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeConfigError("SGLang offloader patch command did not emit JSON") from error
+    return _require_mapping(payload, "SGLang offloader patch evidence")
 
 
 def _parse_model_cache_prepare_output(stdout: str) -> dict[str, Any]:
@@ -1497,6 +1822,12 @@ def _runtime_subprocess_env(config: MaterializedSglangRuntimeConfig) -> dict[str
     }
 
 
+def _runtime_subprocess_cwd(config: MaterializedSglangRuntimeConfig) -> str:
+    if os.environ.get("MONARCH_IN_ROOTFS") == "1":
+        return _required_section_str(config.sandbox, "cwd", "sandbox")
+    return _required_section_str(config.resolved_paths, "repo", "resolved_paths")
+
+
 def emit_and_load_rootfs_plan(
     config: MaterializedSglangRuntimeConfig,
     *,
@@ -1514,7 +1845,7 @@ def emit_and_load_rootfs_plan(
         capture_output=True,
         text=True,
         check=False,
-        cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+        cwd=_runtime_subprocess_cwd(config),
         env=env,
     )
     if process.returncode != 0:
@@ -1549,6 +1880,7 @@ def wait_for_models_probe(
                     raise RuntimeConfigError(
                         f"SGLang process exited before /v1/models became ready: returncode={returncode}; last_error={last_error}"
                     )
+            _raise_for_fatal_startup_log(config)
             time.sleep(2)
     raise RuntimeConfigError(f"models probe timed out: {last_error}")
 
@@ -1564,16 +1896,72 @@ def probe_models(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
     )
 
 
+def probe_generate(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    timeout_seconds = _required_section_int(config.probes, "chat_timeout_seconds", "probes")
+    request = urllib.request.Request(
+        _required_section_str(config.probes, "generate_url", "probes"),
+        data=json.dumps(config.probes["generate_payload"]).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", response.getcode())
+            body = response.read()
+    except (TimeoutError, socket.timeout) as error:
+        raise RuntimeLaunchError(f"generate probe timed out after {timeout_seconds}s") from error
+    if status != 200:
+        raise RuntimeLaunchError(f"generate probe returned HTTP {status}")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeLaunchError("invalid /generate JSON") from error
+    content = _generate_content(payload)
+    if not content:
+        raise RuntimeLaunchError("generate probe returned empty text")
+    return {"content": content, "payload": payload}
+
+
+def probe_completion(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    timeout_seconds = _required_section_int(config.probes, "chat_timeout_seconds", "probes")
+    request = urllib.request.Request(
+        _required_section_str(config.probes, "completions_url", "probes"),
+        data=json.dumps(config.probes["completion_payload"]).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", response.getcode())
+            body = response.read()
+    except (TimeoutError, socket.timeout) as error:
+        raise RuntimeLaunchError(f"completion probe timed out after {timeout_seconds}s") from error
+    if status != 200:
+        raise RuntimeLaunchError(f"completion probe returned HTTP {status}")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeLaunchError("invalid /v1/completions JSON") from error
+    content = _completion_content(payload)
+    if not content:
+        raise RuntimeLaunchError("completion probe returned empty text")
+    return {"content": content, "payload": payload}
+
+
 def probe_chat(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    timeout_seconds = _required_section_int(config.probes, "chat_timeout_seconds", "probes")
     request = urllib.request.Request(
         _required_section_str(config.probes, "chat_url", "probes"),
         data=json.dumps(config.probes["chat_payload"]).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        status = getattr(response, "status", response.getcode())
-        body = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", response.getcode())
+            body = response.read()
+    except (TimeoutError, socket.timeout) as error:
+        raise RuntimeLaunchError(f"chat probe timed out after {timeout_seconds}s") from error
     if status != 200:
         raise RuntimeLaunchError(f"chat probe returned HTTP {status}")
     try:
@@ -1625,10 +2013,11 @@ def launch_runtime(
         validate_materialized_config(config)
         artifact_paths = _resolve_artifact_paths(config)
         write_materialized_config(config, artifact_paths["materialized_config"])
+        preflight_gpu_occupancy(config)
         with artifact_paths["stdout_log"].open("ab") as stdout_handle, artifact_paths["stderr_log"].open("ab") as stderr_handle:
             process = subprocess.Popen(
                 _resolved_outer_argv(config),
-                cwd=_required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+                cwd=_runtime_subprocess_cwd(config),
                 env=_runtime_subprocess_env(config),
                 start_new_session=True,
                 stdout=stdout_handle,
@@ -1639,6 +2028,10 @@ def launch_runtime(
             process_record_written = True
             models_probe = wait_for_models_probe(config, process=process)
             _write_json(artifact_paths["models_probe"], models_probe)
+            generate_probe = probe_generate(config)
+            _write_json(artifact_paths["generate_probe"], generate_probe)
+            completion_probe = probe_completion(config)
+            _write_json(artifact_paths["completion_probe"], completion_probe)
             chat_probe = probe_chat(config)
             _write_json(artifact_paths["chat_probe"], chat_probe)
             summary = {
@@ -1652,7 +2045,9 @@ def launch_runtime(
             return summary
     except Exception as error:
         teardown_action = "not_started"
+        diagnostic_action: dict[str, Any] = {"status": "not_sent", "reason": "process_not_started"}
         if process_record_written and should_teardown_after_failure(config):
+            diagnostic_action = emit_failure_diagnostic_signal(config, reason="probe_failure")
             teardown_action = "teardown_runtime"
             try:
                 teardown_runtime(config, local_environment=local_environment)
@@ -1676,6 +2071,7 @@ def launch_runtime(
                 "run_id": config.run_id,
                 "port": config.service["port"],
                 "error": str(error),
+                "diagnostic_action": diagnostic_action,
                 "teardown_action": teardown_action,
             },
         )
@@ -1727,7 +2123,7 @@ def teardown_runtime(
 
     deadline = time.time() + 30
     while time.time() < deadline:
-        if not _process_group_exists(process_group) and not _is_port_open(
+        if _process_group_is_released(process_group) and not _is_port_open(
             _required_section_str(config.service, "bind_host", "service"),
             port,
         ):
@@ -1740,9 +2136,17 @@ def teardown_runtime(
         os.killpg(process_group, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    if _process_group_is_released(process_group) and not _is_port_open(
+        _required_section_str(config.service, "bind_host", "service"),
+        port,
+    ):
+        _mark_process_stopped(process_record_path, record, "killed")
+        summary = {"status": "teardown_passed", "run_id": config.run_id, "port": port, "escalated": True}
+        _write_json(artifact_paths["teardown_summary"], summary)
+        return summary
     deadline = time.time() + 10
     while time.time() < deadline:
-        if not _process_group_exists(process_group) and not _is_port_open(
+        if _process_group_is_released(process_group) and not _is_port_open(
             _required_section_str(config.service, "bind_host", "service"),
             port,
         ):
@@ -1752,6 +2156,38 @@ def teardown_runtime(
             return summary
         time.sleep(0.5)
     raise RuntimeConfigError("teardown timed out waiting for recorded process group and port release")
+
+
+def emit_failure_diagnostic_signal(config: MaterializedSglangRuntimeConfig, *, reason: str) -> dict[str, Any]:
+    artifact_paths = _resolve_artifact_paths(config)
+    process_record_path = artifact_paths["process_record"]
+    if not process_record_path.exists():
+        return {"status": "not_sent", "reason": "missing_process_record"}
+    record = load_yaml_mapping(process_record_path)
+    _validate_process_record_matches_config(config, record)
+    process_group = _required_int(record, "process_group", "process_record")
+    try:
+        os.killpg(process_group, signal.SIGQUIT)
+    except ProcessLookupError:
+        return {
+            "status": "not_sent",
+            "reason": "process_group_absent",
+            "signal": "SIGQUIT",
+            "process_group": process_group,
+        }
+    except PermissionError as error:
+        raise RuntimeConfigError("cannot signal recorded process group for diagnostics") from error
+    flush_wait_seconds = 6
+    time.sleep(flush_wait_seconds)
+    crash_dump_inventory = _crash_dump_inventory(config)
+    return {
+        "status": "sent",
+        "signal": "SIGQUIT",
+        "process_group": process_group,
+        "reason": reason,
+        "flush_wait_seconds": flush_wait_seconds,
+        **crash_dump_inventory,
+    }
 
 
 def run_one_cycle(
@@ -1853,10 +2289,18 @@ def repeat_runtime(
     declared: DeclaredSglangLaunchSpec,
     local_environment: LocalEnvironmentConfig,
     cycles: int | None,
+    wait_for_gpu_free_seconds: int = 0,
+    gpu_free_stable_seconds: int = 0,
 ) -> dict[str, Any]:
     cycle_count = cycles if cycles is not None else declared.repeatability.cycles
     if cycle_count < 1:
         raise RuntimeConfigError("repeat cycles must be positive")
+    if wait_for_gpu_free_seconds < 0:
+        raise RuntimeConfigError("GPU-free wait seconds must be non-negative")
+    if gpu_free_stable_seconds < 0:
+        raise RuntimeConfigError("GPU-free stable seconds must be non-negative")
+    if gpu_free_stable_seconds and wait_for_gpu_free_seconds < gpu_free_stable_seconds:
+        raise RuntimeConfigError("GPU-free wait seconds must be at least stable seconds")
 
     repeat_id = f"{declared.run_group}-repeat-{_utc_stamp()}-{uuid.uuid4().hex[:8]}"
     repeat_dir = Path(_resolve_local_path_ref(local_environment, declared.local_paths.results_root)) / repeat_id
@@ -1875,6 +2319,11 @@ def repeat_runtime(
             run_id=run_id,
             port=port,
         )
+        config = _with_stable_preparation_record_paths(
+            config,
+            declared=declared,
+            local_environment=local_environment,
+        )
         write_materialized_config(
             config,
             Path(_resolve_host_path_ref(config, config.artifacts["materialized_config"])),
@@ -1885,6 +2334,28 @@ def repeat_runtime(
             "run_id": run_id,
             "port": port,
         }
+        if wait_for_gpu_free_seconds:
+            try:
+                cycle_summary["gpu_wait"] = wait_for_gpu_free_window(
+                    config,
+                    timeout_seconds=wait_for_gpu_free_seconds,
+                    stable_seconds=gpu_free_stable_seconds,
+                )
+            except Exception as wait_error:
+                cycle_summary["gpu_wait"] = {
+                    "status": "failed",
+                    "error": str(wait_error),
+                }
+                if isinstance(wait_error, GpuOccupancyError):
+                    cycle_summary["gpu_wait"]["blocked_gpus"] = wait_error.blocked_gpus
+                summaries.append(cycle_summary)
+                _write_repeat_summary(
+                    loop_summary_path,
+                    repeat_id=repeat_id,
+                    status="failed",
+                    cycles=summaries,
+                )
+                raise RuntimeConfigError(f"repeat cycle GPU-free wait failed: {wait_error}") from wait_error
         try:
             cycle_summary["launch"] = launch_runtime(config, local_environment=local_environment)
         except Exception as launch_error:
@@ -1892,7 +2363,9 @@ def repeat_runtime(
                 "status": "failed",
                 "error": str(launch_error),
             }
-            cycle_summary["teardown"] = _best_effort_teardown(config, local_environment)
+            if isinstance(launch_error, GpuOccupancyError):
+                cycle_summary["launch"]["blocked_gpus"] = launch_error.blocked_gpus
+            cycle_summary["teardown"] = _repeat_launch_failure_teardown(config, local_environment)
             summaries.append(cycle_summary)
             _write_repeat_summary(
                 loop_summary_path,
@@ -1903,7 +2376,7 @@ def repeat_runtime(
             raise RuntimeConfigError(f"repeat cycle failed: {launch_error}") from launch_error
 
         try:
-            cycle_summary["teardown"] = teardown_runtime(config, local_environment=local_environment)
+            cycle_summary["teardown"] = _best_effort_teardown(config, local_environment)
         except Exception as teardown_error:
             cycle_summary["teardown"] = {
                 "status": "failed",
@@ -2022,6 +2495,27 @@ def _resolve_host_path_ref(config: MaterializedSglangRuntimeConfig, ref: str) ->
     raise RuntimeConfigError(f"unsupported host path ref: {ref}")
 
 
+def _host_path_from_run_sandbox_path(config: MaterializedSglangRuntimeConfig, sandbox_path: str) -> str:
+    if not sandbox_path.startswith("/run/glm52/"):
+        raise RuntimeConfigError(f"run artifact path must be under /run/glm52: {sandbox_path}")
+    return _resolve_host_path_ref(config, f"run://{sandbox_path.removeprefix('/run/glm52/')}")
+
+
+def _crash_dump_inventory(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    crash_dump_folder = _required_section_str(config.observability, "crash_dump_folder", "observability")
+    crash_dump_host_path = Path(_host_path_from_run_sandbox_path(config, crash_dump_folder))
+    files: list[str] = []
+    if crash_dump_host_path.exists():
+        for path in sorted(crash_dump_host_path.rglob("*")):
+            if path.is_file():
+                files.append(path.relative_to(crash_dump_host_path).as_posix())
+    return {
+        "crash_dump_folder": crash_dump_folder,
+        "crash_dump_host_path": str(crash_dump_host_path),
+        "crash_dump_files": files,
+    }
+
+
 def _model_cache_evidence_path(config: MaterializedSglangRuntimeConfig) -> Path:
     cache_dir = _required_section_str(config.host_layout, "cache_dir", "host_layout")
     return Path(_resolve_host_path_ref(config, cache_dir)) / "model-cache-prepare.json"
@@ -2076,6 +2570,7 @@ def _reject_schema_owned_extra_args(extra_args: list[str]) -> None:
         "--max-total-tokens",
         "--max-running-requests",
         "--cpu-offload-gb",
+        "--crash-dump-folder",
     }
     for arg in extra_args:
         if arg in schema_owned_flags:
@@ -2304,12 +2799,31 @@ def _best_effort_teardown(
     local_environment: LocalEnvironmentConfig,
 ) -> dict[str, Any]:
     try:
-        return teardown_runtime(config, local_environment=local_environment)
+        teardown_config = config
+        materialized_path = Path(_resolve_host_path_ref(config, config.artifacts["materialized_config"]))
+        if materialized_path.exists():
+            teardown_config = load_materialized_config(materialized_path)
+        return teardown_runtime(teardown_config, local_environment=local_environment)
     except Exception as error:
         return {
             "status": "failed",
             "error": str(error),
         }
+
+
+def _repeat_launch_failure_teardown(
+    config: MaterializedSglangRuntimeConfig,
+    local_environment: LocalEnvironmentConfig,
+) -> dict[str, Any]:
+    launch_summary_path = Path(_resolve_host_path_ref(config, config.artifacts["launch_summary"]))
+    if launch_summary_path.exists():
+        launch_summary = _load_json_mapping(launch_summary_path)
+        if launch_summary.get("teardown_action") == "not_started":
+            return {
+                "status": "not_started",
+                "reason": "launch failed before process start",
+            }
+    return _best_effort_teardown(config, local_environment)
 
 
 def _utc_stamp() -> str:
@@ -2319,6 +2833,46 @@ def _utc_stamp() -> str:
 def _load_json_mapping(path: Path) -> dict[str, Any]:
     with path.open() as handle:
         return _require_mapping(json.load(handle), str(path))
+
+
+def _raise_for_fatal_startup_log(config: MaterializedSglangRuntimeConfig) -> None:
+    stderr_ref = config.artifacts.get("stderr_log")
+    if not isinstance(stderr_ref, str):
+        return
+    stderr_path = Path(_resolve_host_path_ref(config, stderr_ref))
+    if not stderr_path.exists():
+        return
+    try:
+        text = _read_text_tail(stderr_path, max_bytes=65536)
+    except OSError:
+        return
+    for marker in (
+        "Scheduler hit an exception",
+        "Received sigquit from a child process",
+        "Traceback (most recent call last):",
+    ):
+        if marker in text:
+            detail = _first_fatal_log_detail(text)
+            raise RuntimeConfigError(f"SGLang startup failed before /v1/models became ready: {detail}")
+
+
+def _read_text_tail(path: Path, *, max_bytes: int) -> str:
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > max_bytes:
+            handle.seek(size - max_bytes)
+        return handle.read().decode("utf-8", errors="replace")
+
+
+def _first_fatal_log_detail(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith(("RuntimeError:", "ValueError:", "TypeError:", "ImportError:", "ModuleNotFoundError:")):
+            return line
+    for line in lines:
+        if "Scheduler hit an exception" in line or "Received sigquit from a child process" in line:
+            return line
+    return "fatal startup marker found in stderr log"
 
 
 def _mark_process_stopped(path: Path, record: dict[str, Any], reason: str) -> None:
@@ -2336,6 +2890,33 @@ def _process_group_exists(process_group: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _process_group_is_released(process_group: int) -> bool:
+    if not _process_group_exists(process_group):
+        return True
+    return not _process_group_has_running_members(process_group)
+
+
+def _process_group_has_running_members(process_group: int) -> bool:
+    proc = Path("/proc")
+    if not proc.exists():
+        return True
+    for stat_path in proc.glob("[0-9]*/stat"):
+        try:
+            stat = stat_path.read_text()
+        except OSError:
+            return True
+        try:
+            after_comm = stat.rsplit(") ", 1)[1]
+            fields = after_comm.split()
+            state = fields[0]
+            pgrp = int(fields[2])
+        except (IndexError, ValueError):
+            return True
+        if pgrp == process_group and state != "Z":
+            return True
+    return False
 
 
 def _is_port_open(host: str, port: int) -> bool:
@@ -2381,12 +2962,18 @@ def _validate_probe_urls(base_url: str, probes: dict[str, Any], service_port: in
     if parsed_base.scheme not in {"http", "https"} or parsed_base.hostname is None or parsed_base.port != service_port:
         raise RuntimeConfigError("service.base_url must include service host and port")
     expected_models_url = f"{base_url.rstrip('/')}/models"
+    expected_generate_url = f"{parsed_base.scheme}://{parsed_base.hostname}:{service_port}/generate"
+    expected_completions_url = f"{base_url.rstrip('/')}/completions"
     expected_chat_url = f"{base_url.rstrip('/')}/chat/completions"
     if _required_section_str(probes, "models_url", "probes") != expected_models_url:
         raise RuntimeConfigError("probe URLs must derive from service.base_url")
+    if _required_section_str(probes, "generate_url", "probes") != expected_generate_url:
+        raise RuntimeConfigError("probe URLs must derive from service.base_url")
+    if _required_section_str(probes, "completions_url", "probes") != expected_completions_url:
+        raise RuntimeConfigError("probe URLs must derive from service.base_url")
     if _required_section_str(probes, "chat_url", "probes") != expected_chat_url:
         raise RuntimeConfigError("probe URLs must derive from service.base_url")
-    for key in ("models_url", "chat_url"):
+    for key in ("models_url", "generate_url", "completions_url", "chat_url"):
         parsed = urlparse(probes[key])
         if parsed.hostname != parsed_base.hostname or parsed.port != service_port:
             raise RuntimeConfigError("probe URLs must derive from service.base_url")
@@ -2416,6 +3003,8 @@ def _reject_disallowed_ports(config: MaterializedSglangRuntimeConfig, disallowed
         _required_section_int(config.service, "port", "service"),
         _parsed_url_port(_required_section_str(config.service, "base_url", "service"), "service.base_url"),
         _parsed_url_port(_required_section_str(config.probes, "models_url", "probes"), "probes.models_url"),
+        _parsed_url_port(_required_section_str(config.probes, "generate_url", "probes"), "probes.generate_url"),
+        _parsed_url_port(_required_section_str(config.probes, "completions_url", "probes"), "probes.completions_url"),
         _parsed_url_port(_required_section_str(config.probes, "chat_url", "probes"), "probes.chat_url"),
         int(_argv_value(_required_str_sequence(config.launch.get("inner_argv"), "launch.inner_argv"), "--port")),
         int(_argv_value(_required_str_sequence(config.launch.get("outer_argv"), "launch.outer_argv"), "--port")),
@@ -2492,6 +3081,35 @@ def _chat_completion_content(payload: Any) -> str:
         joined = "".join(fragments).strip()
         if joined:
             return joined
+    return ""
+
+
+def _completion_content(payload: Any) -> str:
+    mapping = _require_mapping(payload, "/v1/completions response")
+    choices = mapping.get("choices")
+    if not isinstance(choices, list):
+        return ""
+    fragments: list[str] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        text = choice.get("text")
+        if isinstance(text, str):
+            fragments.append(text)
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            fragments.append(message["content"])
+    return "".join(fragments).strip()
+
+
+def _generate_content(payload: Any) -> str:
+    mapping = _require_mapping(payload, "/generate response")
+    text = mapping.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    output = mapping.get("output")
+    if isinstance(output, str) and output.strip():
+        return output.strip()
     return ""
 
 
@@ -2663,6 +3281,8 @@ def build_parser() -> argparse.ArgumentParser:
     repeat.add_argument("--declared-spec", type=Path, required=True)
     repeat.add_argument("--local-environment", type=Path, required=True)
     repeat.add_argument("--cycles", type=int)
+    repeat.add_argument("--wait-for-gpu-free-seconds", type=int, default=0)
+    repeat.add_argument("--gpu-free-stable-seconds", type=int, default=0)
 
     repeatability = subcommands.add_parser("repeatability")
     repeatability.add_argument("--declared", "--declared-spec", dest="declared_spec", type=Path, required=True)
@@ -2723,6 +3343,8 @@ def main(argv: list[str] | None = None) -> int:
                 declared=declared,
                 local_environment=local_environment,
                 cycles=args.cycles,
+                wait_for_gpu_free_seconds=args.wait_for_gpu_free_seconds,
+                gpu_free_stable_seconds=args.gpu_free_stable_seconds,
             )
             return 0
         if args.command == "repeatability":

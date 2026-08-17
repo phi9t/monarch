@@ -89,6 +89,34 @@ def test_enter_rootfs_repo_readonly_emits_read_only_repo_mount(tmp_path: Path) -
     assert repo_mount["mode"] == "ro"
 
 
+def test_enter_rootfs_emit_plan_has_unique_sandbox_mounts(tmp_path: Path) -> None:
+    plan_path = tmp_path / "rootfs-plan.yaml"
+
+    result = subprocess.run(
+        [
+            str(ENTER_ROOTFS),
+            "--rootfs",
+            str(REPO_ROOT / "scripts" / "rootfs" / "rootfs"),
+            "--repo-readonly",
+            "--emit-plan",
+            str(plan_path),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ],
+        env={**os.environ, "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    plan = yaml.safe_load(plan_path.read_text())
+    sandbox_paths = [mount["sandbox_path"] for mount in plan["mounts"]]
+    assert len(sandbox_paths) == len(set(sandbox_paths))
+
+
 def test_enter_rootfs_emit_plan_preserves_hf_home(tmp_path: Path) -> None:
     plan_path = tmp_path / "rootfs-plan.yaml"
 
@@ -118,6 +146,68 @@ def test_enter_rootfs_emit_plan_preserves_hf_home(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     plan = yaml.safe_load(plan_path.read_text())
     assert plan["env"]["HF_HOME"] == "/tmp/glm52/hf-home"
+
+
+def test_enter_rootfs_emit_plan_preserves_sglang_cache_dir(tmp_path: Path) -> None:
+    plan_path = tmp_path / "rootfs-plan.yaml"
+
+    result = subprocess.run(
+        [
+            str(ENTER_ROOTFS),
+            "--rootfs",
+            str(REPO_ROOT / "scripts" / "rootfs" / "rootfs"),
+            "--repo-readonly",
+            "--emit-plan",
+            str(plan_path),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ],
+        env={
+            **os.environ,
+            "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1",
+            "SGLANG_CACHE_DIR": "/cache/glm52/sglang",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    plan = yaml.safe_load(plan_path.read_text())
+    assert plan["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+
+
+def test_enter_rootfs_emit_plan_preserves_transformers_cache(tmp_path: Path) -> None:
+    plan_path = tmp_path / "rootfs-plan.yaml"
+
+    result = subprocess.run(
+        [
+            str(ENTER_ROOTFS),
+            "--rootfs",
+            str(REPO_ROOT / "scripts" / "rootfs" / "rootfs"),
+            "--repo-readonly",
+            "--emit-plan",
+            str(plan_path),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ],
+        env={
+            **os.environ,
+            "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1",
+            "TRANSFORMERS_CACHE": "/cache/glm52/hf-home",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    plan = yaml.safe_load(plan_path.read_text())
+    assert plan["env"]["TRANSFORMERS_CACHE"] == "/cache/glm52/hf-home"
 
 
 def test_enter_rootfs_emit_plan_preserves_uv_cache_dir_override(tmp_path: Path) -> None:
@@ -262,6 +352,56 @@ def test_enter_rootfs_emit_plan_reports_extra_bind_mounts(tmp_path: Path) -> Non
         "-m",
         "sglang.launch_server",
     ]
+
+
+def test_enter_rootfs_emit_plan_does_not_hide_nested_extra_binds(tmp_path: Path) -> None:
+    plan_path = tmp_path / "rootfs-plan.yaml"
+    rootfs_dir = tmp_path / "rootfs"
+    cache_dir = tmp_path / "cache"
+    venv_dir = cache_dir / "venvs" / "sglang"
+    hf_dir = cache_dir / "hf-home"
+
+    result = subprocess.run(
+        [
+            str(ENTER_ROOTFS),
+            "--rootfs",
+            str(rootfs_dir),
+            "--bind-rw",
+            f"{cache_dir}:/cache/glm52",
+            "--bind-rw",
+            f"{venv_dir}:/cache/glm52/venvs/sglang",
+            "--bind-rw",
+            f"{hf_dir}:/cache/glm52/hf-home",
+            "--emit-plan",
+            str(plan_path),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ],
+        env={**os.environ, "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    plan = yaml.safe_load(plan_path.read_text())
+    outer_argv = plan["outer_argv"]
+    tmpfs_targets = [
+        outer_argv[index + 1]
+        for index, arg in enumerate(outer_argv)
+        if arg == "--tmpfs"
+    ]
+    assert tmpfs_targets.count("/cache") == 1
+    bind_index = next(
+        index
+        for index, arg in enumerate(outer_argv)
+        if arg == "--bind"
+        and outer_argv[index + 1] == str(cache_dir)
+        and outer_argv[index + 2] == "/cache/glm52"
+    )
+    assert outer_argv.index("/cache") < bind_index
 
 
 def test_enter_rootfs_emit_plan_equals_form_preserves_chdir(tmp_path: Path) -> None:

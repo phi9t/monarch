@@ -55,6 +55,7 @@ checkout_rel=""
 emit_plan=""
 repo_projection_mode="rw"
 extra_rw_binds=()
+declare -A emitted_sandbox_dirs=()
 
 die() { printf '\033[1;31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -76,6 +77,10 @@ append_sandbox_dirs() {
     part="${parts[$i]}"
     [[ -n "$part" ]] || continue
     current="$current/$part"
+    if [[ "${emitted_sandbox_dirs[$current]+set}" == set ]]; then
+      continue
+    fi
+    emitted_sandbox_dirs[$current]=1
     if [[ "$i" -eq 0 ]]; then
       bwrap_args+=(--tmpfs "$current")
     else
@@ -219,7 +224,12 @@ done
 
 # GPU device nodes: bind every /dev/nvidia* that exists.
 shopt -s nullglob
+declare -A seen_nvidia_devices=()
 for dev in /dev/nvidia* /dev/nvidia-caps; do
+  if [[ "${seen_nvidia_devices[$dev]+set}" == set ]]; then
+    continue
+  fi
+  seen_nvidia_devices[$dev]=1
   bwrap_args+=(--dev-bind "$dev" "$dev")
 done
 
@@ -272,7 +282,7 @@ for var in TERM COLORTERM \
            http_proxy https_proxy ftp_proxy no_proxy \
            HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY \
            NVIDIA_VISIBLE_DEVICES RUST_LOG RUST_BACKTRACE \
-           TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR USER LOGNAME \
+           TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR SGLANG_CACHE_DIR TRANSFORMERS_CACHE USER LOGNAME \
            USE_TENSOR_ENGINE MONARCH_GPU_PLATFORM MONARCH_PACKAGE_NAME \
            MONARCH_VERSION ENABLE_MESSAGE_LOGGING \
            GLM52_MODEL GLM52_CHAT_BASE_URL GLM52_RESPONSES_BASE_URL \

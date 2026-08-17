@@ -8,5 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
-exec "$REPO_ROOT/scripts/run" python scripts/glm52_sglang_runtime.py "$@"
+python_bin="${PYTHON:-python3}"
+exec "$python_bin" "$REPO_ROOT/scripts/glm52_sglang_runtime.py" "$@"

@@ -19,12 +19,26 @@ runtime:
   tensor_parallel_size: 8
   dtype: bfloat16
   context_length: 262144
-  kv_cache_dtype: fp8_e4m3
+  kv_cache_dtype: bfloat16
   mem_fraction_static: 0.93
   max_total_tokens: 32768
   max_running_requests: 1
   cpu_offload_gb: 16
-  extra_args: [--disable-flashinfer-autotune, --cuda-graph-backend-prefill=disabled, --cuda-graph-backend-decode=disabled]
+  extra_args:
+    - --disable-flashinfer-autotune
+    - --enforce-disable-flashinfer-allreduce-fusion
+    - --log-requests
+    - --log-requests-level
+    - "1"
+    - --show-time-cost
+    - --enable-request-time-stats-logging
+    - --dsa-decode-backend
+    - flashmla_kv
+    - --cuda-graph-backend-prefill=disabled
+    - --cuda-graph-backend-decode=disabled
+    - --skip-server-warmup
+    - --moe-runner-backend
+    - triton
 sandbox:
   kind: bwrap_rootfs
   rootfs_ref: rootfs://monarch-default
@@ -40,6 +54,7 @@ observability:
   debug_mode: false
   leave_running_on_failure: false
   log_level: info
+  crash_dump_folder: /run/glm52/crash-dumps
   telemetry:
     local_artifacts: true
     remote_export: false
@@ -50,8 +65,11 @@ local_paths:
   temp_root: temp://glm52-local-serving
 probes:
   startup_timeout_seconds: 900
+  chat_timeout_seconds: 300
   models_required: true
   chat_required: true
+  prompt: "Say OK."
+  max_new_tokens: 1
   chat_template_kwargs:
     enable_thinking: false
 repeatability:
