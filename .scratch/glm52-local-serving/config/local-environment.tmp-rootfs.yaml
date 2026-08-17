@@ -1,0 +1,7 @@
+schema_version: 1
+roots:
+  repo: <absolute-path-to-monarch-checkout>
+  cache: /tmp/monarch-glm52-local-serving-cache
+  temp: /tmp/monarch-glm52-local-serving-tmp
+rootfs:
+  monarch-default: <absolute-path-to-built-bwrap-rootfs>
