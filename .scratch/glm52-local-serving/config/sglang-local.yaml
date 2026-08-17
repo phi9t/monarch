@@ -1,0 +1,58 @@
+schema_version: 1
+run_group: glm52-sglang-local
+fail_fast: true
+allow_fallback: false
+port_policy:
+  mode: strict_run_owned_range
+  bind_host: 127.0.0.1
+  range_start: 19000
+  range_end: 19100
+  disallowed_ports: [8000, 8080, 18080]
+model:
+  id: zai-org/GLM-5.2
+  path: zai-org/GLM-5.2
+  served_model_name: zai-org/GLM-5.2
+  expected_model_ids: [zai-org/GLM-5.2]
+runtime:
+  kind: sglang_openai
+  cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  tensor_parallel_size: 8
+  dtype: bfloat16
+  context_length: 262144
+  kv_cache_dtype: fp8_e4m3
+  mem_fraction_static: 0.93
+  max_total_tokens: 32768
+  max_running_requests: 1
+  cpu_offload_gb: 16
+  extra_args: [--disable-flashinfer-autotune, --cuda-graph-backend-prefill=disabled, --cuda-graph-backend-decode=disabled]
+sandbox:
+  kind: bwrap_rootfs
+  rootfs_ref: rootfs://monarch-default
+  cwd: /workspace/monarch
+  network: host_loopback_required
+  gpu: required
+  sglang:
+    venv_path: /cache/glm52/venvs/sglang
+    hf_home: /cache/glm52/hf-home
+    cache: /cache/glm52/sglang
+    telemetry_root: /workspace/monarch/.scratch/glm52-local-serving/run
+observability:
+  debug_mode: false
+  leave_running_on_failure: false
+  log_level: info
+  telemetry:
+    local_artifacts: true
+    remote_export: false
+local_paths:
+  results_root: repo://glm52-serving-results
+  scratch_root: repo://.scratch/glm52-local-serving
+  cache_root: cache://glm52-local-serving
+  temp_root: temp://glm52-local-serving
+probes:
+  startup_timeout_seconds: 900
+  models_required: true
+  chat_required: true
+  chat_template_kwargs:
+    enable_thinking: false
+repeatability:
+  cycles: 3

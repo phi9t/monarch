@@ -1,0 +1,2397 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+
+HELPER_PATH = Path(__file__).resolve().parents[2] / "scripts" / "glm52_sglang_runtime.py"
+spec = importlib.util.spec_from_file_location("glm52_sglang_runtime", HELPER_PATH)
+assert spec is not None
+assert spec.loader is not None
+glm52_sglang_runtime = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = glm52_sglang_runtime
+spec.loader.exec_module(glm52_sglang_runtime)
+
+DeclaredSglangLaunchSpec = glm52_sglang_runtime.DeclaredSglangLaunchSpec
+RuntimeConfigError = glm52_sglang_runtime.RuntimeConfigError
+RuntimeLaunchError = glm52_sglang_runtime.RuntimeLaunchError
+MaterializedSglangRuntimeConfig = glm52_sglang_runtime.MaterializedSglangRuntimeConfig
+load_declared_spec = glm52_sglang_runtime.load_declared_spec
+load_local_environment = glm52_sglang_runtime.load_local_environment
+load_materialized_config = glm52_sglang_runtime.load_materialized_config
+load_yaml_mapping = glm52_sglang_runtime.load_yaml_mapping
+main = glm52_sglang_runtime.main
+materialize_runtime_config = glm52_sglang_runtime.materialize_runtime_config
+parse_models_response = glm52_sglang_runtime.parse_models_response
+prepare_model_cache = glm52_sglang_runtime.prepare_model_cache
+prepare_sglang_venv = glm52_sglang_runtime.prepare_sglang_venv
+validate_materialized_config = glm52_sglang_runtime.validate_materialized_config
+validate_preparation_records = glm52_sglang_runtime.validate_preparation_records
+validate_resolved_rootfs_plan = glm52_sglang_runtime.validate_resolved_rootfs_plan
+validate_sglang_rootfs_overlay = glm52_sglang_runtime.validate_sglang_rootfs_overlay
+validate_sglang_help = glm52_sglang_runtime.validate_sglang_help
+should_teardown_after_failure = glm52_sglang_runtime.should_teardown_after_failure
+validate_model_snapshot = glm52_sglang_runtime.validate_model_snapshot
+write_materialized_config = glm52_sglang_runtime.write_materialized_config
+
+
+def write_spec(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+VALID_DECLARED = """\
+schema_version: 1
+run_group: glm52-sglang-local
+fail_fast: true
+allow_fallback: false
+port_policy:
+  mode: strict_run_owned_range
+  bind_host: 127.0.0.1
+  range_start: 19000
+  range_end: 19100
+  disallowed_ports: [8000, 8080, 18080]
+model:
+  id: zai-org/GLM-5.2
+  path: zai-org/GLM-5.2
+  served_model_name: zai-org/GLM-5.2
+  expected_model_ids: [zai-org/GLM-5.2]
+runtime:
+  kind: sglang_openai
+  cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  tensor_parallel_size: 8
+  dtype: bfloat16
+  context_length: 262144
+  kv_cache_dtype: fp8_e4m3
+  mem_fraction_static: 0.72
+  max_total_tokens: 32768
+  max_running_requests: 1
+  cpu_offload_gb: 16
+  extra_args: []
+sandbox:
+  kind: bwrap_rootfs
+  rootfs_ref: rootfs://monarch-default
+  cwd: /workspace/monarch
+  network: host_loopback_required
+  gpu: required
+  sglang:
+    venv_path: /cache/glm52/venvs/sglang
+    hf_home: /cache/glm52/hf-home
+    cache: /cache/glm52/sglang
+    telemetry_root: /workspace/monarch/.scratch/glm52-local-serving/run
+observability:
+  debug_mode: false
+  leave_running_on_failure: false
+  log_level: info
+  telemetry:
+    local_artifacts: true
+    remote_export: false
+local_paths:
+  results_root: repo://glm52-serving-results
+  scratch_root: repo://.scratch/glm52-local-serving
+  cache_root: cache://glm52-local-serving
+  temp_root: temp://glm52-local-serving
+probes:
+  startup_timeout_seconds: 900
+  models_required: true
+  chat_required: true
+  chat_template_kwargs:
+    enable_thinking: false
+repeatability:
+  cycles: 3
+"""
+
+VALID_DECLARED_WITH_OVERLAY = VALID_DECLARED
+
+VALID_LOCAL_ENV = """\
+schema_version: 1
+roots:
+  repo: /repo/monarch
+  cache: /repo/monarch/.scratch/glm52-local-serving/cache
+  temp: /repo/monarch/.scratch/glm52-local-serving/tmp
+rootfs:
+  monarch-default: /repo/monarch/scripts/rootfs/rootfs
+"""
+
+
+def write_local_environment(tmp_path: Path) -> Path:
+    return write_spec(
+        tmp_path / "local-env.yaml",
+        f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+    )
+
+
+def materialized_config_for_test(tmp_path: Path, *, port: int):
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY))
+    local_env = load_local_environment(write_local_environment(tmp_path))
+    return materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=port,
+    )
+
+
+def test_load_yaml_mapping_rejects_non_mapping_documents(tmp_path: Path) -> None:
+    path = write_spec(tmp_path / "list.yaml", "- one\n")
+
+    with pytest.raises(RuntimeConfigError, match="must be a mapping"):
+        load_yaml_mapping(path)
+
+
+def test_load_declared_spec_accepts_complete_spec(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+
+    assert isinstance(declared, DeclaredSglangLaunchSpec)
+    assert declared.run_group == "glm52-sglang-local"
+    assert declared.fail_fast is True
+    assert declared.allow_fallback is False
+    assert declared.port_policy.mode == "strict_run_owned_range"
+    assert declared.port_policy.range_start == 19000
+    assert {8000, 8080, 18080}.issubset(set(declared.port_policy.disallowed_ports))
+    assert declared.model.served_model_name == "zai-org/GLM-5.2"
+    assert declared.model.served_model_name in declared.model.expected_model_ids
+    assert declared.runtime.kind == "sglang_openai"
+    assert declared.runtime.context_length == 262144
+    assert declared.runtime.kv_cache_dtype == "fp8_e4m3"
+    assert declared.runtime.mem_fraction_static == 0.72
+    assert declared.runtime.max_total_tokens == 32768
+    assert declared.runtime.max_running_requests == 1
+    assert declared.runtime.cpu_offload_gb == 16
+    assert declared.sandbox.kind == "bwrap_rootfs"
+    assert declared.sandbox.sglang.venv_path == "/cache/glm52/venvs/sglang"
+    assert declared.sandbox.sglang.hf_home == "/cache/glm52/hf-home"
+    assert declared.sandbox.sglang.sglang_cache == "/cache/glm52/sglang"
+    assert declared.sandbox.sglang.telemetry_root == "/workspace/monarch/.scratch/glm52-local-serving/run"
+    assert declared.observability.debug_mode is False
+    assert declared.observability.leave_running_on_failure is False
+    assert declared.local_paths.results_root == "repo://glm52-serving-results"
+    assert declared.repeatability.cycles == 3
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement", "match"),
+    [
+        ("fail_fast: true", "fail_fast: false", "fail_fast must be true"),
+        ("allow_fallback: false", "allow_fallback: true", "allow_fallback must be false"),
+        ("  id: zai-org/GLM-5.2\n", "", "model.id is required"),
+        ("  path: zai-org/GLM-5.2\n", "", "model.path is required"),
+        ("  served_model_name: zai-org/GLM-5.2\n", "", "model.served_model_name is required"),
+        (
+            "expected_model_ids: [zai-org/GLM-5.2]",
+            "expected_model_ids: []",
+            "expected_model_ids must include served_model_name",
+        ),
+        ("mode: strict_run_owned_range", "mode: best_effort", "port_policy.mode must be strict_run_owned_range"),
+        (
+            "disallowed_ports: [8000, 8080, 18080]",
+            "disallowed_ports: [8080]",
+            "disallowed_ports must include",
+        ),
+        ("kind: sglang_openai", "kind: other_openai", "runtime.kind must be sglang_openai"),
+        ("kind: bwrap_rootfs", "kind: host", "sandbox.kind must be bwrap_rootfs"),
+        (
+            "    venv_path: /cache/glm52/venvs/sglang\n",
+            "",
+            "sandbox.sglang.venv_path is required",
+        ),
+        ("  debug_mode: false\n", "", "observability.debug_mode is required"),
+        (
+            "  leave_running_on_failure: false\n",
+            "",
+            "observability.leave_running_on_failure is required",
+        ),
+        (
+            "  leave_running_on_failure: false\n",
+            "  leave_running_on_failure: true\n",
+            "leave_running_on_failure requires debug_mode",
+        ),
+        (
+            "results_root: repo://glm52-serving-results",
+            "results_root: /tmp/glm52",
+            "must use logical path refs",
+        ),
+        ("  mem_fraction_static: 0.72\n", "  mem_fraction_static: 1.5\n", "runtime.mem_fraction_static must be between 0 and 1"),
+        ("  max_total_tokens: 32768\n", "  max_total_tokens: 0\n", "runtime.max_total_tokens must be positive"),
+        ("  max_running_requests: 1\n", "  max_running_requests: 0\n", "runtime.max_running_requests must be positive"),
+        ("  cpu_offload_gb: 16\n", "  cpu_offload_gb: -1\n", "runtime.cpu_offload_gb must be non-negative"),
+    ],
+)
+def test_load_declared_spec_rejects_invalid_policy(
+    tmp_path: Path,
+    needle: str,
+    replacement: str,
+    match: str,
+) -> None:
+    invalid = VALID_DECLARED.replace(needle, replacement)
+
+    with pytest.raises(RuntimeConfigError, match=match):
+        load_declared_spec(write_spec(tmp_path / "declared.yaml", invalid))
+
+
+def test_load_declared_spec_rejects_unknown_fields(tmp_path: Path) -> None:
+    invalid = VALID_DECLARED + "surprise: true\n"
+
+    with pytest.raises(RuntimeConfigError, match="unknown field"):
+        load_declared_spec(write_spec(tmp_path / "declared.yaml", invalid))
+
+
+def test_materialized_config_contains_sglang_rootfs_overlay(tmp_path: Path) -> None:
+    declared_path = write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)
+    local_env_path = write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV)
+
+    declared = load_declared_spec(declared_path)
+    local_env = load_local_environment(local_env_path)
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="overlay-test",
+        port=19017,
+    )
+
+    assert config.sandbox["sglang"]["venv_path"] == "/cache/glm52/venvs/sglang"
+    assert config.sandbox["sglang"]["hf_home"] == "/cache/glm52/hf-home"
+    assert config.sandbox["sglang"]["cache"] == "/cache/glm52/sglang"
+    assert config.launch["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert config.launch["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+
+
+def test_declared_example_contains_sglang_rootfs_overlay(tmp_path: Path) -> None:
+    declared_path = Path(__file__).resolve().parents[2] / ".scratch" / "glm52-local-serving" / "config" / "sglang-local.yaml"
+    local_env_path = write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV)
+
+    declared = load_declared_spec(declared_path)
+    local_env = load_local_environment(local_env_path)
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="overlay-test",
+        port=19017,
+    )
+
+    assert config.sandbox["sglang"] == {
+        "venv_path": "/cache/glm52/venvs/sglang",
+        "python": "/cache/glm52/venvs/sglang/bin/python",
+        "hf_home": "/cache/glm52/hf-home",
+        "cache": "/cache/glm52/sglang",
+        "telemetry_root": "/workspace/monarch/.scratch/glm52-local-serving/run",
+    }
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement", "match"),
+    [
+        (
+            "/cache/glm52/venvs/sglang",
+            "/workspace/monarch/.venv-rootfs",
+            "venv_path must be /cache/glm52/venvs/sglang",
+        ),
+        (
+            "/cache/glm52/hf-home",
+            "/workspace/monarch/.cache/huggingface",
+            "hf_home must be /cache/glm52/hf-home",
+        ),
+        ("cache_root: cache://glm52-local-serving", "cache_root: /tmp/glm52", "must use logical path refs"),
+        ("    cache: /cache/glm52/sglang\n", "", "sandbox.sglang.cache is required"),
+    ],
+)
+def test_declared_overlay_rejects_invalid_paths(
+    tmp_path: Path,
+    needle: str,
+    replacement: str,
+    match: str,
+) -> None:
+    declared_path = write_spec(
+        tmp_path / "declared.yaml",
+        VALID_DECLARED_WITH_OVERLAY.replace(needle, replacement),
+    )
+
+    with pytest.raises(RuntimeConfigError, match=match):
+        load_declared_spec(declared_path)
+
+
+def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    emitted_plans: list[dict[str, object]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        inner = argv[argv.index("--") + 1 :]
+        if inner[:2] == ["uv", "venv"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
+        if inner[:5] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "uv", "pip", "install"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="installed sglang\n", stderr="")
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.SGLANG_VENV_PROBE_SCRIPT]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    '{"python": "/cache/glm52/venvs/sglang/bin/python", '
+                    '"sys_prefix": "/cache/glm52/venvs/sglang", '
+                    '"packages": {"sglang": "0.4.0"}}'
+                ),
+                stderr="",
+            )
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "sglang.launch_server"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="usage: --served-model-name NAME\n", stderr="")
+        raise AssertionError(f"unexpected command: {inner}")
+
+    record = prepare_sglang_venv(
+        declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+        local_environment_path=write_local_environment(tmp_path),
+        run_id="prepare-venv-test",
+        run=fake_run,
+        plan_emitter=lambda config, inner_argv, env=None: (
+            emitted_plans.append({**valid_emitted_preparation_plan(config, inner_argv, env=env), "emitted_marker": "venv-plan"})
+            or emitted_plans[-1]
+        ),
+    )
+
+    flattened_calls = [" ".join(call) for call in calls]
+    assert any("/cache/glm52/venvs/sglang" in call for call in flattened_calls)
+    assert any("sglang[all]" in call for call in flattened_calls)
+    assert record["venv"]["python"] == "/cache/glm52/venvs/sglang/bin/python"
+    assert record["venv"]["sys_prefix"] == "/cache/glm52/venvs/sglang"
+    assert record["venv"]["installed_packages"]["sglang"] == "0.4.0"
+    assert record["bwrap_plan"]["plan_sha256"] == glm52_sglang_runtime._stable_json_digest(emitted_plans[0])
+
+
+def test_prepare_model_cache_uses_rootfs_hf_home(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    validator_paths: list[Path] = []
+    emitted_plans: list[dict[str, object]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"snapshot_path": "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc"}',
+            stderr="",
+        )
+
+    record = prepare_model_cache(
+        declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+        local_environment_path=write_local_environment(tmp_path),
+        run_id="prepare-model-test",
+        run=fake_run,
+        snapshot_validator=lambda path: (
+            validator_paths.append(path)
+            or {"snapshot_path": str(path), "shard_count": 1, "missing_shard_count": 0}
+        ),
+        plan_emitter=lambda config, inner_argv, env=None: (
+            emitted_plans.append({**valid_emitted_preparation_plan(config, inner_argv, env=env), "emitted_marker": "model-plan"})
+            or emitted_plans[-1]
+        ),
+    )
+
+    assert len(calls) == 1
+    command = calls[0][calls[0].index("--") + 1 :]
+    assert command[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.MODEL_CACHE_PREPARE_SCRIPT]
+    assert command[3:] == ["zai-org/GLM-5.2"]
+    assert validator_paths
+    assert not str(validator_paths[0]).startswith("/cache/")
+    assert str(validator_paths[0]).endswith("hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc")
+    assert record["model_cache"]["missing_shard_count"] == 0
+    assert record["bwrap_plan"]["plan_sha256"] == glm52_sglang_runtime._stable_json_digest(emitted_plans[0])
+
+
+def test_prepare_sglang_venv_rejects_emitted_plan_drift_before_install(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def drifted_plan(config, inner_argv, env=None):
+        plan = valid_emitted_preparation_plan(config, inner_argv, env=env)
+        plan["env"] = {**plan["env"], "HF_HOME": "/cache/glm52/drifted-hf"}
+        return plan
+
+    with pytest.raises(RuntimeConfigError, match="rootfs plan HF_HOME does not match materialized config"):
+        prepare_sglang_venv(
+            declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+            local_environment_path=write_local_environment(tmp_path),
+            run_id="prepare-venv-test",
+            run=fake_run,
+            plan_emitter=drifted_plan,
+        )
+
+    assert calls == []
+
+
+def test_prepare_model_cache_rejects_emitted_plan_drift_before_download(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def drifted_plan(config, inner_argv, env=None):
+        plan = valid_emitted_preparation_plan(config, inner_argv, env=env)
+        plan["env"] = {**plan["env"], "SGLANG_CACHE_DIR": "/cache/glm52/drifted-sglang"}
+        return plan
+
+    with pytest.raises(RuntimeConfigError, match="rootfs plan SGLANG_CACHE_DIR does not match materialized config"):
+        prepare_model_cache(
+            declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+            local_environment_path=write_local_environment(tmp_path),
+            run_id="prepare-model-test",
+            run=fake_run,
+            snapshot_validator=lambda path: {"snapshot_path": str(path), "shard_count": 1, "missing_shard_count": 0},
+            plan_emitter=drifted_plan,
+        )
+
+    assert calls == []
+
+
+def test_validate_preparation_records_rejects_plan_digest_mismatch(tmp_path: Path) -> None:
+    config = materialized_config_for_test(tmp_path, port=19021)
+    expected_rootfs = glm52_sglang_runtime._rootfs_recipe_digest(config)
+    records = {
+        "sglang_venv_record": {
+            "schema_version": 1,
+            "run_id": config.run_id,
+            "venv": {
+                "path": "/cache/glm52/venvs/sglang",
+                "python": "/cache/glm52/venvs/sglang/bin/python",
+                "packages": ["sglang[all]"],
+            },
+            "rootfs": {"recipe_sha256": expected_rootfs},
+            "bwrap_plan": {"plan_sha256": "wrong"},
+            "checks": {"served_model_name_flag": True},
+        },
+        "model_cache_record": {
+            "schema_version": 1,
+            "run_id": config.run_id,
+            "model_cache": {
+                "model_id": "zai-org/GLM-5.2",
+                "snapshot_path": "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc",
+                "shard_count": 1,
+                "missing_shard_count": 0,
+            },
+            "rootfs": {"recipe_sha256": expected_rootfs},
+            "bwrap_plan": {
+                "plan_sha256": glm52_sglang_runtime._preparation_plan_digest_for(
+                    config,
+                    glm52_sglang_runtime._model_cache_prepare_command(config),
+                    env=glm52_sglang_runtime._model_cache_prepare_env(),
+                )
+            },
+        },
+    }
+    for name, record in records.items():
+        path = glm52_sglang_runtime._preparation_record_path(config, name)
+        glm52_sglang_runtime._write_json(path, record)
+
+    with pytest.raises(RuntimeConfigError, match="bwrap plan digest mismatch"):
+        validate_preparation_records(config=config)
+
+
+def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path: Path) -> None:
+    declared_path = write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)
+    local_environment_path = write_local_environment(tmp_path)
+
+    def fake_venv_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        inner = argv[argv.index("--") + 1 :]
+        if inner[:2] == ["uv", "venv"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
+        if inner[:5] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "uv", "pip", "install"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="installed sglang\n", stderr="")
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.SGLANG_VENV_PROBE_SCRIPT]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    '{"python": "/cache/glm52/venvs/sglang/bin/python", '
+                    '"sys_prefix": "/cache/glm52/venvs/sglang", '
+                    '"packages": {"sglang": "0.4.0"}}'
+                ),
+                stderr="",
+            )
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "sglang.launch_server"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="usage: --served-model-name NAME\n", stderr="")
+        raise AssertionError(f"unexpected venv command: {inner}")
+
+    prepare_sglang_venv(
+        declared_path=declared_path,
+        local_environment_path=local_environment_path,
+        run_id="prepare-generated",
+        run=fake_venv_run,
+        plan_emitter=lambda config, inner_argv, env=None: valid_emitted_preparation_plan(config, inner_argv, env=env),
+    )
+
+    prepare_model_cache(
+        declared_path=declared_path,
+        local_environment_path=local_environment_path,
+        run_id="prepare-generated",
+        run=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"snapshot_path": "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc"}',
+            stderr="",
+        ),
+        snapshot_validator=lambda path: {"snapshot_path": str(path), "shard_count": 1, "missing_shard_count": 0},
+        plan_emitter=lambda config, inner_argv, env=None: valid_emitted_preparation_plan(config, inner_argv, env=env),
+    )
+
+    config = materialize_runtime_config(
+        declared=load_declared_spec(declared_path),
+        local_environment=load_local_environment(local_environment_path),
+        run_id="prepare-generated",
+        port=19000,
+    )
+
+    records = validate_preparation_records(config=config)
+
+    assert records["sglang_venv"]["run_id"] == "prepare-generated"
+    assert records["model_cache"]["run_id"] == "prepare-generated"
+
+
+def test_validate_preparation_records_rejects_missing_records(tmp_path: Path) -> None:
+    config = materialized_config_for_test(tmp_path, port=19021)
+
+    with pytest.raises(RuntimeConfigError, match="missing SGLang venv preparation record"):
+        validate_preparation_records(config=config)
+
+
+def test_repeatability_rejects_default_ports(tmp_path: Path) -> None:
+    declared_path = write_spec(
+        tmp_path / "declared.yaml",
+        VALID_DECLARED_WITH_OVERLAY.replace("range_start: 19000", "range_start: 8000").replace(
+            "range_end: 19100",
+            "range_end: 8000",
+        ),
+    )
+
+    with pytest.raises(RuntimeConfigError, match="disallowed port"):
+        glm52_sglang_runtime.run_repeatability_cycles(
+            declared_path=declared_path,
+            local_environment_path=write_local_environment(tmp_path),
+            run_id="bad-port",
+        )
+
+
+def test_launch_cycle_rejects_inner_argv_drift(tmp_path: Path) -> None:
+    config = materialized_config_for_test(tmp_path, port=19031)
+    drifted = config.replace_launch_inner(config.launch["inner_argv"] + ["--port", "8000"])
+
+    with pytest.raises(RuntimeConfigError, match="inner argv mismatch"):
+        validate_materialized_config(drifted)
+
+
+def test_launch_failure_tears_down_when_debug_disabled(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    def fake_launch(config: MaterializedSglangRuntimeConfig) -> Any:
+        events.append("launch")
+        return glm52_sglang_runtime.ProcessRecord(
+            pid=1234,
+            pgid=1234,
+            argv=config.launch["inner_argv"],
+            port=config.service["port"],
+        )
+
+    def fake_probe(config: MaterializedSglangRuntimeConfig) -> None:
+        events.append("probe")
+        raise RuntimeLaunchError("probe failed")
+
+    def fake_teardown(record: Any) -> dict[str, Any]:
+        events.append("teardown")
+        return {"ok": True, "port_closed": True, "process_gone": True}
+
+    original_preflight = glm52_sglang_runtime.preflight_model_cache
+    glm52_sglang_runtime.preflight_model_cache = lambda config: {
+        "model_cache": {"snapshot_path": "/cache/glm52/hf-home/snapshots/fake", "missing_shard_count": 0}
+    }
+    with pytest.raises(RuntimeLaunchError, match="probe failed"):
+        try:
+            glm52_sglang_runtime.run_one_cycle(
+                config=materialized_config_for_test(tmp_path, port=19032),
+                launch=fake_launch,
+                probe=fake_probe,
+                teardown=fake_teardown,
+            )
+        finally:
+            glm52_sglang_runtime.preflight_model_cache = original_preflight
+
+    assert events == ["launch", "probe", "teardown"]
+
+
+def test_launch_uses_prepared_model_snapshot_in_actual_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = materialized_config_for_test(tmp_path, port=19033)
+    launched: list[MaterializedSglangRuntimeConfig] = []
+
+    def fake_preflight_model_cache(_config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+        return {
+            "model_cache": {
+                "snapshot_path": "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc123",
+                "missing_shard_count": 0,
+            }
+        }
+
+    def fake_launch(cycle_config: MaterializedSglangRuntimeConfig) -> Any:
+        launched.append(cycle_config)
+        return glm52_sglang_runtime.ProcessRecord(
+            pid=1234,
+            pgid=1234,
+            argv=cycle_config.launch["inner_argv"],
+            port=cycle_config.service["port"],
+        )
+
+    monkeypatch.setattr(glm52_sglang_runtime, "preflight_model_cache", fake_preflight_model_cache)
+
+    result = glm52_sglang_runtime.run_one_cycle(
+        config=config,
+        launch=fake_launch,
+        probe=lambda _config: {"ok": True},
+        teardown=lambda _record: {"ok": True, "port_closed": True, "process_gone": True},
+    )
+
+    assert result["ok"] is True
+    assert launched
+    effective = launched[0]
+    assert effective.model["path"] == "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc123"
+    assert glm52_sglang_runtime._argv_value(effective.launch["inner_argv"], "--model-path") == effective.model["path"]
+    assert "zai-org/GLM-5.2" != effective.model["path"]
+
+
+def test_launch_runtime_probe_failure_uses_recorded_teardown_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_local_environment(tmp_path))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-probe-failure",
+        port=19034,
+    )
+    teardown_configs: list[MaterializedSglangRuntimeConfig] = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise AssertionError("launch_runtime must not use direct process termination after recording process")
+
+        def wait(self, timeout=None):
+            raise AssertionError("launch_runtime must not wait through direct process termination")
+
+    monkeypatch.setattr(glm52_sglang_runtime, "run_sglang_help_preflight", lambda _config: "--served-model-name")
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "emit_and_load_rootfs_plan",
+        lambda cycle_config, *, resolved_plan_path: valid_rootfs_plan(cycle_config),
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "preflight_model_cache",
+        lambda _config: {"model_cache": {"snapshot_path": "/cache/glm52/hf-home/snapshots/abc123"}},
+    )
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "wait_for_models_probe",
+        lambda _config, *, process=None: (_ for _ in ()).throw(RuntimeConfigError("model identity mismatch")),
+    )
+
+    def fake_teardown_runtime(cycle_config, *, local_environment):
+        teardown_configs.append(cycle_config)
+        record_path = Path(
+            glm52_sglang_runtime._resolve_host_path_ref(
+                cycle_config,
+                cycle_config.artifacts["process_record"],
+            )
+        )
+        record = load_yaml_mapping(record_path)
+        assert "sglang.launch_server" in record["inner_argv"]
+        assert glm52_sglang_runtime._argv_value(record["inner_argv"], "--port") == str(cycle_config.service["port"])
+        summary_path = Path(
+            glm52_sglang_runtime._resolve_host_path_ref(
+                cycle_config,
+                cycle_config.artifacts["teardown_summary"],
+            )
+        )
+        glm52_sglang_runtime._write_json(
+            summary_path,
+            {"status": "teardown_passed", "run_id": cycle_config.run_id, "port": cycle_config.service["port"]},
+        )
+        return {"status": "teardown_passed", "run_id": cycle_config.run_id, "port": cycle_config.service["port"]}
+
+    monkeypatch.setattr(glm52_sglang_runtime, "teardown_runtime", fake_teardown_runtime)
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "terminate_process",
+        lambda _process: (_ for _ in ()).throw(AssertionError("direct terminate_process path used")),
+    )
+
+    with pytest.raises(RuntimeConfigError, match="model identity mismatch"):
+        glm52_sglang_runtime.launch_runtime(config, local_environment=local_env)
+
+    assert len(teardown_configs) == 1
+    assert teardown_configs[0].model["path"] == "/cache/glm52/hf-home/snapshots/abc123"
+    run_dir = tmp_path / "repo" / "glm52-serving-results" / config.run_id
+    launch_summary = glm52_sglang_runtime._load_json_mapping(run_dir / "launch-summary.json")
+    teardown_summary = glm52_sglang_runtime._load_json_mapping(run_dir / "teardown-summary.json")
+    assert launch_summary["teardown_action"] == "teardown_runtime"
+    assert teardown_summary["status"] == "teardown_passed"
+
+
+def test_repeatability_summary_uses_ok_contract(tmp_path: Path) -> None:
+    ports: list[int] = []
+
+    def fake_run_one_cycle(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+        ports.append(config.service["port"])
+        return {"ok": True, "port": config.service["port"]}
+
+    summary = glm52_sglang_runtime.run_repeatability_cycles(
+        declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+        local_environment_path=write_local_environment(tmp_path),
+        run_id="glm52-sglang-repeatability",
+        run_one_cycle=fake_run_one_cycle,
+        preparation_validator=lambda config: {"ok": True},
+    )
+
+    assert summary == {
+        "schema_version": 1,
+        "run_id": "glm52-sglang-repeatability",
+        "ok": True,
+        "cycles": [
+            {"cycle": 1, "ok": True, "port": 19000},
+            {"cycle": 2, "ok": True, "port": 19001},
+            {"cycle": 3, "ok": True, "port": 19002},
+        ],
+    }
+    assert ports == [19000, 19001, 19002]
+
+
+def test_repeatability_consumes_stable_prepare_records(tmp_path: Path) -> None:
+    validated_paths: list[dict[str, str]] = []
+
+    def fake_validate(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+        validated_paths.append(dict(config.resolved_paths["preparation"]))
+        return {"sglang_venv": {"ok": True}, "model_cache": {"ok": True}}
+
+    def fake_run_one_cycle(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+        return {"ok": True, "port": config.service["port"]}
+
+    glm52_sglang_runtime.run_repeatability_cycles(
+        declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+        local_environment_path=write_local_environment(tmp_path),
+        run_id="glm52-sglang-repeatability",
+        cycles=1,
+        run_one_cycle=fake_run_one_cycle,
+        preparation_validator=fake_validate,
+    )
+
+    assert validated_paths == [
+        {
+            "sglang_venv_record": str(tmp_path / "repo" / "glm52-serving-results" / "prepare-venv" / "sglang-venv.json"),
+            "model_cache_record": str(tmp_path / "repo" / "glm52-serving-results" / "prepare-model" / "model-cache.json"),
+        }
+    ]
+
+
+def test_repeatability_raises_when_cycle_returns_not_ok(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeConfigError, match="repeatability cycle 1 returned ok=false"):
+        glm52_sglang_runtime.run_repeatability_cycles(
+            declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+            local_environment_path=write_local_environment(tmp_path),
+            run_id="glm52-sglang-repeatability",
+            cycles=1,
+            run_one_cycle=lambda config: {"ok": False, "port": config.service["port"]},
+            preparation_validator=lambda config: {"ok": True},
+        )
+
+
+def test_repeatability_cli_returns_nonzero_when_cycle_returns_not_ok(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)
+    local_env = write_local_environment(tmp_path)
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "run_one_cycle",
+        lambda config: {"ok": False, "port": config.service["port"]},
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "validate_preparation_records",
+        lambda *, config: {"ok": True},
+    )
+
+    rc = main(
+        [
+            "repeatability",
+            "--declared",
+            str(declared),
+            "--local-env",
+            str(local_env),
+            "--run-id",
+            "cli-repeat-not-ok",
+            "--cycles",
+            "1",
+        ]
+    )
+
+    assert rc == 2
+
+
+def test_cli_accepts_repeatability_command(tmp_path: Path) -> None:
+    exit_code = main(
+        [
+            "repeatability",
+            "--declared",
+            str(write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)),
+            "--local-env",
+            str(write_local_environment(tmp_path)),
+            "--run-id",
+            "cli-repeat",
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 0
+
+
+def test_runtime_launch_error_is_public_exception_type() -> None:
+    assert issubclass(RuntimeLaunchError, RuntimeError)
+
+
+def test_validate_sglang_help_requires_served_model_name_flag() -> None:
+    validate_sglang_help("usage: launch_server --model-path X --served-model-name NAME\n")
+
+    with pytest.raises(RuntimeConfigError, match="--served-model-name"):
+        validate_sglang_help("usage: launch_server --model-path X\n")
+
+
+def test_parse_models_response_accepts_served_model_name() -> None:
+    parsed = parse_models_response(
+        b'{"object":"list","data":[{"id":"zai-org/GLM-5.2"}]}',
+        expected_model_ids=["zai-org/GLM-5.2"],
+        served_model_name="zai-org/GLM-5.2",
+    )
+
+    assert parsed["models"] == ["zai-org/GLM-5.2"]
+
+
+def test_parse_models_response_rejects_path_identity_when_served_name_expected() -> None:
+    with pytest.raises(RuntimeConfigError, match="model identity mismatch"):
+        parse_models_response(
+            b'{"object":"list","data":[{"id":"/models/glm52"}]}',
+            expected_model_ids=["zai-org/GLM-5.2"],
+            served_model_name="zai-org/GLM-5.2",
+        )
+
+
+def test_parse_models_response_rejects_missing_expected_model_intersection() -> None:
+    with pytest.raises(RuntimeConfigError, match="model identity mismatch"):
+        parse_models_response(
+            b'{"object":"list","data":[{"id":"zai-org/GLM-5.2"}]}',
+            expected_model_ids=["other-model"],
+            served_model_name="zai-org/GLM-5.2",
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json",
+        b'{"object":"list","data":[]}',
+        b'{"object":"list","data":{"id":"zai-org/GLM-5.2"}}',
+    ],
+)
+def test_parse_models_response_rejects_invalid_models_payload(body: bytes) -> None:
+    with pytest.raises(RuntimeConfigError):
+        parse_models_response(
+            body,
+            expected_model_ids=["zai-org/GLM-5.2"],
+            served_model_name="zai-org/GLM-5.2",
+        )
+
+
+def test_parse_models_response_collects_only_string_model_ids() -> None:
+    parsed = parse_models_response(
+        b'{"object":"list","data":[{"id":17},{"id":"zai-org/GLM-5.2"},{"object":"model"}]}',
+        expected_model_ids=["zai-org/GLM-5.2"],
+        served_model_name="zai-org/GLM-5.2",
+    )
+
+    assert parsed["models"] == ["zai-org/GLM-5.2"]
+
+
+def test_validate_model_snapshot_requires_all_indexed_shards(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "model-00001-of-00002.safetensors").write_text("shard")
+    (snapshot / "model.safetensors.index.json").write_text(
+        glm52_sglang_runtime.json.dumps(
+            {
+                "metadata": {"total_size": 123},
+                "weight_map": {
+                    "layer.0": "model-00001-of-00002.safetensors",
+                    "layer.1": "model-00002-of-00002.safetensors",
+                },
+            }
+        )
+    )
+
+    with pytest.raises(RuntimeConfigError, match="references 1 shard file"):
+        validate_model_snapshot(snapshot)
+
+    (snapshot / "model-00002-of-00002.safetensors").write_text("shard")
+    evidence = validate_model_snapshot(snapshot)
+
+    assert evidence["status"] == "complete"
+    assert evidence["referenced_shard_count"] == 2
+    assert evidence["missing_shard_count"] == 0
+
+
+def test_load_local_environment_accepts_absolute_host_paths(tmp_path: Path) -> None:
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    assert local_env.repo == "/repo/monarch"
+    assert local_env.cache == "/repo/monarch/.scratch/glm52-local-serving/cache"
+    assert local_env.temp == "/repo/monarch/.scratch/glm52-local-serving/tmp"
+    assert local_env.rootfs["monarch-default"] == "/repo/monarch/scripts/rootfs/rootfs"
+
+
+def test_materialize_runtime_config_writes_custom_port_everywhere(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+
+    assert config.service["port"] == 19017
+    assert config.service["base_url"] == "http://127.0.0.1:19017/v1"
+    assert config.probes["models_url"] == "http://127.0.0.1:19017/v1/models"
+    assert config.probes["chat_url"] == "http://127.0.0.1:19017/v1/chat/completions"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--port") + 1] == "19017"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--host") + 1] == "127.0.0.1"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--served-model-name") + 1] == "zai-org/GLM-5.2"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--context-length") + 1] == "262144"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--kv-cache-dtype") + 1] == "fp8_e4m3"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--mem-fraction-static") + 1] == "0.72"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--max-total-tokens") + 1] == "32768"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--max-running-requests") + 1] == "1"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--cpu-offload-gb") + 1] == "16"
+    assert config.runtime["context_length"] == 262144
+    assert config.runtime["kv_cache_dtype"] == "fp8_e4m3"
+    assert config.runtime["mem_fraction_static"] == 0.72
+    assert config.runtime["max_total_tokens"] == 32768
+    assert config.runtime["max_running_requests"] == 1
+    assert config.runtime["cpu_offload_gb"] == 16
+    assert config.launch["outer_argv"][1] == "--repo-readonly"
+    assert config.launch["outer_argv"][config.launch["outer_argv"].index("--emit-plan") + 1] == "run://sandbox/resolved-bwrap-plan.yaml"
+    assert config.launch["outer_argv"].index("--emit-plan") < config.launch["outer_argv"].index("--")
+    concrete_ports = {
+        config.service["port"],
+        int(config.launch["inner_argv"][config.launch["inner_argv"].index("--port") + 1]),
+        int(config.launch["outer_argv"][config.launch["outer_argv"].index("--port") + 1]),
+    }
+    assert concrete_ports == {19017}
+    assert concrete_ports.isdisjoint({8000, 8080, 18080})
+    assert config.host_layout["run_dir"].startswith("repo://glm52-serving-results/glm52-sglang-local-001")
+    assert all(not value.startswith("/") for value in config.host_layout.values())
+    assert config.resolved_paths["repo"] == "/repo/monarch"
+    assert config.resolved_paths["cache"] == "/repo/monarch/.scratch/glm52-local-serving/cache"
+    assert config.resolved_paths["temp"] == "/repo/monarch/.scratch/glm52-local-serving/tmp"
+    assert config.resolved_paths["rootfs"]["monarch-default"] == "/repo/monarch/scripts/rootfs/rootfs"
+    assert set(config.to_mapping()) == {
+        "schema_version",
+        "run_id",
+        "run_group",
+        "fail_fast",
+        "allow_fallback",
+        "service",
+        "model",
+        "runtime",
+        "observability",
+        "host_layout",
+        "sandbox",
+        "launch",
+        "probes",
+        "artifacts",
+        "resolved_paths",
+    }
+
+
+def test_materialize_runtime_config_uses_rootfs_owned_sglang_venv(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+
+    assert config.launch["inner_argv"][:3] == [
+        "/cache/glm52/venvs/sglang/bin/python",
+        "-m",
+        "sglang.launch_server",
+    ]
+    assert config.resolved_paths["sglang_venv"] == (
+        "/repo/monarch/.scratch/glm52-local-serving/cache/"
+        "glm52-sglang-local/venvs/sglang"
+    )
+    assert config.launch["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert config.launch["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert config.sandbox["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert config.sandbox["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert all(not value.startswith("/") for value in config.host_layout.values())
+
+
+def test_materialize_runtime_config_passes_glm_mounts_to_rootfs_entrypoint(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+
+    outer = config.launch["outer_argv"]
+    assert "--bind-rw" in outer
+    bind_specs = [
+        outer[index + 1]
+        for index, arg in enumerate(outer)
+        if arg == "--bind-rw"
+    ]
+    assert bind_specs == [
+        "run://:/run/glm52",
+        "temp://glm52-sglang-local-001:/tmp/glm52",
+        "cache://glm52-sglang-local:/cache/glm52",
+        "cache://glm52-sglang-local/venvs/sglang:/cache/glm52/venvs/sglang",
+        "cache://glm52-sglang-local/hf-home:/cache/glm52/hf-home",
+        "cache://glm52-sglang-local/sglang:/cache/glm52/sglang",
+    ]
+    assert outer.index("--bind-rw") < outer.index("--")
+
+
+def test_materialized_config_rejects_port_command_drift(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    inner = list(config.launch["inner_argv"])
+    inner[inner.index("--port") + 1] = "19018"
+    drifted = config.replace_launch_inner(inner)
+
+    with pytest.raises(RuntimeConfigError, match="service.port must match"):
+        validate_materialized_config(drifted)
+
+
+def test_materialized_config_rejects_exact_disallowed_port_drift(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    inner = list(config.launch["inner_argv"])
+    inner[inner.index("--port") + 1] = "8080"
+    probes = dict(config.probes)
+    probes["models_url"] = "http://127.0.0.1:8080/v1/models"
+    probes["chat_url"] = "http://127.0.0.1:8080/v1/chat/completions"
+    drifted = (
+        config.replace_service({"port": 8080, "base_url": "http://127.0.0.1:8080/v1"})
+        .replace_launch_inner(inner)
+        .replace_launch_outer(
+            ["scripts/rootfs/enter_rootfs.sh", "--emit-plan", "run://sandbox/resolved-bwrap-plan.yaml", "--", *inner]
+        )
+        .replace_probes(probes)
+    )
+
+    with pytest.raises(RuntimeConfigError, match="disallowed fallback port"):
+        validate_materialized_config(drifted)
+
+
+def test_materialized_config_rejects_probe_url_port_drift(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    probes = dict(config.probes)
+    probes["models_url"] = "http://127.0.0.1:8000/v1/models"
+    drifted = config.replace_probes(probes)
+
+    with pytest.raises(RuntimeConfigError, match="probe URLs must derive"):
+        validate_materialized_config(drifted)
+
+
+def test_materialized_config_rejects_outer_inner_drift(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    outer = list(config.launch["outer_argv"])
+    outer[-1] = "float16"
+    drifted = config.replace_launch_outer(outer)
+
+    with pytest.raises(RuntimeConfigError, match="outer_argv SGLang tail must equal inner_argv"):
+        validate_materialized_config(drifted)
+
+
+def test_materialized_config_rejects_missing_served_model_name_flag(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    inner = list(config.launch["inner_argv"])
+    index = inner.index("--served-model-name")
+    del inner[index : index + 2]
+    drifted = config.replace_launch_inner(inner).replace_launch_outer(
+        ["scripts/rootfs/enter_rootfs.sh", "--emit-plan", "run://sandbox/resolved-bwrap-plan.yaml", "--", *inner]
+    )
+
+    with pytest.raises(RuntimeConfigError, match="missing --served-model-name"):
+        validate_materialized_config(drifted)
+
+
+def test_materialize_runtime_config_rejects_extra_args_that_override_schema_flags(tmp_path: Path) -> None:
+    declared_text = VALID_DECLARED.replace(
+        "  extra_args: []",
+        '  extra_args: ["--port", "8000", "--served-model-name", "drifted", "--mem-fraction-static", "0.9", "--cpu-offload-gb", "4"]',
+    )
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", declared_text))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    with pytest.raises(RuntimeConfigError, match="runtime.extra_args must not override schema-owned flag"):
+        materialize_runtime_config(
+            declared=declared,
+            local_environment=local_env,
+            run_id="glm52-sglang-local-001",
+            port=19017,
+        )
+
+
+def test_should_teardown_after_failure_defaults_true(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+
+    assert should_teardown_after_failure(config) is True
+
+
+def test_debug_mode_can_leave_process_running_only_when_explicit(tmp_path: Path) -> None:
+    declared_text = VALID_DECLARED.replace("debug_mode: false", "debug_mode: true").replace(
+        "leave_running_on_failure: false",
+        "leave_running_on_failure: true",
+    )
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", declared_text))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-debug",
+        port=19017,
+    )
+
+    assert should_teardown_after_failure(config) is False
+
+
+def test_leave_running_without_debug_is_rejected(tmp_path: Path) -> None:
+    declared_text = VALID_DECLARED.replace(
+        "leave_running_on_failure: false",
+        "leave_running_on_failure: true",
+    )
+
+    with pytest.raises(RuntimeConfigError, match="leave_running_on_failure requires debug_mode"):
+        load_declared_spec(write_spec(tmp_path / "declared.yaml", declared_text))
+
+
+def materialized_for_tests(tmp_path: Path):
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    return materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+
+
+def valid_rootfs_plan(config) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "rootfs": "/repo/monarch/scripts/rootfs/rootfs",
+        "cwd": "/workspace/monarch",
+        "inner_argv": config.launch["inner_argv"],
+        "repo_projection_mode": "ro",
+        "network": "share-net",
+        "gpu": "dev-bind-nvidia-when-present",
+        "env_allowlist": [],
+        "env": config.launch["env"],
+        "mounts": [
+            {"host_path": "/repo/monarch", "sandbox_path": "/workspace/monarch", "mode": "ro"},
+            {
+                "host_path": "/repo/monarch/glm52-serving-results/glm52-sglang-local-001",
+                "sandbox_path": "/run/glm52",
+                "mode": "rw",
+            },
+            {
+                "host_path": "/repo/monarch/.scratch/glm52-local-serving/tmp/glm52-sglang-local-001",
+                "sandbox_path": "/tmp/glm52",
+                "mode": "rw",
+            },
+            {
+                "host_path": "/repo/monarch/.scratch/glm52-local-serving/cache/glm52-sglang-local",
+                "sandbox_path": "/cache/glm52",
+                "mode": "rw",
+            },
+            {
+                "host_path": "/repo/monarch/.scratch/glm52-local-serving/cache/glm52-sglang-local/venvs/sglang",
+                "sandbox_path": "/cache/glm52/venvs/sglang",
+                "mode": "rw",
+            },
+            {
+                "host_path": "/repo/monarch/.scratch/glm52-local-serving/cache/glm52-sglang-local/hf-home",
+                "sandbox_path": "/cache/glm52/hf-home",
+                "mode": "rw",
+            },
+            {
+                "host_path": "/repo/monarch/.scratch/glm52-local-serving/cache/glm52-sglang-local/sglang",
+                "sandbox_path": "/cache/glm52/sglang",
+                "mode": "rw",
+            },
+        ],
+    }
+
+
+def valid_emitted_preparation_plan(config, inner_argv, env=None) -> dict[str, object]:
+    plan = valid_rootfs_plan(config)
+    plan["rootfs"] = glm52_sglang_runtime._resolved_rootfs_path(config)
+    plan["inner_argv"] = list(inner_argv)
+    plan["env"] = {**config.launch["env"], **dict(env or {})}
+    for mount in plan["mounts"]:
+        for expected in config.sandbox["mounts"]:
+            if mount["sandbox_path"] == expected["sandbox_path"]:
+                mount["host_path"] = glm52_sglang_runtime._resolve_host_path_ref(config, expected["host_path_ref"])
+    return plan
+
+
+def test_validate_resolved_rootfs_plan_accepts_matching_plan(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+
+    validate_resolved_rootfs_plan(config=config, plan=valid_rootfs_plan(config))
+
+
+def test_validate_resolved_rootfs_plan_rejects_writable_repo_mount(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["repo_projection_mode"] = "rw"
+
+    with pytest.raises(RuntimeConfigError, match="repo projection must be ro"):
+        validate_resolved_rootfs_plan(config=config, plan=plan)
+
+
+def test_validate_resolved_rootfs_plan_rejects_inner_argv_drift(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["inner_argv"] = ["python", "-m", "sglang.launch_server"]
+
+    with pytest.raises(RuntimeConfigError, match="inner_argv must match"):
+        validate_resolved_rootfs_plan(config=config, plan=plan)
+
+
+def test_validate_resolved_rootfs_plan_rejects_env_drift(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["env"] = {**config.launch["env"], "CUDA_VISIBLE_DEVICES": "0"}
+
+    with pytest.raises(RuntimeConfigError, match="resolved rootfs plan env mismatch: CUDA_VISIBLE_DEVICES"):
+        validate_resolved_rootfs_plan(config=config, plan=plan)
+
+
+def test_validate_resolved_rootfs_plan_rejects_missing_mount(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["mounts"] = [
+        mount
+        for mount in plan["mounts"]
+        if mount["sandbox_path"] != "/cache/glm52"
+    ]
+
+    with pytest.raises(RuntimeConfigError, match="missing sandbox mount: /cache/glm52"):
+        validate_resolved_rootfs_plan(config=config, plan=plan)
+
+
+def test_validate_resolved_rootfs_plan_rejects_host_path_drift(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["mounts"] = [
+        {**mount, "host_path": "/wrong/repo"}
+        if mount["sandbox_path"] == "/workspace/monarch"
+        else mount
+        for mount in plan["mounts"]
+    ]
+
+    with pytest.raises(RuntimeConfigError, match="mount host path mismatch: /workspace/monarch"):
+        validate_resolved_rootfs_plan(config=config, plan=plan)
+
+
+def test_validate_resolved_rootfs_plan_rejects_duplicate_sandbox_path(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    duplicate = {
+        "host_path": "/wrong/repo",
+        "sandbox_path": "/workspace/monarch",
+        "mode": "rw",
+    }
+    plan["mounts"] = [duplicate, *plan["mounts"]]
+
+    with pytest.raises(RuntimeConfigError, match="duplicate sandbox mount: /workspace/monarch"):
+        validate_resolved_rootfs_plan(config=config, plan=plan)
+
+
+def test_validate_sglang_rootfs_overlay_accepts_matching_plan(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+
+    validate_sglang_rootfs_overlay(config=config, plan=valid_rootfs_plan(config))
+
+
+@pytest.mark.parametrize(
+    ("env_key", "value", "match"),
+    [
+        ("HF_HOME", "/cache/glm52/drifted-hf", "rootfs plan HF_HOME does not match materialized config"),
+        ("SGLANG_CACHE_DIR", "/cache/glm52/drifted-sglang", "rootfs plan SGLANG_CACHE_DIR does not match materialized config"),
+    ],
+)
+def test_validate_sglang_rootfs_overlay_rejects_env_drift(
+    tmp_path: Path,
+    env_key: str,
+    value: str,
+    match: str,
+) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["env"] = {**plan["env"], env_key: value}
+
+    with pytest.raises(RuntimeConfigError, match=match):
+        validate_sglang_rootfs_overlay(config=config, plan=plan)
+
+
+def test_validate_sglang_rootfs_overlay_rejects_missing_sglang_mount(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    plan["mounts"] = [
+        mount
+        for mount in plan["mounts"]
+        if mount["sandbox_path"] != "/cache/glm52/hf-home"
+    ]
+
+    with pytest.raises(RuntimeConfigError, match="rootfs plan missing SGLang mount: /cache/glm52/hf-home"):
+        validate_sglang_rootfs_overlay(config=config, plan=plan)
+
+
+def test_validate_sglang_rootfs_overlay_rejects_duplicate_sglang_mount(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+    plan = valid_rootfs_plan(config)
+    duplicate = {
+        "host_path": "/repo/monarch/.scratch/glm52-local-serving/cache/wrong-hf-home",
+        "sandbox_path": "/cache/glm52/hf-home",
+        "mode": "rw",
+    }
+    plan["mounts"] = [duplicate, *plan["mounts"]]
+
+    with pytest.raises(RuntimeConfigError, match="duplicate sandbox mount: /cache/glm52/hf-home"):
+        validate_sglang_rootfs_overlay(config=config, plan=plan)
+
+
+def test_write_and_load_materialized_config_round_trip(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    path = tmp_path / "materialized.yaml"
+
+    write_materialized_config(config, path)
+    loaded = load_materialized_config(path)
+
+    assert loaded == config
+
+
+def test_materialize_cli_writes_config(tmp_path: Path) -> None:
+    declared = write_spec(tmp_path / "declared.yaml", VALID_DECLARED)
+    local_env = write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV)
+    output = tmp_path / "materialized.yaml"
+
+    rc = main(
+        [
+            "materialize",
+            "--declared-spec",
+            str(declared),
+            "--local-environment",
+            str(local_env),
+            "--run-id",
+            "glm52-sglang-local-001",
+            "--port",
+            "19017",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    loaded = load_materialized_config(output)
+    assert loaded.service["port"] == 19017
+
+
+def test_validate_cli_rejects_drifted_materialized_config(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    drifted = config.replace_launch_inner(["python", "-m", "sglang.launch_server"])
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        glm52_sglang_runtime.yaml.safe_dump(
+            glm52_sglang_runtime._config_to_mapping(drifted),
+            sort_keys=False,
+        )
+    )
+
+    rc = main(["validate", "--materialized-config", str(path)])
+
+    assert rc == 2
+
+
+def test_launch_failure_tears_down_when_not_debug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env_path = write_spec(
+        tmp_path / "local-env.yaml",
+        f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "repo" / "scripts" / "rootfs" / "rootfs"}
+""",
+    )
+    local_env = load_local_environment(local_env_path)
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    config_path = tmp_path / "materialized.yaml"
+    write_materialized_config(config, config_path)
+    events: list[str] = []
+    popen_commands: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout=None):
+            events.append("wait")
+            return 0
+
+    def fake_popen(argv, *args, **kwargs):
+        popen_commands.append(list(argv))
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "run_sglang_help_preflight",
+        lambda _config: "--served-model-name",
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "emit_and_load_rootfs_plan",
+        lambda config, *, resolved_plan_path: valid_rootfs_plan(config),
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "preflight_model_cache",
+        lambda _config: {"model_cache": {"snapshot_path": "/cache/glm52/hf-home/snapshots/abc123"}},
+    )
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "wait_for_models_probe",
+        lambda _config, *, process=None: (_ for _ in ()).throw(RuntimeConfigError("model identity mismatch")),
+    )
+
+    def fake_teardown_runtime(cycle_config, *, local_environment):
+        events.append("teardown_runtime")
+        return {"status": "teardown_passed", "run_id": cycle_config.run_id, "port": cycle_config.service["port"]}
+
+    monkeypatch.setattr(glm52_sglang_runtime, "teardown_runtime", fake_teardown_runtime)
+
+    rc = main(
+        [
+            "launch",
+            "--materialized-config",
+            str(config_path),
+            "--local-environment",
+            str(local_env_path),
+        ]
+    )
+
+    assert rc == 2
+    assert events == ["teardown_runtime"]
+    assert popen_commands
+    assert all(not arg.startswith("run://") for arg in popen_commands[0])
+
+
+def test_launch_fails_fast_when_process_exits_before_models_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-crash",
+        port=19017,
+    )
+
+    class FakeProcess:
+        pid = 987654
+
+        def poll(self):
+            return 42
+
+        def terminate(self):
+            raise AssertionError("terminated after process already exited")
+
+        def wait(self, timeout=None):
+            return 42
+
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "run_sglang_help_preflight",
+        lambda _config: "--served-model-name",
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "emit_and_load_rootfs_plan",
+        lambda config, *, resolved_plan_path: valid_rootfs_plan(config),
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "preflight_model_cache",
+        lambda _config: {"model_cache": {"snapshot_path": "/cache/glm52/hf-home/snapshots/abc123"}},
+    )
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(
+        glm52_sglang_runtime.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionRefusedError("refused")),
+    )
+    monkeypatch.setattr(glm52_sglang_runtime.os, "getpgid", lambda _pid: 987654)
+
+    def fake_killpg(pgid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(glm52_sglang_runtime.os, "killpg", fake_killpg)
+
+    with pytest.raises(RuntimeConfigError, match="SGLang process exited before /v1/models became ready"):
+        glm52_sglang_runtime.launch_runtime(config, local_environment=local_env)
+
+    summary = glm52_sglang_runtime._load_json_mapping(
+        tmp_path / "repo" / "glm52-serving-results" / config.run_id / "launch-summary.json"
+    )
+    assert summary["status"] == "launch_failed"
+    assert summary["teardown_action"] == "teardown_runtime"
+
+
+def test_launch_help_preflight_failure_writes_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-preflight-failure",
+        port=19017,
+    )
+
+    def fake_run_sglang_help_preflight(_config):
+        raise RuntimeConfigError("sglang help preflight failed: missing sglang")
+
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "run_sglang_help_preflight",
+        fake_run_sglang_help_preflight,
+    )
+
+    with pytest.raises(RuntimeConfigError, match="missing sglang"):
+        glm52_sglang_runtime.launch_runtime(config, local_environment=local_env)
+
+    run_dir = tmp_path / "repo" / "glm52-serving-results" / config.run_id
+    assert (run_dir / "materialized-sglang-runtime.yaml").exists()
+    assert (run_dir / "resolved-local-paths.yaml").exists()
+    summary = glm52_sglang_runtime._load_json_mapping(run_dir / "launch-summary.json")
+    assert summary["status"] == "launch_failed"
+    assert summary["teardown_action"] == "not_started"
+
+
+def test_launch_fails_before_process_start_when_model_cache_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "run_sglang_help_preflight",
+        lambda _config: "usage: sglang.launch_server --served-model-name NAME\n",
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "emit_and_load_rootfs_plan",
+        lambda _config, *, resolved_plan_path: valid_rootfs_plan(_config),
+    )
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "preflight_model_cache",
+        lambda _config: (_ for _ in ()).throw(RuntimeConfigError("model snapshot is incomplete")),
+    )
+
+    popen_calls: list[object] = []
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        raise AssertionError("launch must not start SGLang with an incomplete model cache")
+
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeConfigError, match="model snapshot is incomplete"):
+        glm52_sglang_runtime.launch_runtime(config, local_environment=local_env)
+
+    assert popen_calls == []
+    run_dir = tmp_path / "repo" / "glm52-serving-results" / config.run_id
+    summary = glm52_sglang_runtime._load_json_mapping(run_dir / "launch-summary.json")
+    assert summary["status"] == "launch_failed"
+    assert summary["teardown_action"] == "not_started"
+
+
+def test_sglang_help_preflight_uses_rootfs_owned_venv_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = "usage: sglang.launch_server --served-model-name NAME\n"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": list(command), **kwargs})
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
+
+    glm52_sglang_runtime.run_sglang_help_preflight(config)
+
+    assert calls
+    command = calls[0]["command"]
+    marker = command.index("--")
+    assert command[marker + 1 : marker + 4] == [
+        "/cache/glm52/venvs/sglang/bin/python",
+        "-m",
+        "sglang.launch_server",
+    ]
+    assert "python" not in command[marker + 1 : marker + 2]
+    assert calls[0]["env"]["UV_CACHE_DIR"] == "/cache/glm52/uv"
+    assert calls[0]["env"]["XDG_CACHE_HOME"] == "/cache/glm52/xdg"
+    assert calls[0]["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert calls[0]["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert calls[0]["env"]["TORCHINDUCTOR_CACHE_DIR"] == "/cache/glm52/torchinductor"
+    assert calls[0]["env"]["TRITON_CACHE_DIR"] == "/cache/glm52/triton"
+    assert calls[0]["env"]["USER"] == "monarch"
+    assert calls[0]["env"]["LOGNAME"] == "monarch"
+
+
+def test_prepare_sglang_venv_cli_installs_and_writes_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = write_spec(tmp_path / "declared.yaml", VALID_DECLARED)
+    local_env = write_spec(
+        tmp_path / "local-env.yaml",
+        f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+    )
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletedProcess:
+        def __init__(self, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": list(command), **kwargs})
+        if kwargs.get("env", {}).get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") == "1":
+            plan_path = Path(command[command.index("--emit-plan") + 1])
+            config = materialize_runtime_config(
+                declared=load_declared_spec(declared),
+                local_environment=load_local_environment(local_env),
+                run_id="prepare-venv",
+                port=19000,
+            )
+            inner = list(command)[list(command).index("--") + 1 :]
+            plan = valid_emitted_preparation_plan(config, inner)
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
+            return FakeCompletedProcess()
+        inner = list(command)[list(command).index("--") + 1 :]
+        if inner[:2] == ["uv", "venv"]:
+            return FakeCompletedProcess("Using Python 3.12\nCreating virtual environment\n")
+        if inner[:5] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "uv", "pip", "install"]:
+            return FakeCompletedProcess("installed sglang\n")
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.SGLANG_VENV_PROBE_SCRIPT]:
+            return FakeCompletedProcess(
+                '{"python":"/cache/glm52/venvs/sglang/bin/python",'
+                '"sys_prefix":"/cache/glm52/venvs/sglang",'
+                '"packages":{"sglang":"0.4.0"}}\n'
+            )
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "sglang.launch_server"]:
+            return FakeCompletedProcess("usage: --served-model-name NAME\n")
+        raise AssertionError(f"unexpected command: {inner}")
+
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(glm52_sglang_runtime, "validate_sglang_help", lambda help_text: None)
+
+    rc = main(
+        [
+            "prepare-venv",
+            "--declared",
+            str(declared),
+            "--local-env",
+            str(local_env),
+        ]
+    )
+
+    assert rc == 0
+    command_calls = [call for call in calls if call["env"].get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") != "1"]
+    assert len(command_calls) == 4
+    venv_call = command_calls[0]["command"][command_calls[0]["command"].index("--") + 1 :]
+    install_call = command_calls[1]["command"][command_calls[1]["command"].index("--") + 1 :]
+    probe_call = command_calls[2]["command"][command_calls[2]["command"].index("--") + 1 :]
+    help_call = command_calls[3]["command"][command_calls[3]["command"].index("--") + 1 :]
+    assert venv_call == [
+        "uv",
+        "venv",
+        "/cache/glm52/venvs/sglang",
+        "--python",
+        "3.12",
+    ]
+    assert install_call == [
+        "/cache/glm52/venvs/sglang/bin/python",
+        "-m",
+        "uv",
+        "pip",
+        "install",
+        "sglang[all]",
+    ]
+    assert probe_call == [
+        "/cache/glm52/venvs/sglang/bin/python",
+        "-c",
+        glm52_sglang_runtime.SGLANG_VENV_PROBE_SCRIPT,
+    ]
+    assert help_call == [
+        "/cache/glm52/venvs/sglang/bin/python",
+        "-m",
+        "sglang.launch_server",
+        "--help",
+    ]
+    for call in command_calls:
+        command = call["command"]
+        assert command[0] == str(tmp_path / "repo" / "scripts" / "rootfs" / "enter_rootfs.sh")
+        assert "--repo-readonly" in command
+        assert "python" not in command
+        assert call["env"]["UV_CACHE_DIR"] == "/cache/glm52/uv"
+        assert call["env"]["TORCHINDUCTOR_CACHE_DIR"] == "/cache/glm52/torchinductor"
+        assert call["env"]["TRITON_CACHE_DIR"] == "/cache/glm52/triton"
+        assert call["env"]["USER"] == "monarch"
+        assert call["env"]["LOGNAME"] == "monarch"
+    evidence = glm52_sglang_runtime._load_json_mapping(
+        tmp_path / "repo" / "glm52-serving-results" / "prepare-venv" / "sglang-venv.json"
+    )
+    assert evidence["run_id"] == "prepare-venv"
+    assert evidence["venv"]["path"] == "/cache/glm52/venvs/sglang"
+    assert evidence["venv"]["python"] == "/cache/glm52/venvs/sglang/bin/python"
+    assert evidence["venv"]["packages"] == ["sglang[all]"]
+    assert evidence["venv"]["sys_prefix"] == "/cache/glm52/venvs/sglang"
+    assert evidence["venv"]["installed_packages"]["sglang"] == "0.4.0"
+    assert evidence["checks"]["served_model_name_flag"] is True
+    assert "plan_sha256" in evidence["bwrap_plan"]
+
+
+def test_prepare_model_cache_cli_downloads_validates_and_writes_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = write_spec(tmp_path / "declared.yaml", VALID_DECLARED)
+    local_env = write_spec(
+        tmp_path / "local-env.yaml",
+        f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+    )
+    snapshot = tmp_path / "cache" / "glm52-sglang-local" / "hf-home" / "hub" / "models--zai-org--GLM-5.2" / "snapshots" / "abc123"
+    calls: list[dict[str, object]] = []
+    validator_paths: list[Path] = []
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": list(command), **kwargs})
+        if kwargs.get("env", {}).get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") == "1":
+            plan_path = Path(command[command.index("--emit-plan") + 1])
+            config = materialize_runtime_config(
+                declared=load_declared_spec(declared),
+                local_environment=load_local_environment(local_env),
+                run_id="prepare-model",
+                port=19000,
+            )
+            inner = list(command)[list(command).index("--") + 1 :]
+            plan = valid_emitted_preparation_plan(config, inner, env={"TRANSFORMERS_CACHE": "/cache/glm52/hf-home"})
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
+            return FakeCompletedProcess('{"snapshot_path": ""}')
+        snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / "model-00001-of-00001.safetensors").write_text("shard")
+        (snapshot / "model.safetensors.index.json").write_text(
+            glm52_sglang_runtime.json.dumps(
+                {
+                    "weight_map": {
+                        "layer.0": "model-00001-of-00001.safetensors",
+                    },
+                }
+            )
+        )
+        return FakeCompletedProcess(f'{{"snapshot_path":"/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc123"}}\n')
+
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "validate_model_snapshot",
+        lambda path: (
+            validator_paths.append(path)
+            or {"snapshot_path": str(path), "referenced_shard_count": 1, "missing_shard_count": 0}
+        ),
+    )
+
+    rc = main(
+        [
+            "prepare-model",
+            "--declared",
+            str(declared),
+            "--local-env",
+            str(local_env),
+        ]
+    )
+
+    assert rc == 0
+    command_calls = [call for call in calls if call["env"].get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") != "1"]
+    assert len(command_calls) == 1
+    command = command_calls[0]["command"][command_calls[0]["command"].index("--") + 1 :]
+    assert command[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.MODEL_CACHE_PREPARE_SCRIPT]
+    assert command[3:] == ["zai-org/GLM-5.2"]
+    assert command_calls[0]["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert command_calls[0]["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert command_calls[0]["env"]["TRANSFORMERS_CACHE"] == "/cache/glm52/hf-home"
+    assert validator_paths == [snapshot]
+    evidence = glm52_sglang_runtime._load_json_mapping(
+        tmp_path / "repo" / "glm52-serving-results" / "prepare-model" / "model-cache.json"
+    )
+    assert evidence["run_id"] == "prepare-model"
+    assert evidence["model_cache"]["model_id"] == "zai-org/GLM-5.2"
+    assert evidence["model_cache"]["snapshot_path"] == "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc123"
+    assert evidence["model_cache"]["shard_count"] == 1
+    assert evidence["model_cache"]["missing_shard_count"] == 0
+    assert "plan_sha256" in evidence["bwrap_plan"]
+
+
+def test_rootfs_plan_emission_uses_materialized_env_cwd_and_rootfs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_HOME", "/ambient/hf")
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    resolved_plan_path = Path(
+        glm52_sglang_runtime._resolve_host_path_ref(
+            config,
+            config.artifacts["resolved_rootfs_plan"],
+        )
+    )
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": list(command), **kwargs})
+        plan = valid_rootfs_plan(config)
+        plan["rootfs"] = str(tmp_path / "rootfs")
+        for mount in plan["mounts"]:
+            for expected in config.sandbox["mounts"]:
+                if mount["sandbox_path"] == expected["sandbox_path"]:
+                    mount["host_path"] = glm52_sglang_runtime._resolve_host_path_ref(
+                        config,
+                        expected["host_path_ref"],
+                    )
+        resolved_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
+
+    emit_and_load_rootfs_plan = glm52_sglang_runtime.emit_and_load_rootfs_plan
+    emit_and_load_rootfs_plan(config, resolved_plan_path=resolved_plan_path)
+
+    assert calls
+    command = calls[0]["command"]
+    assert command[0] == str(tmp_path / "repo" / "scripts" / "rootfs" / "enter_rootfs.sh")
+    assert str(tmp_path / "rootfs") in command
+    assert all(not str(arg).startswith(("run://", "rootfs://")) for arg in command)
+    assert calls[0]["cwd"] == str(tmp_path / "repo")
+    assert calls[0]["env"] == {
+        **glm52_sglang_runtime._runtime_subprocess_env(config),
+        "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("env_key", "value", "match"),
+    [
+        ("HF_HOME", "/cache/glm52/drifted-hf", "rootfs plan HF_HOME does not match materialized config"),
+        ("SGLANG_CACHE_DIR", "/cache/glm52/drifted-sglang", "rootfs plan SGLANG_CACHE_DIR does not match materialized config"),
+    ],
+)
+def test_rootfs_plan_emission_rejects_sglang_env_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_key: str,
+    value: str,
+    match: str,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    resolved_plan_path = Path(
+        glm52_sglang_runtime._resolve_host_path_ref(
+            config,
+            config.artifacts["resolved_rootfs_plan"],
+        )
+    )
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        plan = valid_rootfs_plan(config)
+        plan["rootfs"] = str(tmp_path / "rootfs")
+        plan["env"] = {**plan["env"], env_key: value}
+        for mount in plan["mounts"]:
+            for expected in config.sandbox["mounts"]:
+                if mount["sandbox_path"] == expected["sandbox_path"]:
+                    mount["host_path"] = glm52_sglang_runtime._resolve_host_path_ref(
+                        config,
+                        expected["host_path_ref"],
+                    )
+        resolved_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeConfigError, match=match):
+        glm52_sglang_runtime.emit_and_load_rootfs_plan(config, resolved_plan_path=resolved_plan_path)
+
+
+def test_teardown_rejects_process_record_drift_before_kill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED))
+    local_env = load_local_environment(
+        write_spec(
+            tmp_path / "local-env.yaml",
+            f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+        )
+    )
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19017,
+    )
+    process_record_path = Path(
+        glm52_sglang_runtime._resolve_host_path_ref(
+            config,
+            config.artifacts["process_record"],
+        )
+    )
+    process_record_path.parent.mkdir(parents=True, exist_ok=True)
+    process_record_path.write_text(
+        glm52_sglang_runtime.yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "run_id": config.run_id,
+                "status": "running",
+                "pid": os.getpid(),
+                "process_group": os.getpgrp(),
+                "port": config.service["port"],
+                "outer_argv": ["drifted"],
+                "inner_argv": config.launch["inner_argv"],
+                "env": config.launch["env"],
+            },
+            sort_keys=False,
+        )
+    )
+    killed: list[int] = []
+    monkeypatch.setattr(glm52_sglang_runtime.os, "killpg", lambda pgid, sig: killed.append(pgid))
+
+    with pytest.raises(RuntimeConfigError, match="process record outer_argv must match"):
+        glm52_sglang_runtime.teardown_runtime(config, local_environment=local_env)
+
+    assert killed == []
+
+
+@pytest.mark.parametrize("command", ["launch", "teardown"])
+def test_lifecycle_cli_commands_require_local_environment(
+    command: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "materialized.yaml"
+
+    with pytest.raises(SystemExit) as error:
+        main([command, "--materialized-config", str(path)])
+
+    assert error.value.code == 2
+
+
+def test_repeat_cli_runs_requested_cycles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    declared = write_spec(tmp_path / "declared.yaml", VALID_DECLARED)
+    local_env = write_spec(
+        tmp_path / "local-env.yaml",
+        f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+    )
+    runs: list[str] = []
+    teardown_runs: list[str] = []
+
+    def fake_launch_runtime(config, *, local_environment):
+        assert local_environment.repo == str(tmp_path / "repo")
+        runs.append(config.run_id)
+        return {"status": "launch_passed", "run_id": config.run_id}
+
+    def fake_teardown_runtime(config, *, local_environment):
+        assert local_environment.repo == str(tmp_path / "repo")
+        teardown_runs.append(config.run_id)
+        return {"status": "teardown_passed", "run_id": config.run_id}
+
+    monkeypatch.setattr(glm52_sglang_runtime, "launch_runtime", fake_launch_runtime)
+    monkeypatch.setattr(glm52_sglang_runtime, "teardown_runtime", fake_teardown_runtime)
+
+    rc = main([
+        "repeat",
+        "--declared-spec",
+        str(declared),
+        "--local-environment",
+        str(local_env),
+        "--cycles",
+        "3",
+    ])
+
+    assert rc == 0
+    assert len(runs) == 3
+    assert len(set(runs)) == 3
+    assert teardown_runs == runs
+    for run_id in runs:
+        config_path = tmp_path / "repo" / "glm52-serving-results" / run_id / "materialized-sglang-runtime.yaml"
+        loaded = load_materialized_config(config_path)
+        assert loaded.run_id == run_id
+        assert 19000 <= loaded.service["port"] <= 19100
+        assert loaded.service["port"] not in {8000, 8080, 18080}
+    summaries = list((tmp_path / "repo" / "glm52-serving-results").glob("*-repeat-*/loop-summary.json"))
+    assert len(summaries) == 1
+    summary = glm52_sglang_runtime._load_json_mapping(summaries[0])
+    assert summary["status"] == "passed"
+    assert [cycle["run_id"] for cycle in summary["cycles"]] == runs
+
+
+def test_repeat_cli_tears_down_and_returns_nonzero_after_cycle_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = write_spec(tmp_path / "declared.yaml", VALID_DECLARED)
+    local_env = write_spec(
+        tmp_path / "local-env.yaml",
+        f"""\
+schema_version: 1
+roots:
+  repo: {tmp_path / "repo"}
+  cache: {tmp_path / "cache"}
+  temp: {tmp_path / "tmp"}
+rootfs:
+  monarch-default: {tmp_path / "rootfs"}
+""",
+    )
+    teardown_runs: list[str] = []
+
+    def fake_launch_runtime(config, *, local_environment):
+        raise RuntimeConfigError("launch failed")
+
+    def fake_teardown_runtime(config, *, local_environment):
+        teardown_runs.append(config.run_id)
+        return {"status": "teardown_passed", "run_id": config.run_id}
+
+    monkeypatch.setattr(glm52_sglang_runtime, "launch_runtime", fake_launch_runtime)
+    monkeypatch.setattr(glm52_sglang_runtime, "teardown_runtime", fake_teardown_runtime)
+
+    rc = main([
+        "repeat",
+        "--declared-spec",
+        str(declared),
+        "--local-environment",
+        str(local_env),
+        "--cycles",
+        "3",
+    ])
+
+    assert rc == 2
+    assert len(teardown_runs) == 1
+    summaries = list((tmp_path / "repo" / "glm52-serving-results").glob("*-repeat-*/loop-summary.json"))
+    assert len(summaries) == 1
+    summary = glm52_sglang_runtime._load_json_mapping(summaries[0])
+    assert summary["status"] == "failed"
+    assert summary["cycles"][0]["launch"]["status"] == "failed"
+    assert summary["cycles"][0]["teardown"]["status"] == "teardown_passed"
+
+
+def test_host_control_wrapper_is_executable() -> None:
+    wrapper = Path(__file__).resolve().parents[2] / "scripts" / "run_glm52_sglang_runtime.sh"
+
+    assert wrapper.stat().st_mode & stat.S_IXUSR
+    text = wrapper.read_text()
+    assert 'exec "$REPO_ROOT/scripts/run" python scripts/glm52_sglang_runtime.py "$@"' in text
+    assert '"$REPO_ROOT/scripts/glm52_sglang_runtime.py"' not in text
