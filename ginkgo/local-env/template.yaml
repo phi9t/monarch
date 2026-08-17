@@ -1,0 +1,16 @@
+schema_version: 1
+roots:
+  repo: <absolute-path-to-monarch-checkout>
+  cache: <absolute-path-to-ginkgo-cache-root>
+  temp: <absolute-path-to-ginkgo-temp-root>
+  run: <absolute-path-to-ginkgo-run-root>
+  results: <absolute-path-to-monarch-checkout>/glm52-serving-results
+rootfs:
+  monarch-default: <absolute-path-to-built-bwrap-rootfs>
+shared_memory:
+  mode: host_path
+  host_path: <absolute-path-to-ginkgo-shm-root>
+  sandbox_path: /dev/shm
+gpu:
+  mode: nvidia
+  devices: <comma-separated-cuda-visible-devices>

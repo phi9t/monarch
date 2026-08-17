@@ -1,0 +1,14 @@
+schema_version: 1
+profile: cuda-kernel
+description: Validate PyTorch CUDA visibility and declared optimized-kernel capabilities without launching a model server.
+requires_gpu: true
+launches_serving_process: false
+evidence_class: cuda-kernel-readiness
+required_actions:
+  - host_capability_survey
+  - rootfs_projection_check
+  - dependency_import_probe
+  - torch_cuda_probe
+  - triton_kernel_probe
+  - flash_attention_probe
+  - flashinfer_probe

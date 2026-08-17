@@ -1140,12 +1140,14 @@ def test_teardown_treats_zombie_only_group_as_stopped_after_escalation(
     assert sent_signals == [glm52_sglang_runtime.signal.SIGTERM, glm52_sglang_runtime.signal.SIGKILL]
 
 
-def test_repeatability_summary_uses_ok_contract(tmp_path: Path) -> None:
+def test_repeatability_summary_uses_ok_contract(tmp_path: Path, monkeypatch) -> None:
     ports: list[int] = []
 
     def fake_run_one_cycle(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
         ports.append(config.service["port"])
         return {"ok": True, "port": config.service["port"]}
+
+    monkeypatch.setattr(glm52_sglang_runtime, "_is_port_bindable", lambda _host, _port: True)
 
     summary = glm52_sglang_runtime.run_repeatability_cycles(
         declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),

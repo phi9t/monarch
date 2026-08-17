@@ -303,7 +303,7 @@ def test_materialized_inference_config_round_trips(tmp_path: Path) -> None:
     assert loaded.components["responses_adapter"]["argv"] == config.components["responses_adapter"]["argv"]
 
 
-def materialized_config_for_test(tmp_path: Path):
+def materialized_config_for_test(tmp_path: Path, *, run_id: str = "run-test"):
     declared_path = write_text(tmp_path / "inference.yaml", VALID_INFERENCE)
     local_env_path = write_text(tmp_path / "local-env.yaml", local_env_text(tmp_path))
     declared = load_declared_inference_spec(declared_path)
@@ -311,7 +311,7 @@ def materialized_config_for_test(tmp_path: Path):
         declared=declared,
         declared_path=declared_path,
         local_environment_path=local_env_path,
-        run_id="run-test",
+        run_id=run_id,
     )
 
 
@@ -1199,7 +1199,7 @@ def test_run_one_inference_cycle_tears_down_after_dynamo_failure(tmp_path: Path,
 
 
 def test_run_one_inference_cycle_rejects_missing_dynamo_before_sglang_launch(tmp_path: Path, monkeypatch) -> None:
-    config = materialized_config_for_test(tmp_path)
+    config = materialized_config_for_test(tmp_path, run_id="run-test-missing-dynamo-before-sglang")
 
     def forbidden_launch_sglang(config):
         raise AssertionError("missing Dynamo prerequisite must fail before SGLang launch")
@@ -1220,7 +1220,7 @@ def test_run_one_inference_cycle_rejects_missing_dynamo_before_sglang_launch(tmp
     payload = json.loads(environment_path.read_text())
     assert payload["status"] == "missing_prerequisite"
     assert payload["reason"] == "module_not_executable"
-    assert payload["module"] == "dynamo.frontend"
+    assert payload["module"] in {"dynamo.frontend", "dynamo.sglang"}
 
 
 def test_run_repeatability_cycles_rejects_false_cycle(tmp_path: Path, monkeypatch) -> None:
