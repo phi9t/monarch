@@ -30,8 +30,9 @@
 # Options:
 #   --rebuild       Force a docker rebuild even if the image tag exists.
 #   --tag TAG       Docker image tag to build/use (default: derived from recipe).
-#   --dest DIR      Managed directory under scripts/rootfs/ named rootfs or
-#                   rootfs-* (default: scripts/rootfs/rootfs).
+#   --dest DIR      Absolute rootfs export directory named rootfs or rootfs-*.
+#                   Defaults to scripts/rootfs/rootfs.
+#   --dry-run       Validate and print the resolved build/export plan.
 #   -h, --help      Show this help and exit.
 
 set -euo pipefail
@@ -47,12 +48,14 @@ source "$ROOTFS_DIR/execution_contract.sh"
 TAG=""
 DEST="$ROOTFS_DIR/rootfs"
 REBUILD=0
+DRY_RUN=0
 
-usage() { sed -n '9,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '9,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rebuild) REBUILD=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --tag) TAG="$2"; shift 2 ;;
     --tag=*) TAG="${1#*=}"; shift ;;
     --dest) DEST="$2"; shift 2 ;;
@@ -76,21 +79,33 @@ ROOTFS_RECIPE_SHA256="$(monarch_rootfs_recipe_sha256 "$REPO_ROOT")"
 [[ -n "$TAG" ]] || TAG="monarch-rootfs:${ROOTFS_RECIPE_SHA256:0:16}"
 
 ROOTFS_DIR="$(realpath -e "$ROOTFS_DIR")"
-dest_parent="$(realpath -m "$(dirname -- "$DEST")")"
+[[ "$DEST" == /* ]] || usage_error "--dest must be absolute: $DEST"
+dest_parent_raw="$(dirname -- "$DEST")"
+[[ -d "$dest_parent_raw" ]] || usage_error "--dest parent does not exist: $dest_parent_raw"
+dest_parent="$(realpath -e "$dest_parent_raw")"
 dest_name="$(basename -- "$DEST")"
-if [[ "$dest_parent" != "$ROOTFS_DIR" || ! "$dest_name" =~ ^rootfs(-[A-Za-z0-9._-]+)?$ ]]; then
-  usage_error "--dest must be a managed rootfs path under $ROOTFS_DIR named rootfs or rootfs-*"
+if [[ ! "$dest_name" =~ ^rootfs(-[A-Za-z0-9._-]+)?$ ]]; then
+  usage_error "--dest must be named rootfs or rootfs-*"
 fi
 DEST="$dest_parent/$dest_name"
 [[ ! -L "$DEST" ]] || usage_error "--dest must not be a symbolic link: $DEST"
-
-command -v docker >/dev/null || die "docker not found on host"
+[[ -w "$dest_parent" ]] || usage_error "--dest parent is not writable: $dest_parent"
 
 # Read the pinned Rust channel from rust-toolchain (e.g. nightly-2026-05-22).
 RUST_CHANNEL="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain")"
 [[ -n "$RUST_CHANNEL" ]] || die "could not parse channel from rust-toolchain"
 log "pinned rust channel: $RUST_CHANNEL"
 log "rootfs recipe: $ROOTFS_RECIPE_SHA256"
+log "rootfs destination: $DEST"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  printf 'rootfs destination: %s\n' "$DEST"
+  printf 'rootfs recipe: %s\n' "$ROOTFS_RECIPE_SHA256"
+  printf 'docker tag: %s\n' "$TAG"
+  exit 0
+fi
+
+command -v docker >/dev/null || die "docker not found on host"
 
 # Reuse an existing image only when its recipe label matches the current recipe.
 image_recipe() {
@@ -115,6 +130,10 @@ else
     --build-arg NPM_VERSION="$MONARCH_NPM_VERSION" \
     --build-arg CUDA_NVCC_VERSION="$MONARCH_CUDA_NVCC_VERSION" \
     --build-arg CUDA_CCCL_VERSION="$MONARCH_CUDA_CCCL_VERSION" \
+    --build-arg CUDA_CRT_VERSION="$MONARCH_CUDA_CRT_VERSION" \
+    --build-arg NVIDIA_NVVM_VERSION="$MONARCH_NVIDIA_NVVM_VERSION" \
+    --build-arg CUDA_CUOBJDUMP_VERSION="$MONARCH_CUDA_CUOBJDUMP_VERSION" \
+    --build-arg CUDA_NVDISASM_VERSION="$MONARCH_CUDA_NVDISASM_VERSION" \
     --build-arg SETUPTOOLS_VERSION="$MONARCH_SETUPTOOLS_VERSION" \
     --build-arg SETUPTOOLS_RUST_VERSION="$MONARCH_SETUPTOOLS_RUST_VERSION" \
     --build-arg WHEEL_VERSION="$MONARCH_WHEEL_VERSION" \
@@ -141,6 +160,10 @@ ARG NODE_VERSION
 ARG NPM_VERSION
 ARG CUDA_NVCC_VERSION
 ARG CUDA_CCCL_VERSION
+ARG CUDA_CRT_VERSION
+ARG NVIDIA_NVVM_VERSION
+ARG CUDA_CUOBJDUMP_VERSION
+ARG CUDA_NVDISASM_VERSION
 ARG SETUPTOOLS_VERSION
 ARG SETUPTOOLS_RUST_VERSION
 ARG WHEEL_VERSION
@@ -195,11 +218,16 @@ RUN cargo install --locked --version "${MDBOOK_VERSION}" mdbook && \
 # libs under nvidia/cu13/{include,lib} but no compiler. The canonical
 # nvidia-cuda-nvcc wheel adds nvidia/cu13/bin/nvcc (+ crt/nvvm) into the same
 # tree, so CUDA_HOME can point straight at nvidia/cu13. setup.py get_cuda_home()
-# and torch cpp_extension expect bin/nvcc, include/, and lib64/, so symlink
-# lib64 -> lib.
+# and torch cpp_extension expect bin/nvcc, include/, and lib64/. Runtime JIT
+# linkers also use -lcudart, so the synthetic CUDA_HOME must expose the
+# unversioned linker name even though the wheel ships the versioned runtime.
 RUN pip install --break-system-packages --no-cache-dir \
         "nvidia-cuda-nvcc==${CUDA_NVCC_VERSION}" \
         "nvidia-cuda-cccl==${CUDA_CCCL_VERSION}" \
+        "nvidia-cuda-crt==${CUDA_CRT_VERSION}" \
+        "nvidia-nvvm==${NVIDIA_NVVM_VERSION}" \
+        "nvidia-cuda-cuobjdump==${CUDA_CUOBJDUMP_VERSION}" \
+        "nvidia-cuda-nvdisasm==${CUDA_NVDISASM_VERSION}" \
         "setuptools==${SETUPTOOLS_VERSION}" \
         "setuptools-rust==${SETUPTOOLS_RUST_VERSION}" \
         "wheel==${WHEEL_VERSION}" \
@@ -208,9 +236,17 @@ RUN set -euo pipefail; \
     site="$(python -c 'import site;print(site.getsitepackages()[0])')"; \
     cu="$site/nvidia/cu13"; \
     test -x "$cu/bin/nvcc" || { echo "nvcc missing at $cu/bin/nvcc" >&2; exit 1; }; \
+    test -x "$cu/bin/cuobjdump" || { echo "cuobjdump missing at $cu/bin/cuobjdump" >&2; exit 1; }; \
+    test -x "$cu/bin/nvdisasm" || { echo "nvdisasm missing at $cu/bin/nvdisasm" >&2; exit 1; }; \
     test -f "$cu/include/cuda_runtime.h" || { echo "cuda headers missing" >&2; exit 1; }; \
+    test -e "$cu/lib/libcudart.so.13" || { echo "cuda runtime missing at $cu/lib/libcudart.so.13" >&2; exit 1; }; \
+    ln -sfn libcudart.so.13 "$cu/lib/libcudart.so"; \
+    test -e "$cu/lib/libcudart.so" || { echo "cuda runtime linker name missing at $cu/lib/libcudart.so" >&2; exit 1; }; \
     ln -sfn lib "$cu/lib64"; \
     ln -sfn "$cu" /opt/cuda-synth; \
+    cudart_minor="$(python -c 'from pathlib import Path; import re; text = Path("/opt/cuda-synth/include/cuda_runtime_api.h").read_text(); match = re.search(r"^#define\s+CUDART_VERSION\s+(\d+)", text, re.M); assert match, "missing CUDART_VERSION"; version = int(match.group(1)); print(f"{version // 1000}.{version % 1000 // 10}")')"; \
+    nvcc_minor="$(/opt/cuda-synth/bin/nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\),.*/\1/p' | head -1)"; \
+    test "$nvcc_minor" = "$cudart_minor" || { echo "cuda compiler/header mismatch: nvcc $nvcc_minor vs CUDART_VERSION $cudart_minor" >&2; exit 1; }; \
     /opt/cuda-synth/bin/nvcc --version
 ENV CUDA_HOME=/opt/cuda-synth CUDA_PATH=/opt/cuda-synth
 ENV PATH=/opt/cuda-synth/bin:$PATH
@@ -239,6 +275,11 @@ RUN printf '%s\n' \
         "MONARCH_MDBOOK_VERSION=${MDBOOK_VERSION}" \
         "MONARCH_NEXTEST_VERSION=${NEXTEST_VERSION}" \
         "MONARCH_CUDA_NVCC_VERSION=${CUDA_NVCC_VERSION}" \
+        "MONARCH_CUDA_CCCL_VERSION=${CUDA_CCCL_VERSION}" \
+        "MONARCH_CUDA_CRT_VERSION=${CUDA_CRT_VERSION}" \
+        "MONARCH_NVIDIA_NVVM_VERSION=${NVIDIA_NVVM_VERSION}" \
+        "MONARCH_CUDA_CUOBJDUMP_VERSION=${CUDA_CUOBJDUMP_VERSION}" \
+        "MONARCH_CUDA_NVDISASM_VERSION=${CUDA_NVDISASM_VERSION}" \
         > /etc/monarch-rootfs-contract
 
 # Pre-create the read-only mount points bwrap binds over: the checkout mount,
@@ -253,16 +294,16 @@ fi
 # Export the image filesystem to a flattened directory. Export to a temp dir and
 # swap into place so an interrupted run never leaves a half-populated rootfs.
 log "exporting $TAG to $DEST"
-mkdir -p "$ROOTFS_DIR"
-STAGE="$(mktemp -d "$ROOTFS_DIR/.rootfs.stage.XXXXXX")"
-[[ -d "$STAGE" && ! -L "$STAGE" && "$(dirname -- "$STAGE")" == "$ROOTFS_DIR" ]] || \
+mkdir -p "$dest_parent"
+STAGE="$(mktemp -d "$dest_parent/.rootfs.stage.XXXXXX")"
+[[ -d "$STAGE" && ! -L "$STAGE" && "$(dirname -- "$STAGE")" == "$dest_parent" ]] || \
   die "mktemp produced an invalid stage directory: $STAGE"
 cid="$(docker create "$TAG")"
 [[ "$cid" =~ ^[0-9a-f]+$ ]] || die "docker create returned an invalid container id"
 cleanup() {
   docker rm -f -- "${cid:?}" >/dev/null 2>&1 || true
   if [[ -d "${STAGE:-}" && ! -L "$STAGE" && \
-        "$(dirname -- "$STAGE")" == "$ROOTFS_DIR" && \
+        "$(dirname -- "$STAGE")" == "$dest_parent" && \
         "$(basename -- "$STAGE")" == .rootfs.stage.* ]]; then
     rm -rf -- "${STAGE:?}"
   fi
@@ -271,12 +312,20 @@ trap cleanup EXIT
 docker export "$cid" | tar -C "$STAGE" -xf -
 [[ -x "$STAGE/bin/bash" ]] || die "export produced an unusable rootfs (no bin/bash)"
 [[ -r "$STAGE/etc/monarch-rootfs-contract" ]] || die "export is missing the stamped contract"
-[[ "$(dirname -- "$DEST")" == "$ROOTFS_DIR" && ! -L "$DEST" ]] || \
+python3 "$ROOTFS_DIR/verify_rootfs.py" \
+  --rootfs "$STAGE" \
+  --expected-recipe "$ROOTFS_RECIPE_SHA256" \
+  --skip-command-checks >/dev/null || die "export failed rootfs verification"
+[[ "$(dirname -- "$DEST")" == "$dest_parent" && ! -L "$DEST" ]] || \
   die "refusing to replace invalid rootfs destination: $DEST"
 if [[ -e "$DEST" ]]; then
   [[ -d "$DEST" ]] || die "rootfs destination is not a directory: $DEST"
   rm -rf -- "${DEST:?}"
 fi
 mv "$STAGE" "$DEST"
+python3 "$ROOTFS_DIR/verify_rootfs.py" \
+  --rootfs "$DEST" \
+  --expected-recipe "$ROOTFS_RECIPE_SHA256" \
+  --skip-command-checks >/dev/null || die "rootfs failed post-move verification"
 
 log "rootfs ready: $DEST"

@@ -15,6 +15,11 @@
 #   scripts/run [--] <command> [args...]
 #   scripts/run                      # interactive shell inside the rootfs
 #
+# Set MONARCH_ROOTFS to an absolute rootfs directory to use an already-built
+# rootfs outside scripts/rootfs/rootfs. The directory must still satisfy the
+# current rootfs contract; this is a storage-location override, not a contract
+# bypass.
+#
 # Host bootstrap (building and entering the rootfs) is the only Linux-local work
 # that does not go through this gateway. GitHub Actions, native macOS, installed
 # wheels, Meta-internal builds, and remote workers are separate execution
@@ -81,5 +86,23 @@ elif [[ "$cwd" == "$REPO_ROOT"/* ]]; then
   checkout_rel="${cwd#"$REPO_ROOT"/}"
 fi
 
+rootfs_args=()
+if [[ -n "${MONARCH_ROOTFS:-}" ]]; then
+  if [[ "$MONARCH_ROOTFS" != /* ]]; then
+    echo "error: MONARCH_ROOTFS must be an absolute path: $MONARCH_ROOTFS" >&2
+    exit 2
+  fi
+  rootfs_args=(--rootfs "$MONARCH_ROOTFS")
+fi
+
+emit_plan_args=()
+if [[ -n "${MONARCH_ROOTFS_EMIT_PLAN:-}" ]]; then
+  if [[ "$MONARCH_ROOTFS_EMIT_PLAN" != /* ]]; then
+    echo "error: MONARCH_ROOTFS_EMIT_PLAN must be an absolute path: $MONARCH_ROOTFS_EMIT_PLAN" >&2
+    exit 2
+  fi
+  emit_plan_args=(--emit-plan "$MONARCH_ROOTFS_EMIT_PLAN")
+fi
+
 exec "$REPO_ROOT/scripts/rootfs/enter_rootfs.sh" \
-  --chdir "$checkout_rel" -- /workspace/monarch/scripts/run "$@"
+  "${rootfs_args[@]}" "${emit_plan_args[@]}" --chdir "$checkout_rel" -- /workspace/monarch/scripts/run "$@"

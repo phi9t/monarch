@@ -182,13 +182,11 @@ def test_pytest_junit_rejects_stale_artifact(tmp_path: Path) -> None:
     "dest",
     [
         "/",
-        "/tmp/rootfs-experiment",
         str(REPO_ROOT),
-        str(REPO_ROOT / "scripts" / "rootfs"),
         str(REPO_ROOT / "scripts" / "rootfs" / "experiment"),
     ],
 )
-def test_rootfs_builder_rejects_unmanaged_destination(dest: str) -> None:
+def test_rootfs_builder_rejects_destination_not_named_rootfs(dest: str) -> None:
     result = subprocess.run(
         [ROOTFS_BUILDER, "--dest", dest],
         check=False,
@@ -198,7 +196,90 @@ def test_rootfs_builder_rejects_unmanaged_destination(dest: str) -> None:
     )
 
     assert result.returncode == 2
-    assert "--dest must be a managed rootfs path" in result.stderr
+    assert "--dest must be named rootfs or rootfs-*" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "dest",
+    [
+        "/tmp/rootfs-experiment",
+        str(REPO_ROOT / "scripts" / "rootfs"),
+    ],
+)
+def test_rootfs_builder_dry_run_allows_rootfs_named_destinations(dest: str) -> None:
+    result = subprocess.run(
+        [ROOTFS_BUILDER, "--dest", dest, "--dry-run"],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PATH": "/usr/bin:/bin"},
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"rootfs destination: {dest}" in result.stdout
+
+
+def test_rootfs_builder_allows_absolute_external_rootfs_store(tmp_path: Path) -> None:
+    dest = tmp_path / "rootfs-ca484a4d579b45c0"
+
+    result = subprocess.run(
+        [ROOTFS_BUILDER, "--dest", str(dest), "--dry-run"],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PATH": "/usr/bin:/bin"},
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"rootfs destination: {dest}" in result.stdout
+
+
+def test_rootfs_builder_rejects_symlink_destination(tmp_path: Path) -> None:
+    target = tmp_path / "real-rootfs"
+    target.mkdir()
+    dest = tmp_path / "rootfs-link"
+    dest.symlink_to(target)
+
+    result = subprocess.run(
+        [ROOTFS_BUILDER, "--dest", str(dest), "--dry-run"],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PATH": "/usr/bin:/bin"},
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "--dest must not be a symbolic link" in result.stderr
+
+
+def test_rootfs_entrypoint_uses_verify_rootfs_before_launch() -> None:
+    entry = (REPO_ROOT / "scripts/rootfs/enter_rootfs.sh").read_text()
+
+    verify_index = entry.index("verify_rootfs.py")
+    bwrap_index = entry.index('exec bwrap "${bwrap_args[@]}"')
+    assert verify_index < bwrap_index
+
+
+def test_rootfs_builder_provides_cuda_runtime_linker_name() -> None:
+    builder = ROOTFS_BUILDER.read_text()
+
+    assert "libcudart.so.13" in builder
+    assert "libcudart.so" in builder
+    assert "test -e \"$cu/lib/libcudart.so\"" in builder
+
+
+def test_rootfs_builder_rejects_cuda_compiler_header_mismatch() -> None:
+    builder = ROOTFS_BUILDER.read_text()
+
+    assert "nvidia-cuda-crt==${CUDA_CRT_VERSION}" in builder
+    assert "nvidia-nvvm==${NVIDIA_NVVM_VERSION}" in builder
+    assert "nvidia-cuda-cuobjdump==${CUDA_CUOBJDUMP_VERSION}" in builder
+    assert "nvidia-cuda-nvdisasm==${CUDA_NVDISASM_VERSION}" in builder
+    assert "cuobjdump missing" in builder
+    assert "nvdisasm missing" in builder
+    assert "CUDART_VERSION" in builder
+    assert "nvcc_minor" in builder
+    assert "cuda compiler/header mismatch" in builder
 
 
 def test_capacity_script_delegates_before_python_or_cuda_work() -> None:
