@@ -52,10 +52,30 @@ same Monarch-specific workflows. The `run-monarch-single-machine` skill is the
 canonical guide for running Monarch on one host through the hermetic bwrap
 rootfs and for building or maintaining that rootfs.
 
-For broad, multi-area codebase exploration or distributed-training design work,
-use the `.agents/skills/subagent-exploration` skill to split read-heavy
-investigation and disjoint implementation slices across focused subagents while
-keeping synthesis in the main thread.
+Clean-context subagent execution is the default execution rule for non-trivial
+work in this repo. Before broad exploration, design, verification, or
+implementation, dispatch one or more clean-context subagents for bounded,
+independent slices and keep synthesis, sequencing, integration, and final
+reporting in the main thread. Use the `.agents/skills/subagent-exploration`
+skill for broad exploration, distributed-training design, verification, and
+disjoint implementation slices. Simple single-command checks and tightly scoped
+edits may stay local when delegation would add no useful independent work.
+
+### Issue tracker
+
+Issues and specs are tracked as local Markdown under `.scratch/`. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The repo uses the default Matt Pocock skill triage vocabulary:
+`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and
+`wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo for agent domain docs: use root `CONTEXT.md` and
+root `docs/adr/`. See `docs/agents/domain.md`.
 
 ## Build & Commands
 
