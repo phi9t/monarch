@@ -38,11 +38,14 @@ from ginkgo.insula.schema import InsulaConfigError
 from ginkgo.insula.schema import InsulaEnvironmentSpec
 from ginkgo.insula.schema import InsulaInvocationSpec
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 SGLANG_VENV_SANDBOX_PATH = "/cache/glm52/venvs/sglang"
 SGLANG_VENV_PYTHON = f"{SGLANG_VENV_SANDBOX_PATH}/bin/python"
 SGLANG_HF_HOME_SANDBOX_PATH = "/cache/glm52/hf-home"
 SGLANG_CACHE_SANDBOX_PATH = "/cache/glm52/sglang"
-SGLANG_PREPARE_PACKAGES = ["sglang[all]"]
+GLM52_RUNTIME_DEPENDENCY_GROUP = "glm52-runtime"
+GLM52_RUNTIME_LOCKFILE_REF = "repo://uv.lock"
+SGLANG_PREPARE_PACKAGES = ["sglang[all]==0.5.17"]
 SGLANG_PREPARE_RUN_ID = "prepare-venv"
 MODEL_CACHE_PREPARE_RUN_ID = "prepare-model"
 SGLANG_OFFLOADER_PATCH_ID = "glm52-offloader-v1-plain-tensor-attrs-v1"
@@ -1205,14 +1208,7 @@ def prepare_sglang_venv(
         port=declared.port_policy.range_start,
     )
     inner_argv = _sglang_venv_prepare_command()
-    install_argv = [
-        "uv",
-        "pip",
-        "install",
-        "--python",
-        SGLANG_VENV_PYTHON,
-        *SGLANG_PREPARE_PACKAGES,
-    ]
+    install_argv = _locked_dependency_sync_command(SGLANG_VENV_PYTHON)
     patch_argv = [
         SGLANG_VENV_PYTHON,
         SGLANG_OFFLOADER_PATCH_SCRIPT,
@@ -1239,11 +1235,19 @@ def prepare_sglang_venv(
         run=run,
         plan_emitter=plan_emitter,
     )
-    for command in (inner_argv, install_argv, patch_argv, probe_argv, help_argv):
-        completed = _run_preparation_command(config, command, run=run)
+    command_envs = [
+        {},
+        _locked_dependency_sync_env(SGLANG_VENV_SANDBOX_PATH),
+        {},
+        {},
+        {},
+    ]
+    for command, command_env in zip((inner_argv, install_argv, patch_argv, probe_argv, help_argv), command_envs, strict=True):
+        completed = _run_preparation_command(config, command, run=run, env=command_env)
         outputs.append(
             {
                 "command": command,
+                "env": command_env,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
             }
@@ -1276,6 +1280,7 @@ def prepare_sglang_venv(
             "packages": list(SGLANG_PREPARE_PACKAGES),
             "installed_packages": packages,
         },
+        "dependency_resolution": _locked_dependency_resolution_record(),
         "rootfs": {
             "recipe_sha256": _rootfs_recipe_digest(config),
         },
@@ -1372,6 +1377,28 @@ def validate_preparation_records(
     for package in ("sglang",):
         if not installed_packages.get(package):
             raise RuntimeConfigError(f"SGLang venv preparation record missing installed package: {package}")
+    dependency_resolution = _require_mapping(
+        venv_record.get("dependency_resolution"),
+        "sglang_venv_record.dependency_resolution",
+    )
+    if _required_section_str(
+        dependency_resolution,
+        "group",
+        "sglang_venv_record.dependency_resolution",
+    ) != GLM52_RUNTIME_DEPENDENCY_GROUP:
+        raise RuntimeConfigError("SGLang venv preparation record must use the GLM52 runtime dependency group")
+    if _required_section_str(
+        dependency_resolution,
+        "lockfile",
+        "sglang_venv_record.dependency_resolution",
+    ) != GLM52_RUNTIME_LOCKFILE_REF:
+        raise RuntimeConfigError("SGLang venv preparation record must use repo://uv.lock")
+    if not _required_section_str(
+        dependency_resolution,
+        "lock_sha256",
+        "sglang_venv_record.dependency_resolution",
+    ):
+        raise RuntimeConfigError("SGLang venv preparation record missing uv.lock digest")
     checks = _require_mapping(venv_record.get("checks"), "sglang_venv_record.checks")
     if checks.get("served_model_name_flag") is not True:
         raise RuntimeConfigError("SGLang venv preparation record missing served_model_name_flag")
@@ -1735,6 +1762,37 @@ def _load_preparation_record(config: MaterializedSglangRuntimeConfig, name: str,
 
 def _rootfs_recipe_digest(config: MaterializedSglangRuntimeConfig) -> str:
     return hashlib.sha256(_resolved_rootfs_path(config).encode("utf-8")).hexdigest()
+
+
+def _locked_dependency_sync_command(python: str) -> list[str]:
+    return [
+        "uv",
+        "sync",
+        "--active",
+        "--locked",
+        "--no-sources-package",
+        "torch",
+        "--no-install-project",
+        "--only-group",
+        GLM52_RUNTIME_DEPENDENCY_GROUP,
+        "--python",
+        python,
+    ]
+
+
+def _locked_dependency_sync_env(venv_path: str) -> dict[str, str]:
+    return {"VIRTUAL_ENV": venv_path}
+
+
+def _locked_dependency_resolution_record() -> dict[str, str]:
+    lock_path = REPO_ROOT / GLM52_RUNTIME_LOCKFILE_REF.removeprefix("repo://")
+    return {
+        "group": GLM52_RUNTIME_DEPENDENCY_GROUP,
+        "lockfile": GLM52_RUNTIME_LOCKFILE_REF,
+        "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+        "selection": "only_group",
+        "sources": "standard_metadata_for_torch",
+    }
 
 
 def _sglang_venv_prepare_command() -> list[str]:

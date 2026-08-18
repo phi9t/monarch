@@ -916,8 +916,21 @@ rootfs:
             return glm52_inference_runtime.subprocess.CompletedProcess(command, 0, stdout="uv 0.8.0\n", stderr="")
         if command[0:2] == ["uv", "venv"]:
             return glm52_inference_runtime.subprocess.CompletedProcess(command, 0, stdout="created\n", stderr="")
-        if command[0:3] == ["uv", "pip", "install"]:
-            return glm52_inference_runtime.subprocess.CompletedProcess(command, 0, stdout="installed\n", stderr="")
+        expected_sync_prefix = [
+            "uv",
+            "sync",
+            "--active",
+            "--locked",
+            "--no-sources-package",
+            "torch",
+            "--no-install-project",
+            "--only-group",
+            "glm52-runtime",
+        ]
+        if command[: len(expected_sync_prefix)] == expected_sync_prefix:
+            assert "--python" in command
+            assert kwargs["env"]["VIRTUAL_ENV"].endswith("/glm52/venvs/dynamo")
+            return glm52_inference_runtime.subprocess.CompletedProcess(command, 0, stdout="resolved\n", stderr="")
         if command[1:3] == ["-m", "dynamo.frontend"]:
             return glm52_inference_runtime.subprocess.CompletedProcess(
                 command,
@@ -944,23 +957,31 @@ rootfs:
     expected_venv = "/workspace/monarch/scripts/rootfs/cache/glm52-local-serving/glm52/venvs/dynamo"
     expected_python = str(Path(expected_venv) / "bin" / "python")
     assert commands[0] == ["uv", "--version"]
-    assert commands[1] == ["uv", "venv", "--python", sys.executable, expected_venv]
+    assert commands[1] == ["uv", "venv", "--clear", "--python", sys.executable, expected_venv]
     assert commands[2] == [
         "uv",
-        "pip",
-        "install",
+        "sync",
+        "--active",
+        "--locked",
+        "--no-sources-package",
+        "torch",
+        "--no-install-project",
+        "--only-group",
+        "glm52-runtime",
         "--python",
         expected_python,
-        "ai-dynamo==1.4.0",
-        "ai-dynamo-runtime==1.4.0",
-        "sglang==0.5.17",
-        "blake3",
     ]
+    assert record["commands"][1]["env"]["VIRTUAL_ENV"] == expected_venv
     assert commands[3] == [expected_python, "-m", "dynamo.frontend", "--help"]
     assert commands[4] == [expected_python, "-m", "dynamo.sglang", "--help"]
     assert record["venv"]["path"] == "cache://glm52/venvs/dynamo"
     assert record["venv"]["python"] == expected_python
     assert record["packages"] == ["ai-dynamo==1.4.0", "ai-dynamo-runtime==1.4.0", "sglang==0.5.17", "blake3"]
+    assert record["dependency_resolution"]["group"] == "glm52-runtime"
+    assert record["dependency_resolution"]["lockfile"] == "repo://uv.lock"
+    assert len(record["dependency_resolution"]["lock_sha256"]) == 64
+    assert record["dependency_resolution"]["selection"] == "only_group"
+    assert record["dependency_resolution"]["sources"] == "standard_metadata_for_torch"
     assert record["tools"]["uv"]["ok"] is True
     assert record["checks"]["modules"]["dynamo.frontend"]["ok"] is True
     assert record["checks"]["modules"]["dynamo.sglang"]["ok"] is True

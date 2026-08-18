@@ -42,6 +42,8 @@ DISALLOWED_PORTS = {8000, 8080, 18080}
 COMPONENT_ORDER = ["sglang_backend", "dynamo_frontend", "responses_adapter"]
 DEFAULT_MODEL = "zai-org/GLM-5.2"
 DYNAMO_SGLANG_PACKAGES = ["ai-dynamo==1.4.0", "ai-dynamo-runtime==1.4.0", "sglang==0.5.17", "blake3"]
+GLM52_RUNTIME_DEPENDENCY_GROUP = "glm52-runtime"
+GLM52_RUNTIME_LOCKFILE_REF = "repo://uv.lock"
 DYNAMO_REQUIRED_HELP_FLAGS = {
     "dynamo.frontend": ["--http-host", "--http-port", "--model-name", "--dyn-chat-processor"],
     "dynamo.sglang": ["--model-path", "--served-model-name", "--device", "--host", "--port", "--disaggregation-mode"],
@@ -734,11 +736,11 @@ def prepare_dynamo_venv(
         tool: _verify_rootfs_tool(tool, run=run)
         for tool in rootfs_tools
     }
-    create_command = ["uv", "venv", "--python", sys.executable, venv_path]
-    install_command = ["uv", "pip", "install", "--python", python, *packages]
+    create_command = ["uv", "venv", "--clear", "--python", sys.executable, venv_path]
+    install_command = _locked_dependency_sync_command(python)
     commands = [
         _run_prepare_command(create_command, run=run),
-        _run_prepare_command(install_command, run=run),
+        _run_prepare_command(install_command, run=run, env=_locked_dependency_sync_env(venv_path)),
     ]
     module_checks = {
         module: _validate_module_help_contract(module, _probe_python_module_executable(python, module, run=run))
@@ -758,6 +760,7 @@ def prepare_dynamo_venv(
             "python": python,
         },
         "packages": packages,
+        "dependency_resolution": _locked_dependency_resolution_record(),
         "tools": tool_checks,
         "checks": {
             "modules": module_checks,
@@ -1381,6 +1384,37 @@ def _resolve_executable(executable: str) -> str | None:
     return shutil.which(executable)
 
 
+def _locked_dependency_sync_command(python: str) -> list[str]:
+    return [
+        "uv",
+        "sync",
+        "--active",
+        "--locked",
+        "--no-sources-package",
+        "torch",
+        "--no-install-project",
+        "--only-group",
+        GLM52_RUNTIME_DEPENDENCY_GROUP,
+        "--python",
+        python,
+    ]
+
+
+def _locked_dependency_sync_env(venv_path: str) -> dict[str, str]:
+    return {"VIRTUAL_ENV": venv_path}
+
+
+def _locked_dependency_resolution_record() -> dict[str, str]:
+    lock_path = REPO_ROOT / GLM52_RUNTIME_LOCKFILE_REF.removeprefix("repo://")
+    return {
+        "group": GLM52_RUNTIME_DEPENDENCY_GROUP,
+        "lockfile": GLM52_RUNTIME_LOCKFILE_REF,
+        "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+        "selection": "only_group",
+        "sources": "standard_metadata_for_torch",
+    }
+
+
 def _find_module_spec(module_name: str) -> Any:
     try:
         return importlib.util.find_spec(module_name)
@@ -1388,13 +1422,15 @@ def _find_module_spec(module_name: str) -> Any:
         return None
 
 
-def _run_prepare_command(command: list[str], *, run: Any | None = None) -> dict[str, Any]:
+def _run_prepare_command(command: list[str], *, run: Any | None = None, env: dict[str, str] | None = None) -> dict[str, Any]:
     runner = subprocess.run if run is None else run
-    completed = runner(command, capture_output=True, text=True, timeout=1800)
+    command_env = dict(env or {})
+    completed = runner(command, capture_output=True, text=True, timeout=1800, env={**os.environ, **command_env})
     if completed.returncode != 0:
         raise InferenceLaunchError(f"prepare command failed: {' '.join(command)}\n{completed.stderr}")
     return {
         "argv": command,
+        "env": command_env,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }

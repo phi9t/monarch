@@ -688,8 +688,22 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
         inner = argv[argv.index("--") + 1 :]
         if inner[:2] == ["uv", "venv"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
-        if inner[:5] == ["uv", "pip", "install", "--python", "/cache/glm52/venvs/sglang/bin/python"]:
-            return subprocess.CompletedProcess(argv, 0, stdout="installed sglang\n", stderr="")
+        expected_sync_prefix = [
+            "uv",
+            "sync",
+            "--active",
+            "--locked",
+            "--no-sources-package",
+            "torch",
+            "--no-install-project",
+            "--only-group",
+            "glm52-runtime",
+        ]
+        if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
+            assert "--python" in inner
+            assert inner[inner.index("--python") + 1] == "/cache/glm52/venvs/sglang/bin/python"
+            assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            return subprocess.CompletedProcess(argv, 0, stdout="resolved glm52 runtime deps\n", stderr="")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
             "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
@@ -736,15 +750,21 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
 
     flattened_calls = [" ".join(call) for call in calls]
     assert any("/cache/glm52/venvs/sglang" in call for call in flattened_calls)
-    assert any("sglang[all]" in call for call in flattened_calls)
+    assert any("uv sync --active --locked --no-sources-package torch --no-install-project --only-group glm52-runtime" in call for call in flattened_calls)
     assert record["venv"]["python"] == "/cache/glm52/venvs/sglang/bin/python"
     assert record["venv"]["sys_prefix"] == "/cache/glm52/venvs/sglang"
-    assert record["venv"]["packages"] == ["sglang[all]"]
+    assert record["venv"]["packages"] == glm52_sglang_runtime.SGLANG_PREPARE_PACKAGES
     assert record["venv"]["installed_packages"]["sglang"] == "0.4.0"
     assert record["checks"]["platform"]["is_cpu"] is True
     assert record["checks"]["platform"]["utils_is_cpu"] is True
     assert record["checks"]["platform"]["rotary_base_is_cpu"] is True
     assert record["checks"]["platform"]["rotary_base_is_cuda"] is False
+    assert record["dependency_resolution"]["group"] == "glm52-runtime"
+    assert record["dependency_resolution"]["lockfile"] == "repo://uv.lock"
+    assert len(record["dependency_resolution"]["lock_sha256"]) == 64
+    assert record["dependency_resolution"]["selection"] == "only_group"
+    assert record["dependency_resolution"]["sources"] == "standard_metadata_for_torch"
+    assert record["commands"][1]["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
     assert record["checks"]["offloader_patch"]["patch_id"] == "glm52-offloader-v1-plain-tensor-attrs-v1"
     assert record["checks"]["offloader_patch"]["sha256_after"] == "patched-sha"
     assert record["bwrap_plan"]["plan_sha256"] == glm52_sglang_runtime._stable_json_digest(emitted_plans[0])
@@ -752,12 +772,23 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
 
 def test_prepare_sglang_venv_accepts_cuda_platform_for_cuda_declared_spec(tmp_path: Path) -> None:
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del kwargs
         inner = argv[argv.index("--") + 1 :]
         if inner[:2] == ["uv", "venv"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
-        if inner[:5] == ["uv", "pip", "install", "--python", "/cache/glm52/venvs/sglang/bin/python"]:
-            return subprocess.CompletedProcess(argv, 0, stdout="installed sglang\n", stderr="")
+        expected_sync_prefix = [
+            "uv",
+            "sync",
+            "--active",
+            "--locked",
+            "--no-sources-package",
+            "torch",
+            "--no-install-project",
+            "--only-group",
+            "glm52-runtime",
+        ]
+        if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
+            assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            return subprocess.CompletedProcess(argv, 0, stdout="resolved glm52 runtime deps\n", stderr="")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
             "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
@@ -1038,9 +1069,10 @@ def test_validate_preparation_records_rejects_plan_digest_mismatch(tmp_path: Pat
             "venv": {
                 "path": "/cache/glm52/venvs/sglang",
                 "python": "/cache/glm52/venvs/sglang/bin/python",
-                "packages": ["sglang[all]"],
+                "packages": glm52_sglang_runtime.SGLANG_PREPARE_PACKAGES,
                 "installed_packages": {"sglang": "0.4.0"},
             },
+            "dependency_resolution": glm52_sglang_runtime._locked_dependency_resolution_record(),
             "rootfs": {"recipe_sha256": expected_rootfs},
             "bwrap_plan": {"plan_sha256": "wrong"},
             "checks": {
@@ -1108,8 +1140,20 @@ def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path
         inner = argv[argv.index("--") + 1 :]
         if inner[:2] == ["uv", "venv"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
-        if inner[:5] == ["uv", "pip", "install", "--python", "/cache/glm52/venvs/sglang/bin/python"]:
-            return subprocess.CompletedProcess(argv, 0, stdout="installed sglang\n", stderr="")
+        expected_sync_prefix = [
+            "uv",
+            "sync",
+            "--active",
+            "--locked",
+            "--no-sources-package",
+            "torch",
+            "--no-install-project",
+            "--only-group",
+            "glm52-runtime",
+        ]
+        if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
+            assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            return subprocess.CompletedProcess(argv, 0, stdout="resolved glm52 runtime deps\n", stderr="")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
             "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
@@ -1221,9 +1265,10 @@ def valid_preparation_records_for_config(
             "venv": {
                 "path": "/cache/glm52/venvs/sglang",
                 "python": "/cache/glm52/venvs/sglang/bin/python",
-                "packages": ["sglang[all]"],
+                "packages": glm52_sglang_runtime.SGLANG_PREPARE_PACKAGES,
                 "installed_packages": {"sglang": "0.4.0"},
             },
+            "dependency_resolution": glm52_sglang_runtime._locked_dependency_resolution_record(),
             "rootfs": {"recipe_sha256": expected_rootfs},
             "bwrap_plan": {
                 "plan_sha256": glm52_sglang_runtime._preparation_plan_digest_for(
@@ -3331,8 +3376,20 @@ rootfs:
         inner = list(command)[list(command).index("--") + 1 :]
         if inner[:2] == ["uv", "venv"]:
             return FakeCompletedProcess("Using Python 3.12\nCreating virtual environment\n")
-        if inner[:5] == ["uv", "pip", "install", "--python", "/cache/glm52/venvs/sglang/bin/python"]:
-            return FakeCompletedProcess("installed sglang\n")
+        expected_sync_prefix = [
+            "uv",
+            "sync",
+            "--active",
+            "--locked",
+            "--no-sources-package",
+            "torch",
+            "--no-install-project",
+            "--only-group",
+            "glm52-runtime",
+        ]
+        if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
+            assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            return FakeCompletedProcess("resolved glm52 runtime deps\n")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
             "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
@@ -3386,12 +3443,18 @@ rootfs:
     ]
     assert install_call == [
         "uv",
-        "pip",
-        "install",
+        "sync",
+        "--active",
+        "--locked",
+        "--no-sources-package",
+        "torch",
+        "--no-install-project",
+        "--only-group",
+        "glm52-runtime",
         "--python",
         "/cache/glm52/venvs/sglang/bin/python",
-        "sglang[all]",
     ]
+    assert calls[1]["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
     assert patch_call == [
         "/cache/glm52/venvs/sglang/bin/python",
         "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
@@ -3426,9 +3489,14 @@ rootfs:
     assert evidence["run_id"] == "prepare-venv"
     assert evidence["venv"]["path"] == "/cache/glm52/venvs/sglang"
     assert evidence["venv"]["python"] == "/cache/glm52/venvs/sglang/bin/python"
-    assert evidence["venv"]["packages"] == ["sglang[all]"]
+    assert evidence["venv"]["packages"] == glm52_sglang_runtime.SGLANG_PREPARE_PACKAGES
     assert evidence["venv"]["sys_prefix"] == "/cache/glm52/venvs/sglang"
     assert evidence["venv"]["installed_packages"]["sglang"] == "0.4.0"
+    assert evidence["dependency_resolution"]["group"] == "glm52-runtime"
+    assert evidence["dependency_resolution"]["lockfile"] == "repo://uv.lock"
+    assert evidence["dependency_resolution"]["selection"] == "only_group"
+    assert evidence["dependency_resolution"]["sources"] == "standard_metadata_for_torch"
+    assert evidence["commands"][1]["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
     assert evidence["checks"]["served_model_name_flag"] is True
     assert evidence["checks"]["platform"]["is_cuda"] is True
     assert evidence["checks"]["platform"]["rotary_base_is_cuda"] is True
