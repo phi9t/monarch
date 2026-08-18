@@ -4339,6 +4339,172 @@ def test_smoke_command_defaults_to_manifest_bwrap_fixture_suites(
     assert not (result_dir / "terminal-bench-2").exists()
 
 
+def test_smoke_command_rejects_parent_manifest_url_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = tmp_path / "benchmark-manifest.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "suites:",
+                "  - id: ruler",
+                "    profile: long-context",
+                "    dataset_revision: ruler@rev",
+                "    harness_revision: fixture@rev",
+                "    prompt_template: ruler-v1",
+                "    execution_backend: bwrap_rootfs",
+                "    decoding_profile:",
+                "      temperature: 0",
+                "    metric: exact_match",
+            ]
+        )
+        + "\n"
+    )
+    parent_manifest_path = tmp_path / "parent-manifest.json"
+    parent_manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": "parent-run",
+                "model": "zai-org/GLM-5.2",
+                "evidence_level": "benchmark-ready",
+                "completed_responses_base_url": "http://127.0.0.1:19002/v1",
+                "repeatability": {"cycle_count": 3, "ok": True},
+                "components": {
+                    "sglang_backend": {"evidence_level": "completion", "chat": {"text": "ok"}},
+                    "dynamo_frontend": {"evidence_level": "completion", "chat": {"text": "ok"}},
+                    "responses_adapter": {
+                        "evidence_level": "completion",
+                        "nonstream": {"output_text": "ok"},
+                        "stream": {"output_text": "ok"},
+                        "tool_call": {"name": "calculator"},
+                    },
+                },
+                "teardown": {"ok": True, "port_closure": {"ok": True}, "orphan_scan": {"ok": True}},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    args = build_parser().parse_args(
+        [
+            "smoke",
+            "--suite",
+            "ruler",
+            "--manifest",
+            str(manifest_path),
+            "--execution-backend",
+            "bwrap_rootfs",
+            "--responses-base-url",
+            "http://127.0.0.1:19003/v1",
+            "--parent-manifest",
+            str(parent_manifest_path),
+            "--run-id",
+            "mismatch",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-root",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    with pytest.raises(
+        glm52_benchmark_verifier.BenchmarkVerifierError,
+        match="Responses URL does not match completed parent run",
+    ):
+        args.func(args)
+
+
+def test_smoke_command_accepts_parent_manifest_matching_responses_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = tmp_path / "benchmark-manifest.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "suites:",
+                "  - id: ruler",
+                "    profile: long-context",
+                "    dataset_revision: ruler@rev",
+                "    harness_revision: fixture@rev",
+                "    prompt_template: ruler-v1",
+                "    execution_backend: bwrap_rootfs",
+                "    decoding_profile:",
+                "      temperature: 0",
+                "    metric: exact_match",
+            ]
+        )
+        + "\n"
+    )
+    parent_manifest_path = tmp_path / "parent-manifest.json"
+    parent_manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": "parent-run",
+                "model": "zai-org/GLM-5.2",
+                "evidence_level": "benchmark-ready",
+                "completed_responses_base_url": "http://127.0.0.1:19002/v1",
+                "repeatability": {"cycle_count": 3, "ok": True},
+                "components": {
+                    "sglang_backend": {"evidence_level": "completion", "chat": {"text": "ok"}},
+                    "dynamo_frontend": {"evidence_level": "completion", "chat": {"text": "ok"}},
+                    "responses_adapter": {
+                        "evidence_level": "completion",
+                        "nonstream": {"output_text": "ok"},
+                        "stream": {"output_text": "ok"},
+                        "tool_call": {"name": "calculator"},
+                    },
+                },
+                "teardown": {"ok": True, "port_closure": {"ok": True}, "orphan_scan": {"ok": True}},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    summary_path = tmp_path / "results" / "matched" / "summary.json"
+
+    def fake_write_ruler_responses_run(**kwargs: object) -> Path:
+        assert kwargs["responses_base_url"] == "http://127.0.0.1:19002/v1"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps({"status": "pass"}) + "\n")
+        return summary_path
+
+    monkeypatch.setattr(
+        glm52_benchmark_verifier,
+        "write_ruler_responses_run",
+        fake_write_ruler_responses_run,
+    )
+    args = build_parser().parse_args(
+        [
+            "smoke",
+            "--suite",
+            "ruler",
+            "--manifest",
+            str(manifest_path),
+            "--execution-backend",
+            "bwrap_rootfs",
+            "--responses-base-url",
+            "http://127.0.0.1:19002/v1",
+            "--parent-manifest",
+            str(parent_manifest_path),
+            "--run-id",
+            "matched",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-root",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert args.func(args) == 0
+
+
 def test_smoke_command_resumes_completed_matching_fixture_suite(tmp_path: Path) -> None:
     manifest_path = tmp_path / "benchmark-manifest.yaml"
     manifest_path.write_text(

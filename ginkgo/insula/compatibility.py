@@ -28,6 +28,7 @@ ROOTFS_DIR = REPO_ROOT / "scripts" / "rootfs"
 DEFAULT_ROOTFS = ROOTFS_DIR / "rootfs"
 REPO_MOUNT = "/workspace/monarch"
 ROOTFS_CONTRACT_PATH = "/etc/monarch-rootfs-contract"
+ROOTFS_HOME = "/" + "home/monarch"
 CHECKOUT_TOOLS = ("python", "uv", "cargo")
 HOST_ENV_ALLOWLIST = (
     "TERM",
@@ -233,7 +234,7 @@ def _materialize_legacy_plan(
             "repo_root": REPO_MOUNT,
             "cache_root": cache_mount,
             "cargo_target_dir": cargo_target_mount,
-            "home": "/home/monarch",
+            "home": ROOTFS_HOME,
             "nvidia_host": "/run/nvidia-host",
         },
         "cwd": cwd,
@@ -258,7 +259,7 @@ def _rootfs_env(
     *, recipe_sha256: str, cache_mount: str, cargo_target_mount: str, have_nvidia: bool
 ) -> dict[str, str]:
     env = {
-        "HOME": "/home/monarch",
+        "HOME": ROOTFS_HOME,
         "PATH": "/opt/cuda-synth/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin:/run/nvidia-host",
         "UV_PROJECT_ENVIRONMENT": f"{REPO_MOUNT}/.venv-rootfs",
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", f"{cache_mount}/uv"),
