@@ -5760,37 +5760,6 @@ def run_bwrap_sandbox_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_inference_runtime() -> Any:
-    helper_path = Path(__file__).resolve().with_name("glm52_inference_runtime.py")
-    spec = importlib.util.spec_from_file_location("glm52_inference_runtime_for_benchmark_gate", helper_path)
-    if spec is None or spec.loader is None:
-        raise BenchmarkVerifierError(f"cannot load inference runtime helper: {helper_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def validate_parent_manifest_gate(
-    parent_manifest: Path | None,
-    *,
-    responses_base_url: str | None,
-) -> dict[str, Any] | None:
-    if parent_manifest is None:
-        return None
-    try:
-        audit = _load_inference_runtime().audit_parent_manifest(parent_manifest)
-    except Exception as error:
-        raise BenchmarkVerifierError(f"parent manifest gate failed: {error}") from error
-    if responses_base_url is not None and _normalize_base_url(responses_base_url) != _normalize_base_url(audit["responses_base_url"]):
-        raise BenchmarkVerifierError("Responses URL does not match completed parent run")
-    return audit
-
-
-def _normalize_base_url(value: str) -> str:
-    return value.rstrip("/")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Verify local GLM-5.2 benchmark execution contracts."
@@ -5822,7 +5791,6 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--published-scores", type=Path)
     smoke.add_argument("--local-container-runtime", choices=["docker", "podman"], default="docker")
     smoke.add_argument("--responses-base-url", default=os.environ.get("GLM52_RESPONSES_BASE_URL", "http://localhost:8080/v1"))
-    smoke.add_argument("--parent-manifest", type=Path)
     smoke.add_argument("--local-host-route", default="host.docker.internal")
     smoke.add_argument("--harbor-smoke-config", type=Path)
     smoke.add_argument(
@@ -5847,7 +5815,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--responses-base-url",
         default=os.environ.get("GLM52_RESPONSES_BASE_URL", "http://localhost:8080/v1"),
     )
-    calibration.add_argument("--parent-manifest", type=Path)
     calibration.add_argument(
         "--execution-backend",
         required=True,
@@ -5863,8 +5830,6 @@ def build_parser() -> argparse.ArgumentParser:
     conformance.add_argument("--published-scores", type=Path, required=True)
     conformance.add_argument("--suite", action="append")
     conformance.add_argument("--execution-backend")
-    conformance.add_argument("--responses-base-url")
-    conformance.add_argument("--parent-manifest", type=Path)
     conformance.add_argument("--run-id", required=True)
     conformance.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     conformance.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
@@ -5939,7 +5904,6 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
 
 
 def _cmd_smoke(args: argparse.Namespace) -> int:
-    validate_parent_manifest_gate(args.parent_manifest, responses_base_url=args.responses_base_url)
     manifest: dict[str, Any] | None = None
     execution_backend = args.execution_backend
     if args.suite is None:
@@ -6460,7 +6424,6 @@ def _bwrap_codegen_task_result_from_completed(
 
 
 def _cmd_calibration(args: argparse.Namespace) -> int:
-    validate_parent_manifest_gate(args.parent_manifest, responses_base_url=args.responses_base_url)
     manifest = load_yaml_object(args.manifest)
     published_scores = load_yaml_object(args.published_scores) if args.published_scores else None
     if args.suite == ["needle-smoke"]:
@@ -6626,7 +6589,6 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
 
 
 def _cmd_conformance(args: argparse.Namespace) -> int:
-    validate_parent_manifest_gate(args.parent_manifest, responses_base_url=args.responses_base_url)
     manifest = load_yaml_object(args.manifest)
     published_scores = load_yaml_object(args.published_scores)
     validate_manifest_suite_coverage(manifest)

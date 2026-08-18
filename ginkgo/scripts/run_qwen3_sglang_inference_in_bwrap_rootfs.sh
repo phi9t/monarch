@@ -12,12 +12,17 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 DEFAULT_LOCAL_ENV="${REPO_ROOT}/ginkgo/local-env/qwen3-sglang.yaml"
 DEFAULT_DECLARED_SPEC="${REPO_ROOT}/ginkgo/configs/smoke-qwen3-dense.yaml"
+CPU_DECLARED_SPEC="${REPO_ROOT}/ginkgo/configs/smoke-qwen3-cpu.yaml"
 DEFAULT_CACHE_ROOT="${REPO_ROOT}/.scratch/glm52-local-serving/cache/ginkgo"
 DEFAULT_TEMP_ROOT="${REPO_ROOT}/.scratch/glm52-local-serving/tmp/ginkgo"
 
 LOCAL_ENVIRONMENT="${GINKGO_QWEN3_LOCAL_ENVIRONMENT:-$DEFAULT_LOCAL_ENV}"
 DECLARED_SPEC="${GINKGO_QWEN3_DECLARED_SPEC:-$DEFAULT_DECLARED_SPEC}"
 LOCAL_ENVIRONMENT_EXPLICIT=0
+DECLARED_SPEC_EXPLICIT=0
+DEVICE="cuda"
+WAIT_FOR_GPU_FREE_SECONDS=0
+GPU_FREE_STABLE_SECONDS=0
 
 log_stage() {
   printf '[ginkgo-wrapper] stage=%s' "$1"
@@ -47,6 +52,33 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       DECLARED_SPEC="$2"
+      DECLARED_SPEC_EXPLICIT=1
+      shift 2
+      ;;
+    --device)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --device requires cpu or cuda" >&2
+        exit 2
+      fi
+      DEVICE="$2"
+      shift 2
+      ;;
+    --wait-for-gpu-free-seconds)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --wait-for-gpu-free-seconds requires an integer" >&2
+        exit 2
+      fi
+      WAIT_FOR_GPU_FREE_SECONDS="$2"
+      args+=("$1" "$2")
+      shift 2
+      ;;
+    --gpu-free-stable-seconds)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --gpu-free-stable-seconds requires an integer" >&2
+        exit 2
+      fi
+      GPU_FREE_STABLE_SECONDS="$2"
+      args+=("$1" "$2")
       shift 2
       ;;
     -h|--help)
@@ -59,6 +91,22 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$DEVICE" in
+  cpu)
+    log_stage select_device "device=cpu"
+    if [[ "$DECLARED_SPEC_EXPLICIT" -eq 0 && -z "${GINKGO_QWEN3_DECLARED_SPEC:-}" ]]; then
+      DECLARED_SPEC="$CPU_DECLARED_SPEC"
+    fi
+    ;;
+  cuda)
+    log_stage select_device "device=cuda"
+    ;;
+  *)
+    echo "error: --device must be cpu or cuda: $DEVICE" >&2
+    exit 2
+    ;;
+esac
 
 for arg in "${args[@]}"; do
   if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
@@ -92,7 +140,7 @@ EOF
   log_stage wrote_default_local_environment "path=${LOCAL_ENVIRONMENT}"
 }
 
-log_stage start "repo=${REPO_ROOT}" "declared_spec=${DECLARED_SPEC}" "local_environment=${LOCAL_ENVIRONMENT}"
+log_stage start "repo=${REPO_ROOT}" "device=${DEVICE}" "declared_spec=${DECLARED_SPEC}" "local_environment=${LOCAL_ENVIRONMENT}" "wait_for_gpu_free_seconds=${WAIT_FOR_GPU_FREE_SECONDS}" "gpu_free_stable_seconds=${GPU_FREE_STABLE_SECONDS}"
 
 if [[ ! -f "$LOCAL_ENVIRONMENT" ]]; then
   if [[ "$LOCAL_ENVIRONMENT_EXPLICIT" -eq 1 || -n "${GINKGO_QWEN3_LOCAL_ENVIRONMENT:-}" ]]; then

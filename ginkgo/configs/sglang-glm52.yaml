@@ -15,6 +15,7 @@ model:
   expected_model_ids: [zai-org/GLM-5.2]
 runtime:
   kind: sglang_openai
+  device: cuda
   cuda_visible_devices: "0,1,2,3,4,5,6,7"
   tensor_parallel_size: 8
   dtype: bfloat16

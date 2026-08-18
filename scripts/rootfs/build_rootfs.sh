@@ -182,7 +182,7 @@ RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         build-essential g++ clang libclang-dev llvm-dev \
         liblzma-dev libunwind-dev libibverbs-dev librdmacm-dev \
-        protobuf-compiler pkg-config git curl ca-certificates rsync && \
+        protobuf-compiler pkg-config git curl ca-certificates rsync bubblewrap && \
     rm -rf /var/lib/apt/lists/*
 
 # uv: copy pinned standalone binaries from the official image.
@@ -259,6 +259,7 @@ RUN set -euo pipefail; \
     test "$(node --version)" = "v${NODE_VERSION}"; \
     test "$(npm --version)" = "${NPM_VERSION}"; \
     test "$(mdbook --version)" = "mdbook v${MDBOOK_VERSION}"; \
+    bwrap --version; \
     cargo nextest --version | grep -q "${NEXTEST_VERSION}"; \
     /opt/cuda-synth/bin/nvcc --version | grep -q "${CUDA_NVCC_VERSION}"
 
@@ -282,10 +283,10 @@ RUN printf '%s\n' \
         "MONARCH_CUDA_NVDISASM_VERSION=${CUDA_NVDISASM_VERSION}" \
         > /etc/monarch-rootfs-contract
 
-# Pre-create the read-only mount points bwrap binds over: the checkout mount,
-# and the writable tmpfs where host NVIDIA driver libraries are injected. A
-# read-only root cannot have mkdir applied at entry.
-RUN mkdir -p /workspace/monarch /run/nvidia-host
+# Pre-create the read-only mount points bwrap binds over. A read-only root
+# cannot have mkdir applied at entry, and nested bwrap commands need top-level
+# bind parents such as /cache before they can attach writable subtrees.
+RUN mkdir -p /cache /workspace/monarch /run/nvidia-host
 
 LABEL org.pytorch.monarch.rootfs-recipe=${ROOTFS_RECIPE_SHA256}
 DOCKERFILE

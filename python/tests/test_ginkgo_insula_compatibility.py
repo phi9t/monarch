@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from ginkgo.insula import cli
+from ginkgo.insula import compatibility
 from ginkgo.insula.bwrap_plan import emit_plan
 from ginkgo.insula.cli import build_parser
 from ginkgo.insula.cli import run_insula_from_args
@@ -155,6 +156,66 @@ def test_enter_rootfs_compat_emits_plan_without_launch(
     assert "--clearenv" in plan["outer_argv"]
     assert "--" in plan["outer_argv"]
     assert plan["outer_argv"][-3:] == ["python3", "-c", "print('ok')"]
+
+
+def test_nvidia_projection_uses_cuda_visible_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakePath:
+        def __init__(self, value: object) -> None:
+            self._path = Path(value)
+
+        def glob(self, pattern: str):
+            text = str(self._path)
+            if text == "/dev" and pattern == "nvidia*":
+                return [
+                    FakePath("/dev/nvidia0"),
+                    FakePath("/dev/nvidia1"),
+                    FakePath("/dev/nvidia2"),
+                    FakePath("/dev/nvidiactl"),
+                    FakePath("/dev/nvidia-uvm"),
+                ]
+            if text == "/usr/lib/x86_64-linux-gnu" and pattern == "libcuda.so*":
+                return [FakePath("/usr/lib/x86_64-linux-gnu/libcuda.so.1")]
+            if text == "/usr/lib/x86_64-linux-gnu" and pattern == "libnvidia-*.so*":
+                return [FakePath("/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1")]
+            return []
+
+        @property
+        def name(self) -> str:
+            return self._path.name
+
+        def is_file(self) -> bool:
+            return str(self._path) == "/usr/bin/nvidia-smi"
+
+        def mkdir(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def __truediv__(self, other: object):
+            return FakePath(self._path / str(other))
+
+        def __fspath__(self) -> str:
+            return str(self._path)
+
+        def __str__(self) -> str:
+            return str(self._path)
+
+        def __lt__(self, other: object) -> bool:
+            return str(self) < str(other)
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(compatibility, "Path", FakePath)
+    monkeypatch.setattr(compatibility, "_cache_host_root", lambda: tmp_path / "cache")
+
+    mounts, have_nvidia = compatibility._append_nvidia_projection([])
+
+    projected_devices = {
+        mount["sandbox_path"]
+        for mount in mounts
+        if mount["purpose"] == "dev-nvidia"
+    }
+    assert have_nvidia is True
+    assert projected_devices == {"/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm"}
 
 
 def test_emit_plan_cli_matches_direct_plan(tmp_path: Path) -> None:

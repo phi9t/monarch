@@ -83,6 +83,7 @@ model:
   expected_model_ids: [zai-org/GLM-5.2]
 runtime:
   kind: sglang_openai
+  device: cuda
   cuda_visible_devices: "0,1,2,3,4,5,6,7"
   tensor_parallel_size: 8
   dtype: bfloat16
@@ -131,6 +132,17 @@ repeatability:
 """
 
 VALID_DECLARED_WITH_OVERLAY = VALID_DECLARED
+
+CPU_DECLARED = VALID_DECLARED.replace(
+    "run_group: glm52-sglang-local",
+    "run_group: qwen3-sglang-cpu",
+).replace(
+    "model:\n  id: zai-org/GLM-5.2\n  path: zai-org/GLM-5.2\n  served_model_name: zai-org/GLM-5.2\n  expected_model_ids: [zai-org/GLM-5.2]",
+    "model:\n  id: Qwen/Qwen3-0.6B\n  path: Qwen/Qwen3-0.6B\n  served_model_name: Qwen/Qwen3-0.6B\n  expected_model_ids: [Qwen/Qwen3-0.6B]",
+).replace(
+    '  device: cuda\n  cuda_visible_devices: "0,1,2,3,4,5,6,7"\n  tensor_parallel_size: 8\n  dtype: bfloat16\n  context_length: 262144\n  kv_cache_dtype: fp8_e4m3\n  mem_fraction_static: 0.72\n  max_total_tokens: 32768\n  max_running_requests: 1\n  cpu_offload_gb: 16',
+    '  device: cpu\n  cuda_visible_devices: ""\n  tensor_parallel_size: 1\n  dtype: float32\n  context_length: 2048\n  kv_cache_dtype: auto\n  mem_fraction_static: 0.40\n  max_total_tokens: 512\n  max_running_requests: 1\n  cpu_offload_gb: 0',
+).replace("  gpu: required", "  gpu: none")
 
 VALID_LOCAL_ENV = """\
 schema_version: 1
@@ -189,6 +201,7 @@ def test_load_declared_spec_accepts_complete_spec(tmp_path: Path) -> None:
     assert declared.model.served_model_name == "zai-org/GLM-5.2"
     assert declared.model.served_model_name in declared.model.expected_model_ids
     assert declared.runtime.kind == "sglang_openai"
+    assert declared.runtime.device == "cuda"
     assert declared.runtime.context_length == 262144
     assert declared.runtime.kv_cache_dtype == "fp8_e4m3"
     assert declared.runtime.mem_fraction_static == 0.72
@@ -272,6 +285,42 @@ def test_load_declared_spec_rejects_invalid_policy(
         load_declared_spec(write_spec(tmp_path / "declared.yaml", invalid))
 
 
+@pytest.mark.parametrize(
+    ("declared_text", "match"),
+    [
+        (VALID_DECLARED.replace("  device: cuda\n", "  device: tpu\n"), "runtime.device must be cpu or cuda"),
+        (
+            VALID_DECLARED.replace(
+                '  device: cuda\n  cuda_visible_devices: "0,1,2,3,4,5,6,7"\n',
+                '  device: cuda\n  cuda_visible_devices: ""\n',
+            ),
+            "runtime.cuda_visible_devices is required for cuda",
+        ),
+        (
+            VALID_DECLARED.replace(
+                '  device: cuda\n  cuda_visible_devices: "0,1,2,3,4,5,6,7"\n',
+                '  device: cpu\n  cuda_visible_devices: "0"\n',
+            ).replace("  gpu: required", "  gpu: none"),
+            "runtime.cuda_visible_devices must be empty for cpu",
+        ),
+        (
+            VALID_DECLARED.replace(
+                '  device: cuda\n  cuda_visible_devices: "0,1,2,3,4,5,6,7"',
+                '  device: cpu\n  cuda_visible_devices: ""',
+            ),
+            "sandbox.gpu must be none for cpu",
+        ),
+    ],
+)
+def test_load_declared_spec_rejects_device_policy_mismatches(
+    tmp_path: Path,
+    declared_text: str,
+    match: str,
+) -> None:
+    with pytest.raises(RuntimeConfigError, match=match):
+        load_declared_spec(write_spec(tmp_path / "declared.yaml", declared_text))
+
+
 def test_load_declared_spec_rejects_unknown_fields(tmp_path: Path) -> None:
     invalid = VALID_DECLARED + "surprise: true\n"
 
@@ -297,6 +346,269 @@ def test_materialized_config_contains_sglang_rootfs_overlay(tmp_path: Path) -> N
     assert config.sandbox["sglang"]["cache"] == "/cache/glm52/sglang"
     assert config.launch["env"]["HF_HOME"] == "/cache/glm52/hf-home"
     assert config.launch["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+
+
+def test_cpu_declared_config_materializes_cpu_only_sglang_launch(tmp_path: Path) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", CPU_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="qwen3-sglang-cpu-001",
+        port=19017,
+    )
+
+    inner = config.launch["inner_argv"]
+    outer = glm52_sglang_runtime._resolved_outer_argv(config)
+    insula = glm52_sglang_runtime.build_insula_invocation_spec(config)
+
+    assert declared.runtime.device == "cpu"
+    assert config.runtime["device"] == "cpu"
+    assert config.runtime["cuda_visible_devices"] == ""
+    assert config.sandbox["gpu"] == "none"
+    assert "CUDA_VISIBLE_DEVICES" not in config.launch["env"]
+    assert "CUDA_VISIBLE_DEVICES" not in config.sandbox["env"]
+    assert config.launch["env"]["SGLANG_USE_CPU_ENGINE"] == "1"
+    assert config.sandbox["env"]["SGLANG_USE_CPU_ENGINE"] == "1"
+    assert inner[inner.index("--device") + 1] == "cpu"
+    assert inner[inner.index("--tp") + 1] == "1"
+    assert outer[outer.index("--device") + 1] == "cpu"
+    assert insula.gpu == "none"
+    assert "CUDA_VISIBLE_DEVICES" not in insula.environment.values
+    assert insula.environment.values["SGLANG_USE_CPU_ENGINE"] == "1"
+
+
+def test_cpu_rootfs_runtime_binds_driver_libs_without_gpu_devices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", CPU_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="qwen3-sglang-cpu-001",
+        port=19017,
+    )
+
+    class FakePath:
+        def __init__(self, value: object) -> None:
+            self._path = Path(value)
+
+        def glob(self, pattern: str):
+            text = str(self._path)
+            if text == "/usr/lib/x86_64-linux-gnu" and pattern == "libcuda.so*":
+                return [FakePath("/usr/lib/x86_64-linux-gnu/libcuda.so.1")]
+            if text == "/usr/lib/x86_64-linux-gnu" and pattern == "libnvidia-*.so*":
+                return [FakePath("/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1")]
+            if text == "/dev" and pattern == "nvidia*":
+                return [FakePath("/dev/nvidia0")]
+            return []
+
+        @property
+        def name(self) -> str:
+            return self._path.name
+
+        def exists(self) -> bool:
+            return False
+
+        def is_file(self) -> bool:
+            return False
+
+        def __truediv__(self, other: object):
+            return FakePath(self._path / str(other))
+
+        def __fspath__(self) -> str:
+            return str(self._path)
+
+        def __str__(self) -> str:
+            return str(self._path)
+
+        def __lt__(self, other: object) -> bool:
+            return str(self) < str(other)
+
+    monkeypatch.setattr(glm52_sglang_runtime, "Path", FakePath)
+
+    binds, env = glm52_sglang_runtime._rootfs_runtime_binds_and_env(config)
+
+    bind_by_name = {bind.name: bind for bind in binds}
+    assert "nvidia-lib-libcuda-so-1" in bind_by_name
+    assert "nvidia-lib-libnvidia-ml-so-1" in bind_by_name
+    assert bind_by_name["nvidia-lib-libcuda-so-1"].mode == "ro"
+    assert env["LD_LIBRARY_PATH"].startswith("/run/nvidia-host:")
+    assert env["LIBRARY_PATH"].startswith("/run/nvidia-host:")
+    assert all(not bind.name.startswith("dev-nvidia") for bind in binds)
+    assert "nvidia-smi" not in bind_by_name
+    assert "NVIDIA_VISIBLE_DEVICES" not in env
+
+
+def test_cpu_rootfs_runtime_reprojects_driver_libs_from_outer_rootfs_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", CPU_DECLARED))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="qwen3-sglang-cpu-001",
+        port=19017,
+    )
+
+    class FakePath:
+        def __init__(self, value: object) -> None:
+            self._path = Path(value)
+
+        def glob(self, pattern: str):
+            text = str(self._path)
+            if text == "/usr/lib/x86_64-linux-gnu":
+                return []
+            if text == "/run/nvidia-host" and pattern == "libcuda.so*":
+                return [FakePath("/run/nvidia-host/libcuda.so.1")]
+            if text == "/run/nvidia-host" and pattern == "libnvidia-*.so*":
+                return [FakePath("/run/nvidia-host/libnvidia-ml.so.1")]
+            if text == "/dev" and pattern == "nvidia*":
+                return [FakePath("/dev/nvidia0")]
+            return []
+
+        @property
+        def name(self) -> str:
+            return self._path.name
+
+        def exists(self) -> bool:
+            return False
+
+        def is_file(self) -> bool:
+            return False
+
+        def __truediv__(self, other: object):
+            return FakePath(self._path / str(other))
+
+        def __fspath__(self) -> str:
+            return str(self._path)
+
+        def __str__(self) -> str:
+            return str(self._path)
+
+        def __lt__(self, other: object) -> bool:
+            return str(self) < str(other)
+
+    monkeypatch.setattr(glm52_sglang_runtime, "Path", FakePath)
+
+    binds, env = glm52_sglang_runtime._rootfs_runtime_binds_and_env(config)
+
+    bind_by_name = {bind.name: bind for bind in binds}
+    assert bind_by_name["nvidia-lib-libcuda-so-1"].host == "host:///run/nvidia-host/libcuda.so.1"
+    assert bind_by_name["nvidia-lib-libcuda-so-1"].sandbox == "/run/nvidia-host/libcuda.so.1"
+    assert bind_by_name["nvidia-lib-libnvidia-ml-so-1"].host == "host:///run/nvidia-host/libnvidia-ml.so.1"
+    assert env["LD_LIBRARY_PATH"].startswith("/run/nvidia-host:")
+    assert all(not bind.name.startswith("dev-nvidia") for bind in binds)
+    assert "NVIDIA_VISIBLE_DEVICES" not in env
+
+
+def test_cuda_rootfs_runtime_projects_only_visible_gpu_devices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared_text = VALID_DECLARED.replace(
+        '  cuda_visible_devices: "0,1,2,3,4,5,6,7"\n  tensor_parallel_size: 8\n',
+        '  cuda_visible_devices: "0"\n  tensor_parallel_size: 1\n',
+    )
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", declared_text))
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="qwen3-sglang-cuda-001",
+        port=19017,
+    )
+
+    class FakePath:
+        def __init__(self, value: object) -> None:
+            self._path = Path(value)
+
+        def glob(self, pattern: str):
+            text = str(self._path)
+            if text == "/usr/lib/x86_64-linux-gnu" and pattern == "libcuda.so*":
+                return [FakePath("/usr/lib/x86_64-linux-gnu/libcuda.so.1")]
+            if text == "/usr/lib/x86_64-linux-gnu" and pattern == "libnvidia-*.so*":
+                return [FakePath("/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1")]
+            if text == "/dev" and pattern == "nvidia*":
+                return [
+                    FakePath("/dev/nvidia0"),
+                    FakePath("/dev/nvidia1"),
+                    FakePath("/dev/nvidia2"),
+                    FakePath("/dev/nvidia3"),
+                    FakePath("/dev/nvidia4"),
+                    FakePath("/dev/nvidia5"),
+                    FakePath("/dev/nvidia6"),
+                    FakePath("/dev/nvidia7"),
+                    FakePath("/dev/nvidiactl"),
+                    FakePath("/dev/nvidia-uvm"),
+                    FakePath("/dev/nvidia-uvm-tools"),
+                    FakePath("/dev/nvidia-modeset"),
+                    FakePath("/dev/nvidia-caps"),
+                ]
+            return []
+
+        @property
+        def name(self) -> str:
+            return self._path.name
+
+        def exists(self) -> bool:
+            return True
+
+        def is_file(self) -> bool:
+            return str(self._path) == "/usr/bin/nvidia-smi"
+
+        def __truediv__(self, other: object):
+            return FakePath(self._path / str(other))
+
+        def __fspath__(self) -> str:
+            return str(self._path)
+
+        def __str__(self) -> str:
+            return str(self._path)
+
+        def __lt__(self, other: object) -> bool:
+            return str(self) < str(other)
+
+    monkeypatch.setattr(glm52_sglang_runtime, "Path", FakePath)
+
+    binds, env = glm52_sglang_runtime._rootfs_runtime_binds_and_env(config)
+
+    dev_sandboxes = {bind.sandbox for bind in binds if bind.mode == "dev"}
+    assert {
+        "/dev/nvidia0",
+        "/dev/nvidiactl",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-modeset",
+        "/dev/nvidia-caps",
+    }.issubset(dev_sandboxes)
+    assert "/dev/nvidia1" not in dev_sandboxes
+    assert "/dev/nvidia2" not in dev_sandboxes
+    assert "/dev/nvidia7" not in dev_sandboxes
+    assert env["NVIDIA_VISIBLE_DEVICES"] == "0"
+
+
+def test_checked_in_cpu_qwen3_config_materializes_cpu_only(tmp_path: Path) -> None:
+    declared_path = Path(__file__).resolve().parents[2] / "ginkgo" / "configs" / "smoke-qwen3-cpu.yaml"
+    declared = load_declared_spec(declared_path)
+    local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
+
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="qwen3-sglang-cpu-001",
+        port=19017,
+    )
+
+    assert config.run_group == "ginkgo-smoke-qwen3-cpu"
+    assert config.runtime["device"] == "cpu"
+    assert config.sandbox["gpu"] == "none"
+    assert "CUDA_VISIBLE_DEVICES" not in config.launch["env"]
 
 
 def test_declared_example_contains_sglang_rootfs_overlay(tmp_path: Path) -> None:
@@ -400,7 +712,10 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
                 stdout=(
                     '{"python": "/cache/glm52/venvs/sglang/bin/python", '
                     '"sys_prefix": "/cache/glm52/venvs/sglang", '
-                    '"packages": {"sglang": "0.4.0"}}'
+                    '"packages": {"sglang": "0.4.0"}, '
+                    '"platform": {"class": "CpuSRTPlatform", "device_name": "cpu", "device_type": "cpu", '
+                    '"is_cpu": true, "is_cuda": false, "utils_is_cpu": true, '
+                    '"rotary_base_is_cpu": true, "rotary_base_is_cuda": false}}'
                 ),
                 stderr="",
             )
@@ -409,7 +724,7 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
         raise AssertionError(f"unexpected command: {inner}")
 
     record = prepare_sglang_venv(
-        declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+        declared_path=write_spec(tmp_path / "declared.yaml", CPU_DECLARED),
         local_environment_path=write_local_environment(tmp_path),
         run_id="prepare-venv-test",
         run=fake_run,
@@ -424,10 +739,117 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
     assert any("sglang[all]" in call for call in flattened_calls)
     assert record["venv"]["python"] == "/cache/glm52/venvs/sglang/bin/python"
     assert record["venv"]["sys_prefix"] == "/cache/glm52/venvs/sglang"
+    assert record["venv"]["packages"] == ["sglang[all]"]
     assert record["venv"]["installed_packages"]["sglang"] == "0.4.0"
+    assert record["checks"]["platform"]["is_cpu"] is True
+    assert record["checks"]["platform"]["utils_is_cpu"] is True
+    assert record["checks"]["platform"]["rotary_base_is_cpu"] is True
+    assert record["checks"]["platform"]["rotary_base_is_cuda"] is False
     assert record["checks"]["offloader_patch"]["patch_id"] == "glm52-offloader-v1-plain-tensor-attrs-v1"
     assert record["checks"]["offloader_patch"]["sha256_after"] == "patched-sha"
     assert record["bwrap_plan"]["plan_sha256"] == glm52_sglang_runtime._stable_json_digest(emitted_plans[0])
+
+
+def test_prepare_sglang_venv_accepts_cuda_platform_for_cuda_declared_spec(tmp_path: Path) -> None:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        inner = argv[argv.index("--") + 1 :]
+        if inner[:2] == ["uv", "venv"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
+        if inner[:5] == ["uv", "pip", "install", "--python", "/cache/glm52/venvs/sglang/bin/python"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="installed sglang\n", stderr="")
+        if inner[:4] == [
+            "/cache/glm52/venvs/sglang/bin/python",
+            "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
+            "--offloader",
+            "/cache/glm52/venvs/sglang/lib/python3.12/site-packages/sglang/srt/utils/offloader.py",
+        ]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    '{"patch_id":"glm52-offloader-v1-plain-tensor-attrs-v1",'
+                    '"sha256_after":"patched-sha","changed":true}\n'
+                ),
+                stderr="",
+            )
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.SGLANG_VENV_PROBE_SCRIPT]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    '{"python": "/cache/glm52/venvs/sglang/bin/python", '
+                    '"sys_prefix": "/cache/glm52/venvs/sglang", '
+                    '"packages": {"sglang": "0.4.0"}, '
+                    '"platform": {"class": "CudaSRTPlatform", "device_name": "cuda", "device_type": "cuda", '
+                    '"is_cpu": false, "is_cuda": true, "utils_is_cpu": false, '
+                    '"rotary_base_is_cpu": false, "rotary_base_is_cuda": true}}'
+                ),
+                stderr="",
+            )
+        if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "sglang.launch_server"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="usage: --served-model-name NAME\n", stderr="")
+        raise AssertionError(f"unexpected command: {inner}")
+
+    record = prepare_sglang_venv(
+        declared_path=write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY),
+        local_environment_path=write_local_environment(tmp_path),
+        run_id="prepare-venv-cuda-test",
+        run=fake_run,
+        plan_emitter=lambda config, inner_argv, env=None: valid_emitted_preparation_plan(config, inner_argv, env=env),
+    )
+
+    assert record["checks"]["platform"]["is_cuda"] is True
+    assert record["checks"]["platform"]["rotary_base_is_cuda"] is True
+
+
+def test_preparation_command_creates_writable_mount_sources(tmp_path: Path) -> None:
+    config = materialized_config_for_test(tmp_path, port=19021)
+    cache_mounts = [
+        Path(glm52_sglang_runtime._resolve_host_path_ref(config, mount["host_path_ref"]))
+        for mount in config.sandbox["mounts"]
+        if mount["mode"] == "rw" and mount["host_path_ref"].startswith(("cache://", "temp://", "run://"))
+    ]
+    for path in cache_mounts:
+        assert not path.exists()
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        for path in cache_mounts:
+            assert path.is_dir(), f"missing mount source before bwrap command: {path}"
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    completed = glm52_sglang_runtime._run_preparation_command(
+        config,
+        ["true"],
+        run=fake_run,
+    )
+
+    assert completed.returncode == 0
+
+
+def test_preparation_command_creates_repo_projected_writable_mountpoints(tmp_path: Path) -> None:
+    config = materialized_config_for_test(tmp_path, port=19021)
+    target_mountpoint = (
+        Path(config.resolved_paths["repo"])
+        / "target"
+        / "bwrap"
+        / glm52_sglang_runtime._rootfs_recipe_digest(config)
+    )
+    assert not target_mountpoint.exists()
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        assert target_mountpoint.is_dir()
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    completed = glm52_sglang_runtime._run_preparation_command(
+        config,
+        ["true"],
+        run=fake_run,
+    )
+
+    assert completed.returncode == 0
 
 
 def test_sglang_offloader_patch_helper_is_idempotent(tmp_path: Path) -> None:
@@ -617,11 +1039,22 @@ def test_validate_preparation_records_rejects_plan_digest_mismatch(tmp_path: Pat
                 "path": "/cache/glm52/venvs/sglang",
                 "python": "/cache/glm52/venvs/sglang/bin/python",
                 "packages": ["sglang[all]"],
+                "installed_packages": {"sglang": "0.4.0"},
             },
             "rootfs": {"recipe_sha256": expected_rootfs},
             "bwrap_plan": {"plan_sha256": "wrong"},
             "checks": {
                 "served_model_name_flag": True,
+                "platform": {
+                    "class": "CudaSRTPlatform",
+                    "device_name": "cuda",
+                    "device_type": "cuda",
+                    "is_cpu": False,
+                    "is_cuda": True,
+                    "utils_is_cpu": False,
+                    "rotary_base_is_cpu": False,
+                    "rotary_base_is_cuda": True,
+                },
                 "offloader_patch": {
                     "patch_id": "glm52-offloader-v1-plain-tensor-attrs-v1",
                     "sha256_after": "patched-sha",
@@ -699,7 +1132,10 @@ def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path
                 stdout=(
                     '{"python": "/cache/glm52/venvs/sglang/bin/python", '
                     '"sys_prefix": "/cache/glm52/venvs/sglang", '
-                    '"packages": {"sglang": "0.4.0"}}'
+                    '"packages": {"sglang": "0.4.0"}, '
+                    '"platform": {"class": "CudaSRTPlatform", "device_name": "cuda", "device_type": "cuda", '
+                    '"is_cpu": false, "is_cuda": true, "utils_is_cpu": false, '
+                    '"rotary_base_is_cpu": false, "rotary_base_is_cuda": true}}'
                 ),
                 stderr="",
             )
@@ -740,6 +1176,89 @@ def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path
 
     assert records["sglang_venv"]["run_id"] == "prepare-generated"
     assert records["model_cache"]["run_id"] == "prepare-generated"
+
+
+def test_validate_preparation_records_rejects_cpu_platform_record_for_cuda_config(tmp_path: Path) -> None:
+    config = materialized_config_for_test(tmp_path, port=19021)
+    records = valid_preparation_records_for_config(
+        config,
+        platform={
+            "class": "CpuSRTPlatform",
+            "device_name": "cpu",
+            "device_type": "cpu",
+            "is_cpu": True,
+            "is_cuda": False,
+            "utils_is_cpu": True,
+            "rotary_base_is_cpu": True,
+            "rotary_base_is_cuda": False,
+        },
+    )
+    for name, record in records.items():
+        path = glm52_sglang_runtime._preparation_record_path(config, name)
+        glm52_sglang_runtime._write_json(path, record)
+    for name, inner_argv, env in (
+        ("sglang_venv_record", glm52_sglang_runtime._sglang_venv_prepare_command(), None),
+        ("model_cache_record", glm52_sglang_runtime._model_cache_prepare_command(config), glm52_sglang_runtime._model_cache_prepare_env()),
+    ):
+        plan_path = glm52_sglang_runtime._preparation_plan_path_for_record(config, name)
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(yaml.safe_dump(valid_emitted_preparation_plan(config, inner_argv, env=env), sort_keys=False))
+
+    with pytest.raises(RuntimeConfigError, match="reports CPU platform for CUDA route"):
+        validate_preparation_records(config=config)
+
+
+def valid_preparation_records_for_config(
+    config,
+    *,
+    platform: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    expected_rootfs = glm52_sglang_runtime._rootfs_recipe_digest(config)
+    return {
+        "sglang_venv_record": {
+            "schema_version": 1,
+            "run_id": config.run_id,
+            "venv": {
+                "path": "/cache/glm52/venvs/sglang",
+                "python": "/cache/glm52/venvs/sglang/bin/python",
+                "packages": ["sglang[all]"],
+                "installed_packages": {"sglang": "0.4.0"},
+            },
+            "rootfs": {"recipe_sha256": expected_rootfs},
+            "bwrap_plan": {
+                "plan_sha256": glm52_sglang_runtime._preparation_plan_digest_for(
+                    config,
+                    glm52_sglang_runtime._sglang_venv_prepare_command(),
+                )
+            },
+            "checks": {
+                "served_model_name_flag": True,
+                "platform": platform,
+                "offloader_patch": {
+                    "patch_id": "glm52-offloader-v1-plain-tensor-attrs-v1",
+                    "sha256_after": "patched-sha",
+                },
+            },
+        },
+        "model_cache_record": {
+            "schema_version": 1,
+            "run_id": config.run_id,
+            "model_cache": {
+                "model_id": "zai-org/GLM-5.2",
+                "snapshot_path": "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc",
+                "shard_count": 1,
+                "missing_shard_count": 0,
+            },
+            "rootfs": {"recipe_sha256": expected_rootfs},
+            "bwrap_plan": {
+                "plan_sha256": glm52_sglang_runtime._preparation_plan_digest_for(
+                    config,
+                    glm52_sglang_runtime._model_cache_prepare_command(config),
+                    env=glm52_sglang_runtime._model_cache_prepare_env(),
+                )
+            },
+        },
+    }
 
 
 def test_validate_preparation_records_rejects_missing_records(tmp_path: Path) -> None:
@@ -1645,6 +2164,7 @@ def test_materialize_runtime_config_writes_custom_port_everywhere(tmp_path: Path
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--port") + 1] == "19017"
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--host") + 1] == "127.0.0.1"
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--served-model-name") + 1] == "zai-org/GLM-5.2"
+    assert config.launch["inner_argv"][config.launch["inner_argv"].index("--device") + 1] == "cuda"
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--context-length") + 1] == "262144"
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--mem-fraction-static") + 1] == "0.72"
@@ -1652,6 +2172,7 @@ def test_materialize_runtime_config_writes_custom_port_everywhere(tmp_path: Path
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--max-running-requests") + 1] == "1"
     assert config.launch["inner_argv"][config.launch["inner_argv"].index("--cpu-offload-gb") + 1] == "16"
     assert config.runtime["context_length"] == 262144
+    assert config.runtime["device"] == "cuda"
     assert config.runtime["kv_cache_dtype"] == "fp8_e4m3"
     assert config.runtime["mem_fraction_static"] == 0.72
     assert config.runtime["max_total_tokens"] == 32768
@@ -1714,6 +2235,7 @@ def test_materialize_runtime_config_uses_rootfs_owned_sglang_venv(tmp_path: Path
     )
     assert config.launch["env"]["HF_HOME"] == "/cache/glm52/hf-home"
     assert config.launch["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert config.launch["env"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
     assert config.sandbox["env"]["HF_HOME"] == "/cache/glm52/hf-home"
     assert config.sandbox["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
     assert all(not value.startswith("/") for value in config.host_layout.values())
@@ -2040,6 +2562,8 @@ def test_build_insula_invocation_spec_preserves_sglang_runtime_contract(tmp_path
     assert spec.environment.values["CUDA_HOME"] == "/opt/cuda-synth"
     assert spec.environment.values["UV_PROJECT_ENVIRONMENT"] == "/workspace/monarch/.venv-rootfs"
     assert spec.environment.values["MONARCH_IN_ROOTFS"] == "1"
+    assert spec.environment.values["USER"] == "monarch"
+    assert spec.environment.values["LOGNAME"] == "monarch"
     assert spec.repo.mode == "ro"
     assert {bind.sandbox for bind in spec.binds} >= {
         "/run/glm52",
@@ -2823,7 +3347,10 @@ rootfs:
             return FakeCompletedProcess(
                 '{"python":"/cache/glm52/venvs/sglang/bin/python",'
                 '"sys_prefix":"/cache/glm52/venvs/sglang",'
-                '"packages":{"sglang":"0.4.0"}}\n'
+                '"packages":{"sglang":"0.4.0"},'
+                '"platform":{"class":"CudaSRTPlatform","device_name":"cuda","device_type":"cuda",'
+                '"is_cpu":false,"is_cuda":true,"utils_is_cpu":false,'
+                '"rotary_base_is_cpu":false,"rotary_base_is_cuda":true}}\n'
             )
         if inner[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-m", "sglang.launch_server"]:
             return FakeCompletedProcess("usage: --served-model-name NAME\n")
@@ -2903,6 +3430,10 @@ rootfs:
     assert evidence["venv"]["sys_prefix"] == "/cache/glm52/venvs/sglang"
     assert evidence["venv"]["installed_packages"]["sglang"] == "0.4.0"
     assert evidence["checks"]["served_model_name_flag"] is True
+    assert evidence["checks"]["platform"]["is_cuda"] is True
+    assert evidence["checks"]["platform"]["rotary_base_is_cuda"] is True
+    assert evidence["checks"]["platform"]["is_cpu"] is False
+    assert evidence["checks"]["platform"]["rotary_base_is_cpu"] is False
     assert evidence["checks"]["offloader_patch"]["patch_id"] == "glm52-offloader-v1-plain-tensor-attrs-v1"
     assert evidence["checks"]["offloader_patch"]["sha256_after"] == "patched-sha"
     assert "plan_sha256" in evidence["bwrap_plan"]

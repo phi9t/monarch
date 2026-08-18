@@ -191,6 +191,13 @@ def test_builder_uses_every_reviewed_tool_pin() -> None:
     assert "/etc/monarch-rootfs-contract" in builder
 
 
+def test_builder_installs_and_verifies_nested_bwrap() -> None:
+    builder = (REPO_ROOT / "scripts/rootfs/build_rootfs.sh").read_text()
+
+    assert "bubblewrap" in builder
+    assert "bwrap --version" in builder
+
+
 def test_entry_uses_read_only_root_and_clear_environment() -> None:
     entry = (REPO_ROOT / "scripts/rootfs/enter_rootfs.sh").read_text()
     compatibility = (REPO_ROOT / "ginkgo/insula/compatibility.py").read_text()

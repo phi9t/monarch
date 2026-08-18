@@ -21,6 +21,11 @@ Tracked Ginkgo files own:
 - dependency, optimized-kernel, and model-cache manifests;
 - operator workflow and verification docs.
 
+The Monarch control-plane design lives in
+`ginkgo/schemas/monarch-control-plane.md`. It keeps Insula as the sole bwrap
+owner while describing how Monarch Actors can orchestrate Ginkgo prepare,
+launch, probe, teardown, and status phases.
+
 Ginkgo does not own generated state. Materialized configs, process records,
 logs, venvs, caches, model snapshots, and per-run artifacts stay in the
 declared run, temp, cache, and results roots.

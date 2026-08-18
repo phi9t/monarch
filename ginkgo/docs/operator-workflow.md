@@ -31,11 +31,73 @@ Ginkgo configs.
    rootfs, sends a real chat request, prints each bringup/inference/teardown
    stage, prints SGLang log tails and the final model output, then writes
    `qwen3-sglang-smoke-evidence.json` in the run-owned results directory.
+   In-process actor mode may generate projected local environment files under
+   `ginkgo/local-env/.generated/`; those files are run artifacts and must be
+   regenerated from the operator local environment instead of edited as source.
+   When the configured CUDA device is occupied, operators may wait for that
+   exact device before launch:
+
+   ```sh
+   ginkgo/scripts/run_qwen3_sglang_inference_in_bwrap_rootfs.sh \
+     --port 19007 \
+     --wait-for-gpu-free-seconds 600 \
+     --gpu-free-stable-seconds 10
+   ```
+
+   The wait is no-fallback: it watches only the device declared by the
+   materialized config, for example `CUDA_VISIBLE_DEVICES=0` from the dense
+   smoke config. It does not choose another GPU, does not switch to CPU, and
+   fails loudly when the declared device remains occupied. Failed waits write
+   `gpu_wait` and `failure.blocked_gpus` evidence in the run manifest so the
+   blocker is inspectable without treating the run as serving success.
+   For a CPU-only route that validates the SGLang serving path without GPU
+   projection, use:
+
+   ```sh
+   ginkgo/scripts/run_qwen3_sglang_inference_in_bwrap_rootfs.sh --device cpu --port 19007
+   ```
+
+   This selects `ginkgo/configs/smoke-qwen3-cpu.yaml`, keeps
+   `sandbox.gpu: none`, and omits `CUDA_VISIBLE_DEVICES` from the materialized
+   launch contract. Passing an explicit `--declared-spec` keeps that declared
+   spec authoritative.
 7. Run three dense smoke launch/probe/teardown cycles before treating the
    sandbox as repeatable.
 8. Run the MoE smoke only when the host satisfies its explicit disk, GPU, and
    timeout budget.
-9. Run the GLM profile only after the sandbox, CUDA-kernel, dense smoke, and
+9. For the Monarch parent control-plane route, run the CPU actor smoke inside
+   the rootfs and require artifact verification before accepting the run:
+
+   ```sh
+   scripts/run python ginkgo/scripts/run_qwen3_monarch_control_plane_smoke.py \
+     --mode in-process-actor \
+     --run-id qwen3-monarch-cpu-actor-$(date -u +%Y%m%dT%H%M%SZ) \
+     --expected-child-device cpu \
+     --verify-artifact
+   ```
+
+   The smoke writes a parent `monarch-control-plane-manifest.json`, launches the
+   Qwen3 SGLang child through the same Local Run path, sends real model and
+   inference probes, and tears the child down. A host-child parent pass is gated
+   by the standalone Qwen3 child verifier before passed parent evidence is
+   written; that gate validates the child manifest, child device, OpenAI URL,
+   generated text, teardown status, and closed serving port. `--verify-artifact`
+   then verifies the saved parent and child artifacts, including parent status,
+   execution mode, evidence boundary, actor status, and component state. The CPU
+   route defaults to `--expected-child-device cpu`; CUDA variants must pass
+   `--expected-child-device cuda` explicitly and must not reuse CPU artifact
+   proof. To audit an existing run, use:
+
+   ```sh
+   scripts/run python ginkgo/scripts/verify_qwen3_monarch_control_plane_smoke.py \
+     --expected-child-device cpu \
+     glm52-serving-results/<run-id>/monarch-control-plane-manifest.json
+   ```
+
+   This verifier proves the Qwen3 CPU Monarch actor smoke artifact only. It is
+   not CUDA readiness, GLM-5.2 readiness, Dynamo readiness, Responses readiness,
+   or benchmark/eval completion evidence.
+10. Run the GLM profile only after the sandbox, CUDA-kernel, dense smoke, and
    any required MoE checks pass.
 
 ## Contract

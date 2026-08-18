@@ -38,6 +38,7 @@ class LocalRunResult:
     port: int
     generated_text: str
     evidence_manifest: Path
+    teardown_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,10 +141,36 @@ class RuntimeBackedLocalRunAdapter:
             "missing SGLang venv preparation record:" in text
             or "missing model cache preparation record:" in text
             or "preparation record rootfs recipe digest mismatch" in text
+            or "preparation record bwrap plan digest mismatch" in text
+            or "preparation bwrap plan env mismatch:" in text
+            or "mount host path mismatch:" in text
+            or "SGLang venv preparation record package contract mismatch" in text
+            or "SGLang venv preparation record missing installed package:" in text
+            or "SGLang venv preparation record missing CPU platform proof" in text
+            or "SGLang venv preparation record missing utils.is_cpu proof" in text
+            or "SGLang venv preparation record missing rotary CPU proof" in text
+            or "SGLang venv preparation record reports CUDA rotary mode for CPU route" in text
+            or "SGLang venv preparation record missing CUDA platform proof" in text
+            or "SGLang venv preparation record missing rotary CUDA proof" in text
+            or "SGLang venv preparation record reports CPU platform for CUDA route" in text
+            or "SGLang venv preparation record reports CPU rotary mode for CUDA route" in text
         )
 
     def launch(self, config: Any, *, local_environment: Any) -> dict[str, Any]:
         return self.runtime.launch_runtime(config, local_environment=local_environment)
+
+    def wait_for_gpu_free_window(
+        self,
+        config: Any,
+        *,
+        timeout_seconds: int,
+        stable_seconds: int = 0,
+    ) -> dict[str, Any]:
+        return self.runtime.wait_for_gpu_free_window(
+            config,
+            timeout_seconds=timeout_seconds,
+            stable_seconds=stable_seconds,
+        )
 
     def reload_effective_config(self, path: Path) -> Any:
         return self.runtime.load_materialized_config(path)
@@ -198,7 +225,15 @@ class SglangLocalRun:
         run_id: str | None = None,
         port: int | None = None,
         output: TextIO | None = None,
+        wait_for_gpu_free_seconds: int = 0,
+        gpu_free_stable_seconds: int = 0,
     ) -> LocalRunResult:
+        if wait_for_gpu_free_seconds < 0:
+            raise LocalRunError("wait_for_gpu_free_seconds must be non-negative")
+        if gpu_free_stable_seconds < 0:
+            raise LocalRunError("gpu_free_stable_seconds must be non-negative")
+        if gpu_free_stable_seconds and wait_for_gpu_free_seconds < gpu_free_stable_seconds:
+            raise LocalRunError("gpu_free_stable_seconds must not exceed wait_for_gpu_free_seconds")
         output = output or sys.stdout
         logger = StageLogger(output)
         print(f"========== GINKGO {self.workload.name.upper()} SGLANG LOCAL RUN ==========", file=output)
@@ -208,6 +243,7 @@ class SglangLocalRun:
         paths: EvidencePaths | None = None
         launch_summary: dict[str, Any] | None = None
         teardown_summary: dict[str, Any] | None = None
+        gpu_wait_summary: dict[str, Any] | None = None
         models: dict[str, Any] | None = None
         chat: dict[str, Any] | None = None
         generated_text = ""
@@ -246,6 +282,19 @@ class SglangLocalRun:
                 local_environment=local_environment,
                 logger=logger,
             )
+            if wait_for_gpu_free_seconds:
+                logger.stage(
+                    "wait_for_gpu_free",
+                    {
+                        "timeout_seconds": wait_for_gpu_free_seconds,
+                        "stable_seconds": gpu_free_stable_seconds,
+                    },
+                )
+                gpu_wait_summary = self.runtime.wait_for_gpu_free_window(
+                    config,
+                    timeout_seconds=wait_for_gpu_free_seconds,
+                    stable_seconds=gpu_free_stable_seconds,
+                )
             logger.stage(
                 "launch_sglang",
                 {
@@ -266,6 +315,14 @@ class SglangLocalRun:
                 raise LocalRunError("chat probe returned empty generated text")
         except Exception as error:
             failed_stage = logger.current_stage
+            if failed_stage == "wait_for_gpu_free" and gpu_wait_summary is None:
+                gpu_wait_summary = {
+                    "status": "failed",
+                    "error": str(error),
+                }
+                blocked_gpus = getattr(error, "blocked_gpus", None)
+                if blocked_gpus is not None:
+                    gpu_wait_summary["blocked_gpus"] = _json_safe(blocked_gpus)
             if launch_summary is not None and config is not None and local_env is not None:
                 logger.stage("teardown", {"run_id": _config_run_id(config)})
                 teardown_summary = self.runtime.teardown(config, local_environment=local_env)
@@ -278,6 +335,7 @@ class SglangLocalRun:
                 paths=paths,
                 launch_summary=launch_summary,
                 teardown_summary=teardown_summary,
+                gpu_wait_summary=gpu_wait_summary,
             )
             raise
 
@@ -297,6 +355,7 @@ class SglangLocalRun:
             generated_text=generated_text,
             launch_summary=launch_summary,
             teardown_summary=teardown_summary,
+            gpu_wait_summary=gpu_wait_summary,
         )
         logger.stage("write_evidence_manifest", {"path": str(paths.manifest)})
         paths.manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -307,6 +366,7 @@ class SglangLocalRun:
             port=_config_port(config),
             generated_text=generated_text,
             evidence_manifest=paths.manifest,
+            teardown_status=_teardown_status(teardown_summary),
         )
 
     def _emit_failure(
@@ -320,6 +380,7 @@ class SglangLocalRun:
         paths: EvidencePaths | None,
         launch_summary: dict[str, Any] | None,
         teardown_summary: dict[str, Any] | None,
+        gpu_wait_summary: dict[str, Any] | None,
     ) -> None:
         logs = self._read_logs(paths) if paths is not None else _empty_logs()
         print("========== GINKGO FAILURE ==========", file=output)
@@ -342,12 +403,16 @@ class SglangLocalRun:
             generated_text="",
             launch_summary=launch_summary,
             teardown_summary=teardown_summary,
+            gpu_wait_summary=gpu_wait_summary,
         )
         failure_manifest["failure"] = {
             "stage": failed_stage,
             "exception_type": type(error).__name__,
             "message": str(error),
         }
+        blocked_gpus = getattr(error, "blocked_gpus", None)
+        if blocked_gpus is not None:
+            failure_manifest["failure"]["blocked_gpus"] = _json_safe(blocked_gpus)
         paths.manifest.write_text(json.dumps(failure_manifest, indent=2, sort_keys=True) + "\n")
         print(f"[ginkgo] failure_manifest={paths.manifest}", file=output)
 
@@ -364,6 +429,7 @@ class SglangLocalRun:
         generated_text: str,
         launch_summary: dict[str, Any] | None,
         teardown_summary: dict[str, Any] | None,
+        gpu_wait_summary: dict[str, Any] | None,
     ) -> dict[str, Any]:
         manifest: dict[str, Any] = {
             "schema_version": 1,
@@ -372,6 +438,7 @@ class SglangLocalRun:
             "control_plane": logger.events,
             "launch": launch_summary,
             "teardown": teardown_summary,
+            "gpu_wait": gpu_wait_summary,
             "logs": logs,
             "artifacts": {
                 "run_dir": str(paths.run_dir),
@@ -383,13 +450,26 @@ class SglangLocalRun:
             },
         }
         if config is not None:
+            service = _config_service(config)
+            model = _config_model(config)
+            port = _config_port(config)
+            teardown_status = None
+            if isinstance(teardown_summary, dict):
+                teardown_status = teardown_summary.get("status")
             manifest.update(
                 {
                     "run_id": _config_run_id(config),
                     "run_group": _config_run_group(config),
-                    "port": _config_port(config),
-                    "service": _config_service(config),
-                    "model": _config_model(config),
+                    "port": port,
+                    "openai_base_url": service.get("base_url"),
+                    "generated_text": generated_text,
+                    "teardown_status": teardown_status,
+                    "evidence_boundary": "live_qwen3_sglang_smoke",
+                    "model_id": model.get("id"),
+                    "served_model_name": model.get("served_model_name"),
+                    "expected_model_ids": model.get("expected_model_ids"),
+                    "service": service,
+                    "model": model,
                     "request": {
                         "url": _config_probe_url(config, "chat_url"),
                         "payload": _config_probe_payload(config, "chat_payload"),
@@ -401,7 +481,9 @@ class SglangLocalRun:
                     "models": models,
                 }
             )
-            manifest.update(self.workload.manifest_metadata(config))
+            metadata = self.workload.manifest_metadata(config)
+            manifest["metadata"] = metadata
+            manifest.update(metadata)
         return manifest
 
     def _print_observation(
@@ -451,9 +533,16 @@ class Qwen3SglangWorkload:
             raise LocalRunError("declared smoke config must disallow default fallback ports")
         if requested_port in disallowed:
             raise LocalRunError(f"disallowed serving port requested: {requested_port}")
+        device = _declared_device(declared)
         cuda_visible_devices = _declared_cuda_visible_devices(declared)
-        if len(_visible_cuda_devices(cuda_visible_devices)) != 1:
-            raise LocalRunError("Qwen3 SGLang smoke must use exactly one visible GPU")
+        if device == "cpu":
+            if _visible_cuda_devices(cuda_visible_devices):
+                raise LocalRunError("Qwen3 CPU SGLang smoke must not expose CUDA devices")
+        elif device == "cuda":
+            if len(_visible_cuda_devices(cuda_visible_devices)) != 1:
+                raise LocalRunError("Qwen3 SGLang smoke must use exactly one visible GPU")
+        else:
+            raise LocalRunError("Qwen3 SGLang smoke device must be cpu or cuda")
         if _declared_tensor_parallel_size(declared) != 1:
             raise LocalRunError("Qwen3 SGLang smoke tensor_parallel_size must be 1")
         if requested_port is not None:
@@ -470,6 +559,12 @@ class Qwen3SglangWorkload:
             raise LocalRunError("materialized service base_url must use the run-owned localhost port")
         if _config_probe_url(config, "chat_url") != f"http://127.0.0.1:{_config_port(config)}/v1/chat/completions":
             raise LocalRunError("materialized chat probe URL must derive from the run-owned service port")
+        device = _config_device(config)
+        sandbox_gpu = _config_sandbox(config).get("gpu")
+        if device == "cpu" and sandbox_gpu != "none":
+            raise LocalRunError("materialized CPU SGLang smoke must use sandbox.gpu=none")
+        if device == "cuda" and sandbox_gpu != "required":
+            raise LocalRunError("materialized CUDA SGLang smoke must require a GPU")
 
     def extract_generated_text(self, chat: dict[str, Any]) -> str:
         content = chat.get("content")
@@ -492,7 +587,7 @@ class Qwen3SglangWorkload:
         return ""
 
     def manifest_metadata(self, config: Any) -> dict[str, Any]:
-        return {"smoke_kind": "qwen3_sglang"}
+        return {"smoke_kind": "qwen3_sglang", "device": _config_device(config)}
 
 
 def load_runtime_module() -> Any:
@@ -508,6 +603,14 @@ def load_runtime_module() -> Any:
 
 def _empty_logs() -> dict[str, str]:
     return {"stdout_tail": "", "stderr_tail": "", "telemetry_tail": ""}
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+    except TypeError:
+        return str(value)
+    return value
 
 
 def _resolve_run_dir(config: Any) -> Path:
@@ -592,6 +695,15 @@ def _declared_run_group(declared: Any) -> str:
     return str(getattr(declared, "run_group"))
 
 
+def _teardown_status(teardown_summary: dict[str, Any] | None) -> str | None:
+    if not isinstance(teardown_summary, dict):
+        return None
+    status = teardown_summary.get("status")
+    if isinstance(status, str):
+        return status
+    return None
+
+
 def _declared_port_range_start(declared: Any) -> int:
     value = getattr(declared, "port_range_start", None)
     if isinstance(value, int):
@@ -613,6 +725,13 @@ def _declared_disallowed_ports(declared: Any) -> list[int]:
     return [int(port) for port in declared.port_policy.disallowed_ports]
 
 
+def _declared_device(declared: Any) -> str:
+    value = getattr(declared, "device", None)
+    if isinstance(value, str):
+        return value
+    return str(declared.runtime.device)
+
+
 def _declared_cuda_visible_devices(declared: Any) -> str:
     value = getattr(declared, "cuda_visible_devices", None)
     if isinstance(value, str):
@@ -629,6 +748,18 @@ def _declared_tensor_parallel_size(declared: Any) -> int:
 
 def _visible_cuda_devices(cuda_visible_devices: str) -> list[str]:
     return [device.strip() for device in cuda_visible_devices.split(",") if device.strip()]
+
+
+def _config_device(config: Any) -> str:
+    runtime = _mapping_attr(config, "runtime")
+    value = runtime.get("device")
+    if not isinstance(value, str):
+        raise LocalRunError("materialized runtime.device is required")
+    return value
+
+
+def _config_sandbox(config: Any) -> dict[str, Any]:
+    return _mapping_attr(config, "sandbox")
 
 
 def _default_run_id(run_group: str) -> str:

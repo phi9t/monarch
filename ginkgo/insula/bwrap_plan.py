@@ -25,6 +25,9 @@ def build_bwrap_argv(invocation: MaterializedInsulaInvocation) -> list[str]:
         "/",
         "--proc",
         "/proc",
+        "--ro-bind",
+        "/sys",
+        "/sys",
         "--tmpfs",
         "/tmp",
         "--dev",
@@ -39,6 +42,10 @@ def build_bwrap_argv(invocation: MaterializedInsulaInvocation) -> list[str]:
         argv.append("--share-net")
     argv.extend(["--die-with-parent", "--clearenv", "--chdir", invocation.command.cwd])
 
+    for target in _created_writable_bind_tmpfs_targets(invocation.binds):
+        argv.extend(["--tmpfs", target])
+    for target in _created_writable_bind_dir_targets(invocation.binds):
+        argv.extend(["--dir", target])
     for bind in invocation.binds:
         argv.extend([_bind_flag(bind), bind.host, bind.sandbox])
     for key, value in sorted(invocation.environment.items()):
@@ -120,6 +127,25 @@ def _validate_bind(bind: InsulaBindSpec) -> None:
     _bind_flag(bind)
 
 
+def _created_writable_bind_tmpfs_targets(binds: list[InsulaBindSpec]) -> list[str]:
+    targets = {
+        f"/{bind.sandbox.strip('/').split('/', 1)[0]}"
+        for bind in binds
+        if bind.create and bind.mode == "rw"
+    }
+    return sorted(targets)
+
+
+def _created_writable_bind_dir_targets(binds: list[InsulaBindSpec]) -> list[str]:
+    return sorted(
+        {
+            bind.sandbox.rstrip("/") or bind.sandbox
+            for bind in binds
+            if bind.create and bind.mode == "rw"
+        }
+    )
+
+
 def _require_absolute_host_path(value: str, field: str) -> None:
     if not Path(value).is_absolute():
         raise InsulaConfigError(f"{field} must be an absolute path")
@@ -153,6 +179,12 @@ def _gpu(invocation: MaterializedInsulaInvocation) -> str:
 
 def _mounts(invocation: MaterializedInsulaInvocation) -> list[dict[str, str]]:
     return [
+        {
+            "name": "sysfs",
+            "host": "/sys",
+            "sandbox": "/sys",
+            "mode": "ro",
+        },
         {
             "name": "rootfs",
             "host": invocation.rootfs_path,

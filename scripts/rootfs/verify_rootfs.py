@@ -24,6 +24,7 @@ CONTRACT_ENV = REPO_ROOT / "scripts" / "rootfs" / "contract.env"
 
 REQUIRED_EXECUTABLES = (
     "bin/bash",
+    "usr/bin/bwrap",
     "usr/bin/python",
     "usr/local/bin/uv",
     "usr/local/bin/node",
@@ -36,7 +37,7 @@ REQUIRED_EXECUTABLES = (
     "opt/cuda-synth/bin/cuobjdump",
     "opt/cuda-synth/bin/nvdisasm",
 )
-REQUIRED_MOUNTPOINTS = ("workspace/monarch", "run/nvidia-host")
+REQUIRED_MOUNTPOINTS = ("cache", "workspace/monarch", "run/nvidia-host")
 REQUIRED_CUDA_FILES = (
     "opt/cuda-synth/include/cuda_runtime.h",
     "opt/cuda-synth/include/cuda_runtime_api.h",

@@ -44,6 +44,16 @@ _LOCAL_DEV_COMMAND = re.compile(
     r"^(uv|cargo|pytest|npm|mdbook)\b|^python\b.*\bmonarch\b|^make\s+-C\s+docs\b"
 )
 
+_SOURCE_INVENTORY_IGNORE = (
+    "scripts/rootfs/rootfs/**",
+    "scripts/rootfs/cache/**",
+)
+
+_ROOTFS_INVENTORY_IGNORE = (
+    "rootfs/**",
+    "cache/**",
+)
+
 
 def _shell_command_lines(markdown: str) -> list[str]:
     """Command lines inside fenced shell blocks, prompts stripped.
@@ -89,6 +99,27 @@ def test_execution_inventory_is_complete() -> None:
         cwd=REPO_ROOT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_source_inventory_ignore_prunes_generated_rootfs_trees() -> None:
+    repo_patterns = {
+        line.strip()
+        for line in (REPO_ROOT / ".ignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    missing = sorted(set(_SOURCE_INVENTORY_IGNORE) - repo_patterns)
+    assert not missing, ".ignore must prune generated source-inventory trees: " + ", ".join(
+        missing
+    )
+    rootfs_patterns = {
+        line.strip()
+        for line in (REPO_ROOT / "scripts/rootfs/.ignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    missing = sorted(set(_ROOTFS_INVENTORY_IGNORE) - rootfs_patterns)
+    assert not missing, "scripts/rootfs/.ignore must prune local inventory trees: " + ", ".join(
+        missing
+    )
 
 
 def test_discovery_covers_the_required_categories() -> None:

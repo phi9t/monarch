@@ -61,8 +61,6 @@ patterns = [
     "hyperactor_mesh_admin_tui/bin/*.rs",
     "ndslice/tests/*.rs",
     # Python examples and benches build/run against the rootfs interpreter.
-    "python/examples/**/*.py",
-    "examples/*.py",
     "examples/example_actors/**/*.py",
     "examples/kubernetes/**/*.py",
     "examples/presentation/**/*.py",
@@ -78,6 +76,7 @@ patterns = [
     "hyperactor_mesh/test/*.rs",
     "monarch_hyperactor/test/*.rs",
     "scripts/rootfs/tests/*.py",
+    "scripts/rootfs/audit_entrypoints.py",
 ]
 
 [domains.github-linux]
@@ -123,4 +122,6 @@ patterns = [
     "scripts/ginkgo_host_survey.py",
     "scripts/glm52_*.py",
     "scripts/run_glm52_*.sh",
+    "scripts/rootfs/rootfs_sandbox_config.py",
+    "scripts/rootfs/verify_rootfs.py",
 ]

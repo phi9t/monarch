@@ -710,81 +710,6 @@ def prove_cycle_clean(config: MaterializedInferenceConfig) -> dict[str, Any]:
     return {"ok": True, "ports": ports, "orphan_scan": {"ok": True, "checked": []}}
 
 
-def audit_parent_manifest(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text())
-    except FileNotFoundError as error:
-        raise InferenceConfigError(f"parent manifest not found: {path}") from error
-    except json.JSONDecodeError as error:
-        raise InferenceConfigError(f"parent manifest is not valid JSON: {path}") from error
-    manifest = _require_mapping(payload, "parent manifest")
-    if manifest.get("model") != DEFAULT_MODEL:
-        raise InferenceConfigError("parent manifest model must be zai-org/GLM-5.2")
-    if manifest.get("evidence_level") != "benchmark-ready":
-        raise InferenceConfigError("parent manifest evidence_level must be benchmark-ready")
-
-    responses_base_url = _required_str(
-        manifest,
-        "completed_responses_base_url",
-        "parent manifest",
-    )
-    responses_port = _parsed_url_port(
-        responses_base_url,
-        "parent manifest completed_responses_base_url",
-    )
-    if responses_port in DISALLOWED_PORTS:
-        raise InferenceConfigError("disallowed Responses port")
-
-    components = _require_mapping(manifest.get("components"), "parent manifest.components")
-    for component in COMPONENT_ORDER:
-        component_manifest = _require_mapping(
-            components.get(component),
-            f"parent manifest.components.{component}",
-        )
-        if component_manifest.get("evidence_level") != "completion":
-            raise InferenceConfigError(f"{component} must have completion evidence")
-    if not _require_mapping(
-        components["sglang_backend"].get("chat"),
-        "parent manifest.components.sglang_backend.chat",
-    ):
-        raise InferenceConfigError("SGLang chat evidence is required")
-    if not _require_mapping(
-        components["dynamo_frontend"].get("chat"),
-        "parent manifest.components.dynamo_frontend.chat",
-    ):
-        raise InferenceConfigError("Dynamo chat evidence is required")
-    responses = components["responses_adapter"]
-    for probe in ("nonstream", "stream", "tool_call"):
-        if not _require_mapping(
-            responses.get(probe),
-            f"parent manifest.components.responses_adapter.{probe}",
-        ):
-            raise InferenceConfigError(f"Responses {probe} evidence is required")
-
-    repeatability = _require_mapping(manifest.get("repeatability"), "parent manifest.repeatability")
-    if repeatability.get("ok") is not True:
-        raise InferenceConfigError("parent manifest repeatability must be ok")
-    cycle_count = repeatability.get("cycle_count")
-    if not isinstance(cycle_count, int) or cycle_count < 3:
-        raise InferenceConfigError("parent manifest repeatability requires at least three cycles")
-    teardown = _require_mapping(manifest.get("teardown"), "parent manifest.teardown")
-    if teardown.get("ok") is not True:
-        raise InferenceConfigError("parent manifest teardown must be ok")
-    for proof in ("port_closure", "orphan_scan"):
-        proof_payload = _require_mapping(teardown.get(proof), f"parent manifest.teardown.{proof}")
-        if proof_payload.get("ok") is not True:
-            raise InferenceConfigError(f"parent manifest teardown {proof} must be ok")
-
-    return {
-        "status": "completed",
-        "run_id": _required_str(manifest, "run_id", "parent manifest"),
-        "model": DEFAULT_MODEL,
-        "responses_base_url": responses_base_url,
-        "evidence_level": manifest["evidence_level"],
-        "cycle_count": cycle_count,
-    }
-
-
 def prepare_dynamo_venv(
     *,
     declared_path: Path,
@@ -904,91 +829,8 @@ def run_repeatability_cycles(
         summaries.append(cycle_summary)
 
     summary = _repeatability_summary(run_id=run_id, ok=True, cycles=summaries, dry_run=dry_run)
-    if not dry_run:
-        parent_manifest = write_parent_manifest(run_id=run_id, cycles=summaries)
-        summary["parent_manifest"] = str(parent_manifest)
-        _write_repeatability_summary(run_id, summary)
-        return summary
     _write_repeatability_summary(run_id, summary)
     return summary
-
-
-def write_parent_manifest(*, run_id: str, cycles: list[dict[str, Any]]) -> Path:
-    if not cycles:
-        raise InferenceConfigError("parent manifest requires at least one cycle")
-    last_cycle = cycles[-1]
-    if any(cycle.get("ok") is not True for cycle in cycles):
-        raise InferenceConfigError("parent manifest requires all cycles to pass")
-    if len(cycles) < 3:
-        raise InferenceConfigError("parent manifest requires at least three cycles")
-
-    components = _require_mapping(last_cycle.get("components"), "cycle.components")
-    sglang = _require_mapping(components.get("sglang_backend"), "cycle.components.sglang_backend")
-    dynamo = _require_mapping(components.get("dynamo_frontend"), "cycle.components.dynamo_frontend")
-    responses = _require_mapping(components.get("responses_adapter"), "cycle.components.responses_adapter")
-    clean = _require_mapping(last_cycle.get("clean"), "cycle.clean")
-    teardown = _require_mapping(last_cycle.get("teardown"), "cycle.teardown")
-    if clean.get("ok") is not True:
-        raise InferenceConfigError("parent manifest requires clean teardown proof")
-
-    responses_url = _component_openai_url(responses)
-    manifest = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "model": DEFAULT_MODEL,
-        "evidence_level": "benchmark-ready",
-        "completed_responses_base_url": responses_url,
-        "repeatability": {"ok": True, "cycle_count": len(cycles)},
-        "components": {
-            "sglang_backend": {
-                "evidence_level": "completion",
-                "chat": _component_chat_probe(sglang, "sglang_backend"),
-            },
-            "dynamo_frontend": {
-                "evidence_level": "completion",
-                "chat": _component_chat_probe(dynamo, "dynamo_frontend"),
-            },
-            "responses_adapter": {
-                "evidence_level": "completion",
-                "nonstream": _response_probe(responses, "nonstream"),
-                "stream": _response_probe(responses, "stream"),
-                "tool_call": _response_probe(responses, "tool_call"),
-            },
-        },
-        "teardown": {
-            "ok": True,
-            "components": teardown,
-            "port_closure": {"ok": True, "ports": clean.get("ports", {})},
-            "orphan_scan": clean.get("orphan_scan", {"ok": True}),
-        },
-        "artifacts": {
-            "summary": f"repo://glm52-serving-results/{run_id}/summary.json",
-        },
-        "created_at": _utc_stamp(),
-    }
-    path = REPO_ROOT / "glm52-serving-results" / run_id / "parent-manifest.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    audit_parent_manifest(path)
-    return path
-
-
-def _component_chat_probe(component: dict[str, Any], name: str) -> dict[str, Any]:
-    probe = _require_mapping(component.get("probe"), f"cycle.components.{name}.probe")
-    chat = _require_mapping(probe.get("chat"), f"cycle.components.{name}.probe.chat")
-    return chat
-
-
-def _response_probe(component: dict[str, Any], key: str) -> dict[str, Any]:
-    probe = _require_mapping(component.get("probe"), "cycle.components.responses_adapter.probe")
-    return _require_mapping(probe.get(key), f"cycle.components.responses_adapter.probe.{key}")
-
-
-def _component_openai_url(component: dict[str, Any]) -> str:
-    process = component.get("process")
-    if isinstance(process, dict) and isinstance(process.get("endpoint_url"), str):
-        return process["endpoint_url"]
-    return _required_str(component, "openai_base_url", "cycle.components.responses_adapter")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1022,9 +864,6 @@ def build_parser() -> argparse.ArgumentParser:
     repeatability.add_argument("--run-id", required=True)
     repeatability.add_argument("--cycles", type=int)
     repeatability.add_argument("--dry-run", action="store_true")
-
-    audit_parent = subcommands.add_parser("audit-parent-manifest")
-    audit_parent.add_argument("--manifest", type=Path, required=True)
     return parser
 
 
@@ -1067,9 +906,6 @@ def main(argv: list[str] | None = None) -> int:
                 cycles=args.cycles,
                 dry_run=args.dry_run,
             )
-            return 0
-        if args.command == "audit-parent-manifest":
-            print(json.dumps(audit_parent_manifest(args.manifest), indent=2, sort_keys=True))
             return 0
         raise InferenceConfigError("command is not implemented yet")
     except (InferenceConfigError, InferenceLaunchError) as error:

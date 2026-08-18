@@ -56,7 +56,21 @@ SGLANG_VENV_PROBE_SCRIPT = (
     "        packages[name] = metadata.version(name)\n"
     "    except metadata.PackageNotFoundError:\n"
     "        packages[name] = None\n"
-    "print(json.dumps({'python': sys.executable, 'sys_prefix': sys.prefix, 'packages': packages}))"
+    "from sglang.srt import platforms; "
+    "from sglang.srt import utils; "
+    "from sglang.srt.layers.rotary_embedding import base as rotary_base; "
+    "platform = platforms.current_platform; "
+    "platform_checks = {"
+    "'class': type(platform).__name__, "
+    "'device_name': getattr(platform, 'device_name', None), "
+    "'device_type': getattr(platform, 'device_type', None), "
+    "'is_cpu': bool(getattr(platform, 'is_cpu', lambda: False)()), "
+    "'is_cuda': bool(getattr(platform, 'is_cuda', lambda: False)()), "
+    "'utils_is_cpu': bool(utils.is_cpu()), "
+    "'rotary_base_is_cpu': bool(getattr(rotary_base, '_is_cpu', False)), "
+    "'rotary_base_is_cuda': bool(getattr(rotary_base, '_is_cuda', False)), "
+    "}; "
+    "print(json.dumps({'python': sys.executable, 'sys_prefix': sys.prefix, 'packages': packages, 'platform': platform_checks}))"
 )
 MODEL_CACHE_PREPARE_SCRIPT = (
     "import json, sys; "
@@ -191,6 +205,7 @@ class ModelSpec:
 @dataclass(frozen=True)
 class SglangRuntimeSpec:
     kind: str
+    device: str
     cuda_visible_devices: str
     tensor_parallel_size: int
     dtype: str
@@ -324,7 +339,7 @@ def load_declared_spec(path: Path) -> DeclaredSglangLaunchSpec:
     if allow_fallback:
         raise RuntimeConfigError("allow_fallback must be false")
 
-    return DeclaredSglangLaunchSpec(
+    declared = DeclaredSglangLaunchSpec(
         schema_version=_required_int(mapping, "schema_version", "declared_spec"),
         run_group=_required_str(mapping, "run_group", "declared_spec"),
         fail_fast=fail_fast,
@@ -338,6 +353,8 @@ def load_declared_spec(path: Path) -> DeclaredSglangLaunchSpec:
         probes=_parse_probes(mapping.get("probes")),
         repeatability=_parse_repeatability(mapping.get("repeatability")),
     )
+    _validate_device_sandbox_contract(declared.runtime, declared.sandbox)
+    return declared
 
 
 def _require_mapping(value: Any, path: str) -> dict[str, Any]:
@@ -352,9 +369,23 @@ def _reject_unknown(mapping: dict[str, Any], allowed: set[str], path: str) -> No
         raise RuntimeConfigError(f"unknown field at {path}: {unknown[0]}")
 
 
+def _validate_device_sandbox_contract(runtime: SglangRuntimeSpec, sandbox: SandboxSpec) -> None:
+    if runtime.device == "cpu" and sandbox.gpu != "none":
+        raise RuntimeConfigError("sandbox.gpu must be none for cpu")
+    if runtime.device == "cuda" and sandbox.gpu != "required":
+        raise RuntimeConfigError("sandbox.gpu must be required for cuda")
+
+
 def _required_str(mapping: dict[str, Any], key: str, path: str) -> str:
     value = mapping.get(key)
     if not isinstance(value, str) or not value:
+        raise RuntimeConfigError(f"{path}.{key} is required")
+    return value
+
+
+def _required_string(mapping: dict[str, Any], key: str, path: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str):
         raise RuntimeConfigError(f"{path}.{key} is required")
     return value
 
@@ -448,6 +479,7 @@ def _parse_runtime(data: Any) -> SglangRuntimeSpec:
         mapping,
         {
             "kind",
+            "device",
             "cuda_visible_devices",
             "tensor_parallel_size",
             "dtype",
@@ -465,6 +497,14 @@ def _parse_runtime(data: Any) -> SglangRuntimeSpec:
     kind = _required_str(mapping, "kind", "runtime")
     if kind != "sglang_openai":
         raise RuntimeConfigError("runtime.kind must be sglang_openai")
+    device = _required_str(mapping, "device", "runtime")
+    if device not in {"cpu", "cuda"}:
+        raise RuntimeConfigError("runtime.device must be cpu or cuda")
+    cuda_visible_devices = _required_string(mapping, "cuda_visible_devices", "runtime")
+    if device == "cuda" and not cuda_visible_devices.strip():
+        raise RuntimeConfigError("runtime.cuda_visible_devices is required for cuda")
+    if device == "cpu" and cuda_visible_devices.strip():
+        raise RuntimeConfigError("runtime.cuda_visible_devices must be empty for cpu")
     context_length = _required_int(mapping, "context_length", "runtime")
     if context_length <= 0:
         raise RuntimeConfigError("runtime.context_length must be positive")
@@ -487,7 +527,8 @@ def _parse_runtime(data: Any) -> SglangRuntimeSpec:
 
     return SglangRuntimeSpec(
         kind=kind,
-        cuda_visible_devices=_required_str(mapping, "cuda_visible_devices", "runtime"),
+        device=device,
+        cuda_visible_devices=cuda_visible_devices,
         tensor_parallel_size=_required_int(mapping, "tensor_parallel_size", "runtime"),
         dtype=_required_str(mapping, "dtype", "runtime"),
         context_length=context_length,
@@ -808,6 +849,8 @@ def materialize_runtime_config(
         str(selected_port),
         "--tp",
         str(declared.runtime.tensor_parallel_size),
+        "--device",
+        declared.runtime.device,
         "--dtype",
         declared.runtime.dtype,
         "--context-length",
@@ -868,6 +911,7 @@ def materialize_runtime_config(
         },
         runtime={
             "kind": declared.runtime.kind,
+            "device": declared.runtime.device,
             "cuda_visible_devices": declared.runtime.cuda_visible_devices,
             "tensor_parallel_size": declared.runtime.tensor_parallel_size,
             "dtype": declared.runtime.dtype,
@@ -912,11 +956,7 @@ def materialize_runtime_config(
                 "telemetry_root": declared.sandbox.sglang.telemetry_root,
             },
             "env_allowlist": [],
-            "env": {
-                "CUDA_VISIBLE_DEVICES": declared.runtime.cuda_visible_devices,
-                "HF_HOME": declared.sandbox.sglang.hf_home,
-                "SGLANG_CACHE_DIR": declared.sandbox.sglang.sglang_cache,
-            },
+            "env": _sglang_launch_env(declared),
             "mounts": [
                 {"host_path_ref": "repo://", "sandbox_path": "/workspace/monarch", "mode": "ro"},
                 {"host_path_ref": "run://", "sandbox_path": "/run/glm52", "mode": "rw"},
@@ -930,11 +970,7 @@ def materialize_runtime_config(
         launch={
             "outer_argv": outer_argv,
             "inner_argv": inner_argv,
-            "env": {
-                "CUDA_VISIBLE_DEVICES": declared.runtime.cuda_visible_devices,
-                "HF_HOME": declared.sandbox.sglang.hf_home,
-                "SGLANG_CACHE_DIR": declared.sandbox.sglang.sglang_cache,
-            },
+            "env": _sglang_launch_env(declared),
         },
         probes={
             "models_url": f"{base_url}/models",
@@ -1025,6 +1061,8 @@ def validate_materialized_config(config: MaterializedSglangRuntimeConfig) -> Non
         raise RuntimeConfigError("model.served_model_name must match launch.inner_argv --served-model-name")
     if _argv_value(inner, "--tp") != str(_required_section_int(config.runtime, "tensor_parallel_size", "runtime")):
         raise RuntimeConfigError("runtime.tensor_parallel_size must match launch.inner_argv --tp")
+    if _argv_value(inner, "--device") != _required_section_str(config.runtime, "device", "runtime"):
+        raise RuntimeConfigError("runtime.device must match launch.inner_argv --device")
     if _argv_value(inner, "--dtype") != _required_section_str(config.runtime, "dtype", "runtime"):
         raise RuntimeConfigError("runtime.dtype must match launch.inner_argv --dtype")
     if _argv_value(inner, "--context-length") != str(_required_section_int(config.runtime, "context_length", "runtime")):
@@ -1128,6 +1166,7 @@ def should_teardown_after_failure(config: MaterializedSglangRuntimeConfig) -> bo
 
 
 def run_sglang_help_preflight(config: MaterializedSglangRuntimeConfig) -> str:
+    _ensure_created_bind_sources(config)
     outer = _resolved_outer_argv(config)
     try:
         marker = outer.index("--")
@@ -1172,7 +1211,7 @@ def prepare_sglang_venv(
         "install",
         "--python",
         SGLANG_VENV_PYTHON,
-        "sglang[all]",
+        *SGLANG_PREPARE_PACKAGES,
     ]
     patch_argv = [
         SGLANG_VENV_PYTHON,
@@ -1218,6 +1257,12 @@ def prepare_sglang_venv(
         raise RuntimeConfigError("SGLang venv preparation used the wrong Python executable")
     sys_prefix = _required_section_str(probe, "sys_prefix", "sglang venv probe")
     packages = _require_mapping(probe.get("packages"), "sglang venv probe packages")
+    platform_checks = _require_mapping(probe.get("platform"), "sglang venv probe platform")
+    _validate_sglang_platform_checks(
+        platform_checks,
+        device=_required_section_str(config.runtime, "device", "runtime"),
+        source="SGLang venv probe",
+    )
     help_text = str(outputs[-1]["stdout"]) + str(outputs[-1]["stderr"])
     if run is None:
         validate_sglang_help(help_text)
@@ -1228,7 +1273,7 @@ def prepare_sglang_venv(
             "path": SGLANG_VENV_SANDBOX_PATH,
             "python": SGLANG_VENV_PYTHON,
             "sys_prefix": sys_prefix,
-            "packages": ["sglang[all]"],
+            "packages": list(SGLANG_PREPARE_PACKAGES),
             "installed_packages": packages,
         },
         "rootfs": {
@@ -1238,6 +1283,7 @@ def prepare_sglang_venv(
         "checks": {
             "served_model_name_flag": True,
             "offloader_patch": offloader_patch,
+            "platform": platform_checks,
         },
         "commands": outputs,
     }
@@ -1320,11 +1366,23 @@ def validate_preparation_records(
     if _required_section_str(venv, "python", "sglang_venv_record.venv") != SGLANG_VENV_PYTHON:
         raise RuntimeConfigError("SGLang venv preparation record Python does not match rootfs venv")
     packages = venv.get("packages")
-    if not isinstance(packages, list) or "sglang[all]" not in packages:
-        raise RuntimeConfigError("SGLang venv preparation record must include sglang[all]")
+    if not isinstance(packages, list) or packages != SGLANG_PREPARE_PACKAGES:
+        raise RuntimeConfigError("SGLang venv preparation record package contract mismatch")
+    installed_packages = _require_mapping(venv.get("installed_packages"), "sglang_venv_record.venv.installed_packages")
+    for package in ("sglang",):
+        if not installed_packages.get(package):
+            raise RuntimeConfigError(f"SGLang venv preparation record missing installed package: {package}")
     checks = _require_mapping(venv_record.get("checks"), "sglang_venv_record.checks")
     if checks.get("served_model_name_flag") is not True:
         raise RuntimeConfigError("SGLang venv preparation record missing served_model_name_flag")
+    if "platform" not in checks:
+        raise RuntimeConfigError("SGLang venv preparation record missing platform proof")
+    platform_checks = _require_mapping(checks.get("platform"), "sglang_venv_record.checks.platform")
+    _validate_sglang_platform_checks(
+        platform_checks,
+        device=_required_section_str(config.runtime, "device", "runtime"),
+        source="SGLang venv preparation record",
+    )
     offloader_patch = _require_mapping(checks.get("offloader_patch"), "sglang_venv_record.checks.offloader_patch")
     if _required_section_str(offloader_patch, "patch_id", "sglang_venv_record.checks.offloader_patch") != SGLANG_OFFLOADER_PATCH_ID:
         raise RuntimeConfigError("SGLang venv preparation record has wrong offloader patch id")
@@ -1355,11 +1413,37 @@ def validate_preparation_records(
     }
 
 
+def _validate_sglang_platform_checks(platform_checks: dict[str, Any], *, device: str, source: str) -> None:
+    if device == "cpu":
+        if platform_checks.get("is_cpu") is not True:
+            raise RuntimeConfigError(f"{source} missing CPU platform proof: {platform_checks}")
+        if platform_checks.get("utils_is_cpu") is not True:
+            raise RuntimeConfigError(f"{source} missing utils.is_cpu proof: {platform_checks}")
+        if platform_checks.get("rotary_base_is_cpu") is not True:
+            raise RuntimeConfigError(f"{source} missing rotary CPU proof: {platform_checks}")
+        if platform_checks.get("rotary_base_is_cuda") is True:
+            raise RuntimeConfigError(f"{source} reports CUDA rotary mode for CPU route: {platform_checks}")
+        return
+    if device == "cuda":
+        if platform_checks.get("is_cpu") is True:
+            raise RuntimeConfigError(f"{source} reports CPU platform for CUDA route: {platform_checks}")
+        if platform_checks.get("rotary_base_is_cpu") is True:
+            raise RuntimeConfigError(f"{source} reports CPU rotary mode for CUDA route: {platform_checks}")
+        if platform_checks.get("is_cuda") is not True:
+            raise RuntimeConfigError(f"{source} missing CUDA platform proof: {platform_checks}")
+        if platform_checks.get("rotary_base_is_cuda") is not True:
+            raise RuntimeConfigError(f"{source} missing rotary CUDA proof: {platform_checks}")
+        return
+    raise RuntimeConfigError(f"runtime.device must be cpu or cuda: {device}")
+
+
 def preflight_model_cache(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
     return validate_preparation_records(config=config)["model_cache"]
 
 
 def preflight_gpu_occupancy(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    if _required_section_str(config.runtime, "device", "runtime") == "cpu":
+        return {"status": "not_required", "checked_gpus": []}
     visible = _visible_gpu_indices(_required_section_str(config.runtime, "cuda_visible_devices", "runtime"))
     if not visible:
         raise RuntimeConfigError("runtime.cuda_visible_devices must name at least one GPU")
@@ -1450,6 +1534,7 @@ def _run_preparation_command(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command_env = dict(env or {})
+    _ensure_created_bind_sources(config, inner_argv=inner_command, env=command_env)
     command = _rootfs_preparation_argv(config, inner_command, env=command_env)
     if run is None:
         completed = subprocess.run(
@@ -1484,6 +1569,29 @@ def _visible_gpu_indices(cuda_visible_devices: str) -> list[int]:
             raise RuntimeConfigError("runtime.cuda_visible_devices must be a comma-separated GPU index list")
         indices.append(int(value))
     return indices
+
+
+_NVIDIA_CONTROL_DEVICE_NAMES = {
+    "nvidiactl",
+    "nvidia-uvm",
+    "nvidia-uvm-tools",
+    "nvidia-modeset",
+    "nvidia-caps",
+}
+
+
+def _selected_nvidia_device_paths(cuda_visible_devices: str) -> list[Path]:
+    visible_indices = _visible_gpu_indices(cuda_visible_devices)
+    if not visible_indices:
+        raise RuntimeConfigError("runtime.cuda_visible_devices must name at least one GPU")
+    selected_names = {f"nvidia{index}" for index in visible_indices}
+    allowed_names = selected_names | _NVIDIA_CONTROL_DEVICE_NAMES
+    devices = [dev for dev in sorted(Path("/dev").glob("nvidia*"), key=str) if dev.name in allowed_names]
+    present_names = {dev.name for dev in devices}
+    missing = sorted(selected_names - present_names)
+    if missing:
+        raise RuntimeConfigError(f"visible GPU device node is missing: /dev/{missing[0]}")
+    return devices
 
 
 def _nvidia_gpu_uuid_by_index() -> dict[int, str]:
@@ -1757,6 +1865,7 @@ def _emit_insula_rootfs_plan(
     env: dict[str, str] | None = None,
     resolved_plan_path: Path | None = None,
 ) -> dict[str, Any]:
+    _ensure_created_bind_sources(config, inner_argv=inner_argv, env=env)
     invocation = _materialized_insula_invocation_for(config, inner_argv=inner_argv, env=env)
     insula_plan = emit_insula_plan(invocation)
     try:
@@ -2068,6 +2177,7 @@ def launch_runtime(
         artifact_paths = _resolve_artifact_paths(config)
         write_materialized_config(config, artifact_paths["materialized_config"])
         preflight_gpu_occupancy(config)
+        _ensure_created_bind_sources(config)
         with artifact_paths["stdout_log"].open("ab") as stdout_handle, artifact_paths["stderr_log"].open("ab") as stderr_handle:
             process = subprocess.Popen(
                 _resolved_outer_argv(config),
@@ -2588,6 +2698,18 @@ def _ensure_rootfs_ref_resolves(rootfs_ref: str, local_environment: LocalEnviron
         raise RuntimeConfigError(f"sandbox.rootfs_ref does not resolve: {rootfs_ref}")
 
 
+def _sglang_launch_env(declared: DeclaredSglangLaunchSpec) -> dict[str, str]:
+    env = {
+        "HF_HOME": declared.sandbox.sglang.hf_home,
+        "SGLANG_CACHE_DIR": declared.sandbox.sglang.sglang_cache,
+    }
+    if declared.runtime.device == "cpu":
+        env["SGLANG_USE_CPU_ENGINE"] = "1"
+    if declared.runtime.device == "cuda":
+        env["CUDA_VISIBLE_DEVICES"] = declared.runtime.cuda_visible_devices
+    return env
+
+
 def _select_port(port_policy: PortPolicy, requested_port: int | None) -> int:
     if requested_port is not None:
         candidates = [requested_port]
@@ -2617,6 +2739,7 @@ def _reject_schema_owned_extra_args(extra_args: list[str]) -> None:
         "--host",
         "--port",
         "--tp",
+        "--device",
         "--dtype",
         "--context-length",
         "--kv-cache-dtype",
@@ -2744,10 +2867,16 @@ def build_insula_invocation_spec(config: MaterializedSglangRuntimeConfig) -> Ins
             "result": "run://insula/result.json",
         },
         network="share-net",
-        gpu="nvidia-if-present",
+        gpu=_insula_gpu_mode(config),
         die_with_parent=True,
         unshare_all=True,
     )
+
+
+def _insula_gpu_mode(config: MaterializedSglangRuntimeConfig) -> str:
+    if _required_section_str(config.runtime, "device", "runtime") == "cpu":
+        return "none"
+    return "nvidia-if-present"
 
 
 def _rootfs_runtime_binds_and_env(config: MaterializedSglangRuntimeConfig) -> tuple[list[InsulaBindSpec], dict[str, str]]:
@@ -2786,25 +2915,28 @@ def _rootfs_runtime_binds_and_env(config: MaterializedSglangRuntimeConfig) -> tu
                 )
             )
 
-    have_nvidia = False
-    for dev in sorted(Path("/dev").glob("nvidia*")):
-        have_nvidia = True
-        binds.append(
-            InsulaBindSpec(
-                name=f"dev-{dev.name}",
-                host=f"host://{dev}",
-                sandbox=str(dev),
-                mode="dev",
-                create=False,
-                required=True,
-            )
-        )
+    env = {
+        "HOME": "/home/monarch",
+        "USER": "monarch",
+        "LOGNAME": "monarch",
+        "PATH": "/opt/cuda-synth/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin:/run/nvidia-host",
+        "UV_PROJECT_ENVIRONMENT": "/workspace/monarch/.venv-rootfs",
+        "UV_CACHE_DIR": "/workspace/monarch/scripts/rootfs/cache/uv",
+        "CARGO_HOME": "/workspace/monarch/scripts/rootfs/cache/cargo",
+        "CARGO_TARGET_DIR": f"/workspace/monarch/target/bwrap/{_rootfs_recipe_digest(config)}",
+        "npm_config_cache": "/workspace/monarch/scripts/rootfs/cache/npm",
+        "XDG_CACHE_HOME": "/workspace/monarch/scripts/rootfs/cache/xdg",
+        "RUSTUP_HOME": "/opt/rustup",
+        "CUDA_HOME": "/opt/cuda-synth",
+        "CUDA_PATH": "/opt/cuda-synth",
+        "MONARCH_IN_ROOTFS": "1",
+        "MONARCH_ROOTFS_RECIPE_SHA256": _rootfs_recipe_digest(config),
+    }
+    have_nvidia_driver_libs = False
     nvidia_host_dir = f"cache://{run_group}/nvidia-host"
-    libs = sorted(Path("/usr/lib/x86_64-linux-gnu").glob("libcuda.so*")) + sorted(
-        Path("/usr/lib/x86_64-linux-gnu").glob("libnvidia-*.so*")
-    )
+    libs = _nvidia_driver_libraries()
     if libs:
-        have_nvidia = True
+        have_nvidia_driver_libs = True
         binds.append(
             InsulaBindSpec(
                 name="nvidia-host",
@@ -2826,40 +2958,45 @@ def _rootfs_runtime_binds_and_env(config: MaterializedSglangRuntimeConfig) -> tu
                     required=True,
                 )
             )
-    nvidia_smi = Path("/usr/bin/nvidia-smi")
-    if nvidia_smi.is_file():
-        have_nvidia = True
-        binds.append(
-            InsulaBindSpec(
-                name="nvidia-smi",
-                host=f"host://{nvidia_smi}",
-                sandbox="/run/nvidia-host/nvidia-smi",
-                mode="ro",
-                create=False,
-                required=True,
-            )
-        )
-
-    env = {
-        "HOME": "/home/monarch",
-        "PATH": "/opt/cuda-synth/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin:/run/nvidia-host",
-        "UV_PROJECT_ENVIRONMENT": "/workspace/monarch/.venv-rootfs",
-        "UV_CACHE_DIR": "/workspace/monarch/scripts/rootfs/cache/uv",
-        "CARGO_HOME": "/workspace/monarch/scripts/rootfs/cache/cargo",
-        "CARGO_TARGET_DIR": f"/workspace/monarch/target/bwrap/{_rootfs_recipe_digest(config)}",
-        "npm_config_cache": "/workspace/monarch/scripts/rootfs/cache/npm",
-        "XDG_CACHE_HOME": "/workspace/monarch/scripts/rootfs/cache/xdg",
-        "RUSTUP_HOME": "/opt/rustup",
-        "CUDA_HOME": "/opt/cuda-synth",
-        "CUDA_PATH": "/opt/cuda-synth",
-        "MONARCH_IN_ROOTFS": "1",
-        "MONARCH_ROOTFS_RECIPE_SHA256": _rootfs_recipe_digest(config),
-        "NVIDIA_VISIBLE_DEVICES": "all",
-    }
-    if have_nvidia:
+    if have_nvidia_driver_libs:
         env["LD_LIBRARY_PATH"] = "/run/nvidia-host:/opt/cuda-synth/lib64"
         env["LIBRARY_PATH"] = "/run/nvidia-host:/opt/cuda-synth/lib64"
+
+    if _required_section_str(config.runtime, "device", "runtime") == "cuda":
+        cuda_visible_devices = _required_section_str(config.runtime, "cuda_visible_devices", "runtime")
+        for dev in _selected_nvidia_device_paths(cuda_visible_devices):
+            binds.append(
+                InsulaBindSpec(
+                    name=f"dev-{dev.name}",
+                    host=f"host://{dev}",
+                    sandbox=str(dev),
+                    mode="dev",
+                    create=False,
+                    required=True,
+                )
+            )
+        nvidia_smi = Path("/usr/bin/nvidia-smi")
+        if nvidia_smi.is_file():
+            binds.append(
+                InsulaBindSpec(
+                    name="nvidia-smi",
+                    host=f"host://{nvidia_smi}",
+                    sandbox="/run/nvidia-host/nvidia-smi",
+                    mode="ro",
+                    create=False,
+                    required=True,
+                )
+            )
+        env["NVIDIA_VISIBLE_DEVICES"] = cuda_visible_devices
     return binds, dict(sorted(env.items()))
+
+
+def _nvidia_driver_libraries() -> list[Path]:
+    for libdir in (Path("/run/nvidia-host"), Path("/usr/lib/x86_64-linux-gnu")):
+        libs = sorted(libdir.glob("libcuda.so*")) + sorted(libdir.glob("libnvidia-*.so*"))
+        if libs:
+            return libs
+    return []
 
 
 def _insula_local_environment(config: MaterializedSglangRuntimeConfig):
@@ -2932,6 +3069,32 @@ def _materialized_insula_invocation_for(
         )
     except InsulaConfigError as error:
         raise RuntimeConfigError(f"failed to materialize Insula invocation: {error}") from error
+
+
+def _ensure_created_bind_sources(
+    config: MaterializedSglangRuntimeConfig,
+    *,
+    inner_argv: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    invocation = _materialized_insula_invocation_for(config, inner_argv=inner_argv, env=env)
+    for bind in invocation.binds:
+        if not bind.create or bind.mode != "rw":
+            continue
+        Path(bind.host).mkdir(parents=True, exist_ok=True)
+        repo_mountpoint = _repo_projected_mountpoint(config, bind.sandbox)
+        if repo_mountpoint is not None:
+            repo_mountpoint.mkdir(parents=True, exist_ok=True)
+
+
+def _repo_projected_mountpoint(config: MaterializedSglangRuntimeConfig, sandbox_path: str) -> Path | None:
+    repo_sandbox_path = "/workspace/monarch"
+    if sandbox_path == repo_sandbox_path:
+        return Path(_required_section_str(config.resolved_paths, "repo", "resolved_paths"))
+    if sandbox_path.startswith(f"{repo_sandbox_path}/"):
+        relative = sandbox_path.removeprefix(f"{repo_sandbox_path}/")
+        return Path(_required_section_str(config.resolved_paths, "repo", "resolved_paths")) / relative
+    return None
 
 
 def _insula_bind_mode(mode: str) -> str:
@@ -3266,12 +3429,32 @@ def _validate_probe_urls(base_url: str, probes: dict[str, Any], service_port: in
 def _validate_launch_env(config: MaterializedSglangRuntimeConfig) -> None:
     launch_env = _require_mapping(config.launch.get("env"), "launch.env")
     sandbox_env = _require_mapping(config.sandbox.get("env"), "sandbox.env")
-    if launch_env.get("CUDA_VISIBLE_DEVICES") != sandbox_env.get("CUDA_VISIBLE_DEVICES"):
-        raise RuntimeConfigError("CUDA_VISIBLE_DEVICES in launch env must equal sandbox env")
+    device = _required_section_str(config.runtime, "device", "runtime")
+    sandbox_gpu = _required_section_str(config.sandbox, "gpu", "sandbox")
+    if device == "cpu":
+        if "CUDA_VISIBLE_DEVICES" in launch_env or "CUDA_VISIBLE_DEVICES" in sandbox_env:
+            raise RuntimeConfigError("CUDA_VISIBLE_DEVICES must be absent for cpu")
+        if sandbox_gpu != "none":
+            raise RuntimeConfigError("sandbox.gpu must be none for cpu")
+    elif device == "cuda":
+        if sandbox_gpu != "required":
+            raise RuntimeConfigError("sandbox.gpu must be required for cuda")
+        if launch_env.get("CUDA_VISIBLE_DEVICES") != sandbox_env.get("CUDA_VISIBLE_DEVICES"):
+            raise RuntimeConfigError("CUDA_VISIBLE_DEVICES in launch env must equal sandbox env")
+        if not launch_env.get("CUDA_VISIBLE_DEVICES"):
+            raise RuntimeConfigError("CUDA_VISIBLE_DEVICES is required for cuda")
+    else:
+        raise RuntimeConfigError("runtime.device must be cpu or cuda")
     if launch_env.get("HF_HOME") != sandbox_env.get("HF_HOME"):
         raise RuntimeConfigError("HF_HOME in launch env must equal sandbox env")
     if launch_env.get("SGLANG_CACHE_DIR") != sandbox_env.get("SGLANG_CACHE_DIR"):
         raise RuntimeConfigError("SGLANG_CACHE_DIR in launch env must equal sandbox env")
+    if launch_env.get("SGLANG_USE_CPU_ENGINE") != sandbox_env.get("SGLANG_USE_CPU_ENGINE"):
+        raise RuntimeConfigError("SGLANG_USE_CPU_ENGINE in launch env must equal sandbox env")
+    if device == "cpu" and launch_env.get("SGLANG_USE_CPU_ENGINE") != "1":
+        raise RuntimeConfigError("SGLANG_USE_CPU_ENGINE=1 is required for cpu")
+    if device == "cuda" and "SGLANG_USE_CPU_ENGINE" in launch_env:
+        raise RuntimeConfigError("SGLANG_USE_CPU_ENGINE must be absent for cuda")
 
 
 def _validate_logical_host_layout(host_layout: dict[str, Any]) -> None:
@@ -3304,6 +3487,7 @@ def _reject_duplicate_inner_argv_schema_flags(inner: list[str]) -> None:
         "--host",
         "--port",
         "--tp",
+        "--device",
         "--dtype",
         "--context-length",
         "--kv-cache-dtype",

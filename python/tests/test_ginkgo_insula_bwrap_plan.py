@@ -59,6 +59,7 @@ def test_build_bwrap_argv_contains_rootfs_mounts_env_and_command(tmp_path: Path)
     assert argv[:3] == ["bwrap", "--ro-bind", invocation.rootfs_path]
     assert "/" in argv
     assert "--proc" in argv
+    assert _ro_bind_sandboxes(argv)["/sys"] == "/sys"
     assert "--tmpfs" in argv
     assert "--dev" in argv
     assert "--dir" in argv
@@ -78,6 +79,46 @@ def test_build_bwrap_argv_contains_rootfs_mounts_env_and_command(tmp_path: Path)
     assert argv[-3:] == ["python3", "-c", "print('ok')"]
 
 
+def test_build_bwrap_argv_creates_writable_bind_sandbox_destinations(tmp_path: Path) -> None:
+    invocation = materialized(tmp_path)
+    argv = build_bwrap_argv(invocation)
+
+    bind_index = argv.index("--bind")
+    assert argv[bind_index + 2] == "/run/glm52"
+    assert _option_value_pairs(argv, "--tmpfs")["/run"] < bind_index
+    assert _option_value_pairs(argv, "--dir")["/run/glm52"] < bind_index
+
+
+def test_build_bwrap_argv_creates_nested_writable_bind_parents(tmp_path: Path) -> None:
+    env = load_local_environment(write_local_env(tmp_path))
+    spec_data = {
+        **VALID_INVOCATION,
+        "binds": [
+            {
+                "name": "cache",
+                "host": "cache://qwen3-cpu",
+                "sandbox": "/cache/glm52",
+                "mode": "rw",
+                "create": True,
+                "required": True,
+            }
+        ],
+    }
+    invocation = materialize_invocation(
+        spec=invocation_spec_from_mapping(spec_data),
+        local_environment=env,
+        invocation_id="run-cache",
+        compatibility={"adapter": "unit-test"},
+    )
+
+    argv = build_bwrap_argv(invocation)
+
+    bind_index = argv.index("--bind")
+    assert argv[bind_index + 2] == "/cache/glm52"
+    assert _option_value_pairs(argv, "--tmpfs")["/cache"] < bind_index
+    assert _option_value_pairs(argv, "--dir")["/cache/glm52"] < bind_index
+
+
 def test_emit_and_validate_plan(tmp_path: Path) -> None:
     invocation = materialized(tmp_path)
     plan = emit_plan(invocation)
@@ -95,6 +136,7 @@ def test_emit_and_validate_plan(tmp_path: Path) -> None:
     assert plan.command_argv == ["python3", "-c", "print('ok')"]
     assert {mount["sandbox"] for mount in plan.mounts} >= {
         "/",
+        "/sys",
         "/workspace/monarch",
         "/run/glm52",
     }
@@ -176,3 +218,19 @@ def test_execute_invocation_marks_nonzero_fake_runner_failed(tmp_path: Path) -> 
     assert result.status == "failed"
     assert result.returncode == 19
     assert Path(result.stderr_path).read_text() == "bad\n"
+
+
+def _option_value_pairs(argv: list[str], option: str) -> dict[str, int]:
+    return {
+        argv[index + 1]: index
+        for index, arg in enumerate(argv[:-1])
+        if arg == option
+    }
+
+
+def _ro_bind_sandboxes(argv: list[str]) -> dict[str, str]:
+    return {
+        argv[index + 2]: argv[index + 1]
+        for index, arg in enumerate(argv[:-2])
+        if arg == "--ro-bind"
+    }

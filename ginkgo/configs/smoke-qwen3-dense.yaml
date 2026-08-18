@@ -15,6 +15,7 @@ model:
   expected_model_ids: [Qwen/Qwen3-0.6B]
 runtime:
   kind: sglang_openai
+  device: cuda
   cuda_visible_devices: "0"
   tensor_parallel_size: 1
   dtype: bfloat16

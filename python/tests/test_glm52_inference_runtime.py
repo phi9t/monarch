@@ -33,7 +33,6 @@ materialize_inference_config = glm52_inference_runtime.materialize_inference_con
 validate_process_record = glm52_inference_runtime.validate_process_record
 write_materialized_inference_config = glm52_inference_runtime.write_materialized_inference_config
 prepare_dynamo_venv = glm52_inference_runtime.prepare_dynamo_venv
-audit_parent_manifest = glm52_inference_runtime.audit_parent_manifest
 
 
 def write_text(path: Path, text: str) -> Path:
@@ -1238,65 +1237,6 @@ def test_run_repeatability_cycles_rejects_false_cycle(tmp_path: Path, monkeypatc
         )
 
 
-def test_run_repeatability_cycles_writes_benchmark_ready_parent_manifest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    declared_path = write_text(tmp_path / "inference.yaml", VALID_INFERENCE)
-    local_env_path = write_text(tmp_path / "local-env.yaml", local_env_text(tmp_path))
-
-    def fake_run_one_inference_cycle(config):
-        return {
-            "ok": True,
-            "run_id": config.run_id,
-            "components": {
-                "sglang_backend": {
-                    "result": {"process": {"pid": 111}},
-                    "probe": {"chat": {"text": "glm"}},
-                },
-                "dynamo_frontend": {"probe": {"chat": {"text": "dynamo"}}},
-                "responses_adapter": {
-                    "process": {"endpoint_url": "http://127.0.0.1:19002/v1"},
-                    "probe": {
-                        "nonstream": {"output_text": "nonstream"},
-                        "stream": {"output_text": "stream"},
-                        "tool_call": {"name": "calculator"},
-                    }
-                },
-            },
-            "teardown": {
-                "responses_adapter": {"ok": True},
-                "dynamo_frontend": {"ok": True},
-                "sglang_backend": {"ok": True},
-            },
-            "clean": {
-                "ok": True,
-                "ports": {
-                    "sglang_backend": {"closed": True},
-                    "dynamo_frontend": {"closed": True},
-                    "responses_adapter": {"closed": True},
-                },
-                "orphan_scan": {"ok": True},
-            },
-        }
-
-    monkeypatch.setattr(glm52_inference_runtime, "run_one_inference_cycle", fake_run_one_inference_cycle)
-
-    summary = glm52_inference_runtime.run_repeatability_cycles(
-        declared_path=declared_path,
-        local_environment_path=local_env_path,
-        run_id="repeat-parent-manifest",
-        cycles=3,
-    )
-
-    manifest_path = Path(summary["parent_manifest"])
-    audit = audit_parent_manifest(manifest_path)
-    assert audit["status"] == "completed"
-    assert audit["run_id"] == "repeat-parent-manifest"
-    assert audit["responses_base_url"].endswith("/v1")
-    assert json.loads(manifest_path.read_text())["repeatability"]["cycle_count"] == 3
-
-
 def test_cli_repeatability_dry_run_writes_summary(tmp_path: Path) -> None:
     declared_path = write_text(tmp_path / "inference.yaml", VALID_INFERENCE)
     local_env_path = write_text(tmp_path / "local-env.yaml", local_env_text(tmp_path))
@@ -1315,40 +1255,6 @@ def test_cli_repeatability_dry_run_writes_summary(tmp_path: Path) -> None:
             "--dry-run",
         ]
     )
-
-    assert rc == 0
-
-
-def test_cli_audit_parent_manifest_accepts_completed_manifest(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "parent-manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": "parent-run",
-                "model": "zai-org/GLM-5.2",
-                "evidence_level": "benchmark-ready",
-                "completed_responses_base_url": "http://127.0.0.1:19002/v1",
-                "repeatability": {"cycle_count": 3, "ok": True},
-                "components": {
-                    "sglang_backend": {"evidence_level": "completion", "chat": {"text": "ok"}},
-                    "dynamo_frontend": {"evidence_level": "completion", "chat": {"text": "ok"}},
-                    "responses_adapter": {
-                        "evidence_level": "completion",
-                        "nonstream": {"output_text": "ok"},
-                        "stream": {"output_text": "ok"},
-                        "tool_call": {"name": "calculator"},
-                    },
-                },
-                "teardown": {"ok": True, "port_closure": {"ok": True}, "orphan_scan": {"ok": True}},
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-
-    rc = glm52_inference_runtime.main(["audit-parent-manifest", "--manifest", str(manifest_path)])
 
     assert rc == 0
 
@@ -1401,76 +1307,6 @@ def test_cli_teardown_runs_materialized_component_teardown(tmp_path: Path, monke
 
     assert rc == 0
     assert torn_down == [(config.run_id, "responses_adapter")]
-
-
-def test_audit_parent_manifest_accepts_completed_glm_responses_url(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "parent-manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": "parent-run",
-                "model": "zai-org/GLM-5.2",
-                "evidence_level": "benchmark-ready",
-                "completed_responses_base_url": "http://127.0.0.1:19002/v1",
-                "repeatability": {"cycle_count": 3, "ok": True},
-                "components": {
-                    "sglang_backend": {"evidence_level": "completion", "chat": {"text": "ok"}},
-                    "dynamo_frontend": {"evidence_level": "completion", "chat": {"text": "ok"}},
-                    "responses_adapter": {
-                        "evidence_level": "completion",
-                        "nonstream": {"output_text": "ok"},
-                        "stream": {"output_text": "ok"},
-                        "tool_call": {"name": "calculator"},
-                    },
-                },
-                "teardown": {"ok": True, "port_closure": {"ok": True}, "orphan_scan": {"ok": True}},
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-
-    audit = audit_parent_manifest(manifest_path)
-
-    assert audit["status"] == "completed"
-    assert audit["run_id"] == "parent-run"
-    assert audit["responses_base_url"] == "http://127.0.0.1:19002/v1"
-    assert audit["evidence_level"] == "benchmark-ready"
-
-
-def test_audit_parent_manifest_rejects_models_only_or_default_port(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "parent-manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": "parent-run",
-                "model": "zai-org/GLM-5.2",
-                "evidence_level": "benchmark-ready",
-                "completed_responses_base_url": "http://127.0.0.1:8080/v1",
-                "repeatability": {"cycle_count": 3, "ok": True},
-                "components": {
-                    "sglang_backend": {"evidence_level": "readiness", "models": {"data": []}},
-                    "dynamo_frontend": {"evidence_level": "completion", "chat": {"text": "ok"}},
-                    "responses_adapter": {
-                        "evidence_level": "completion",
-                        "nonstream": {"output_text": "ok"},
-                        "stream": {"output_text": "ok"},
-                        "tool_call": {"name": "calculator"},
-                    },
-                },
-                "teardown": {"ok": True, "port_closure": {"ok": True}, "orphan_scan": {"ok": True}},
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-
-    with pytest.raises(InferenceConfigError, match="disallowed Responses port"):
-        audit_parent_manifest(manifest_path)
 
 
 def test_inference_runtime_wrapper_is_host_controlled() -> None:

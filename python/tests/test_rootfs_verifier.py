@@ -56,6 +56,7 @@ def make_rootfs(tmp_path: Path, recipe: str = "a" * 64) -> Path:
     write_contract(rootfs, recipe)
     for path in (
         "bin/bash",
+        "usr/bin/bwrap",
         "usr/bin/python",
         "usr/local/bin/uv",
         "usr/local/bin/node",
@@ -78,6 +79,7 @@ def make_rootfs(tmp_path: Path, recipe: str = "a" * 64) -> Path:
     (rootfs / "opt/cuda-synth/lib/libcudart.so.13").write_text("")
     (rootfs / "opt/cuda-synth/lib/libcudart.so").symlink_to("libcudart.so.13")
     (rootfs / "opt/cuda-synth/lib64").symlink_to("lib")
+    (rootfs / "cache").mkdir(parents=True)
     (rootfs / "workspace/monarch").mkdir(parents=True)
     (rootfs / "run/nvidia-host").mkdir(parents=True)
     return rootfs
@@ -131,6 +133,20 @@ def test_verify_rootfs_accepts_complete_export(tmp_path: Path) -> None:
     assert not report.errors
 
 
+def test_verify_rootfs_rejects_missing_nested_bwrap(tmp_path: Path) -> None:
+    rootfs = make_rootfs(tmp_path)
+    (rootfs / "usr/bin/bwrap").unlink()
+
+    report = verify_rootfs.verify_rootfs(
+        rootfs,
+        expected_recipe="a" * 64,
+        run_commands=False,
+    )
+
+    assert report.ok is False
+    assert any("missing executable: /usr/bin/bwrap" in error for error in report.errors)
+
+
 def test_verify_rootfs_rejects_missing_contract(tmp_path: Path) -> None:
     rootfs = make_rootfs(tmp_path)
     (rootfs / "etc/monarch-rootfs-contract").unlink()
@@ -162,6 +178,7 @@ def test_verify_rootfs_rejects_stale_recipe(tmp_path: Path) -> None:
     "missing_path, message",
     [
         ("bin/bash", "missing executable"),
+        ("cache", "missing required mountpoint"),
         ("workspace/monarch", "missing required mountpoint"),
         ("run/nvidia-host", "missing required mountpoint"),
         ("opt/cuda-synth/lib/libcudart.so", "missing cuda runtime linker name"),
@@ -204,7 +221,6 @@ def test_verify_rootfs_rejects_relative_cache_root(tmp_path: Path) -> None:
 def test_verify_rootfs_rejects_cache_root_inside_rootfs(tmp_path: Path) -> None:
     rootfs = make_rootfs(tmp_path)
     cache_root = rootfs / "cache"
-    cache_root.mkdir()
 
     report = verify_rootfs.verify_rootfs(
         rootfs,

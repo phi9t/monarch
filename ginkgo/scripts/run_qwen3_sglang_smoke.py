@@ -35,6 +35,8 @@ def run_smoke(
     port: int | None = None,
     runtime: Any | None = None,
     output: TextIO | None = None,
+    wait_for_gpu_free_seconds: int = 0,
+    gpu_free_stable_seconds: int = 0,
 ) -> dict[str, Any]:
     adapter = RuntimeBackedLocalRunAdapter(runtime) if runtime is not None else None
     result = SglangLocalRun(
@@ -46,6 +48,8 @@ def run_smoke(
         run_id=run_id,
         port=port,
         output=output,
+        wait_for_gpu_free_seconds=wait_for_gpu_free_seconds,
+        gpu_free_stable_seconds=gpu_free_stable_seconds,
     )
     return {
         "status": result.status,
@@ -62,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-environment", type=Path, required=True)
     parser.add_argument("--run-id")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--wait-for-gpu-free-seconds", type=int, default=0)
+    parser.add_argument("--gpu-free-stable-seconds", type=int, default=0)
     return parser
 
 
@@ -74,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
             local_environment=args.local_environment,
             run_id=args.run_id,
             port=args.port,
+            wait_for_gpu_free_seconds=args.wait_for_gpu_free_seconds,
+            gpu_free_stable_seconds=args.gpu_free_stable_seconds,
         )
     except SmokeError as error:
         print(f"error: {error}", file=sys.stderr)

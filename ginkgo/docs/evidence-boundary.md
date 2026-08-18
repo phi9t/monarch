@@ -8,11 +8,24 @@ Ginkgo evidence is profile-scoped.
   bwrap projection.
 - CUDA-kernel evidence proves PyTorch CUDA visibility and required optimized
   kernels for the declared device class.
+- Qwen3 CPU smoke evidence proves SGLang serving mechanics and clean teardown
+  without CUDA environment or host GPU projection.
 - Qwen3 smoke evidence proves SGLang serving mechanics, model identity,
   request handling, artifacts, and teardown for the smoke model.
 - Qwen3 MoE smoke evidence proves MoE serving mechanics when host budget allows.
 
 Qwen3 smoke is not GLM-5.2 completion evidence.
+Qwen3 CPU smoke is not CUDA readiness evidence and is not GLM-5.2 completion
+evidence.
+
+## Blocker Evidence
+
+Failed CUDA-device waits are readiness blockers, not serving success evidence.
+When a no-fallback wait times out on the declared device, the manifest records
+`gpu_wait.status: failed`, the timeout error, and `failure.blocked_gpus` with
+the process IDs, process names, memory, and UUIDs that occupied the declared
+device. These records explain why launch did not proceed; they do not prove
+SGLang startup, inference, teardown, CUDA readiness, or GLM-5.2 completion.
 
 ## Completion Evidence
 

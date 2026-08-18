@@ -28,7 +28,6 @@ ROOTFS_DIR = REPO_ROOT / "scripts" / "rootfs"
 DEFAULT_ROOTFS = ROOTFS_DIR / "rootfs"
 REPO_MOUNT = "/workspace/monarch"
 ROOTFS_CONTRACT_PATH = "/etc/monarch-rootfs-contract"
-ROOTFS_HOME = "/" + "home/monarch"
 CHECKOUT_TOOLS = ("python", "uv", "cargo")
 HOST_ENV_ALLOWLIST = (
     "TERM",
@@ -234,7 +233,7 @@ def _materialize_legacy_plan(
             "repo_root": REPO_MOUNT,
             "cache_root": cache_mount,
             "cargo_target_dir": cargo_target_mount,
-            "home": ROOTFS_HOME,
+            "home": "/home/monarch",
             "nvidia_host": "/run/nvidia-host",
         },
         "cwd": cwd,
@@ -259,7 +258,7 @@ def _rootfs_env(
     *, recipe_sha256: str, cache_mount: str, cargo_target_mount: str, have_nvidia: bool
 ) -> dict[str, str]:
     env = {
-        "HOME": ROOTFS_HOME,
+        "HOME": "/home/monarch",
         "PATH": "/opt/cuda-synth/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin:/run/nvidia-host",
         "UV_PROJECT_ENVIRONMENT": f"{REPO_MOUNT}/.venv-rootfs",
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", f"{cache_mount}/uv"),
@@ -392,7 +391,7 @@ def _append_nvidia_projection(
     mounts: list[dict[str, str]]
 ) -> tuple[list[dict[str, str]], bool]:
     seen: set[Path] = set()
-    for dev in sorted(Path("/dev").glob("nvidia*")):
+    for dev in _nvidia_projection_devices(os.environ.get("CUDA_VISIBLE_DEVICES")):
         if dev in seen:
             continue
         seen.add(dev)
@@ -433,6 +432,43 @@ def _append_nvidia_projection(
             }
         )
     return mounts, True
+
+
+_NVIDIA_CONTROL_DEVICE_NAMES = {
+    "nvidiactl",
+    "nvidia-uvm",
+    "nvidia-uvm-tools",
+    "nvidia-modeset",
+    "nvidia-caps",
+}
+
+
+def _nvidia_projection_devices(cuda_visible_devices: str | None) -> list[Path]:
+    devices = sorted(Path("/dev").glob("nvidia*"), key=str)
+    if cuda_visible_devices is None or not cuda_visible_devices.strip():
+        return devices
+    selected_names = {f"nvidia{index}" for index in _visible_gpu_indices(cuda_visible_devices)}
+    allowed_names = selected_names | _NVIDIA_CONTROL_DEVICE_NAMES
+    projected = [dev for dev in devices if dev.name in allowed_names]
+    present_names = {dev.name for dev in projected}
+    missing = sorted(selected_names - present_names)
+    if missing:
+        raise InsulaConfigError(f"visible GPU device node is missing: /dev/{missing[0]}")
+    return projected
+
+
+def _visible_gpu_indices(cuda_visible_devices: str) -> list[int]:
+    indices: list[int] = []
+    for item in cuda_visible_devices.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        if not value.isdecimal():
+            raise InsulaConfigError("CUDA_VISIBLE_DEVICES must be a comma-separated GPU index list")
+        indices.append(int(value))
+    if not indices:
+        raise InsulaConfigError("CUDA_VISIBLE_DEVICES must name at least one GPU")
+    return indices
 
 
 def _preflight_host() -> None:
