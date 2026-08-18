@@ -16,18 +16,20 @@ Ginkgo configs.
 4. Prepare the SGLang venv under `/cache/glm52/venvs/sglang`.
 5. Prepare the dense Qwen3 smoke model cache under `/cache/glm52/hf-home`.
 6. Run the dense serving smoke from `ginkgo/configs/smoke-qwen3-dense.yaml`.
-   The runnable helper is a thin bash wrapper around the Python implementation:
+   The operator command is:
 
    ```sh
-   ginkgo/scripts/run_qwen3_sglang_smoke.sh \
-     --local-environment ginkgo/local-env/<host>.yaml \
-     --declared-spec ginkgo/configs/smoke-qwen3-dense.yaml \
-     --port 19007
+   ginkgo/scripts/run_qwen3_sglang_inference_in_bwrap_rootfs.sh --port 19007
    ```
 
-   Run it through `scripts/run` from the host. It materializes the schema,
-   launches SGLang, sends a real chat request, captures `/v1/models`, generated
-   assistant text, SGLang log tails, and teardown status, then writes
+   The wrapper is a host-control entrypoint: it materializes host-local paths
+   and delegates to the Python implementation, which validates and launches the
+   resolved bwrap command. It defaults to
+   `ginkgo/local-env/qwen3-sglang.yaml` for machine-local paths; set
+   `GINKGO_QWEN3_LOCAL_ENVIRONMENT` or pass `--local-environment <path>` to use
+   another file. It materializes the schema, launches SGLang inside the governed
+   rootfs, sends a real chat request, prints each bringup/inference/teardown
+   stage, prints SGLang log tails and the final model output, then writes
    `qwen3-sglang-smoke-evidence.json` in the run-owned results directory.
 7. Run three dense smoke launch/probe/teardown cycles before treating the
    sandbox as repeatable.

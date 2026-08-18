@@ -53,6 +53,7 @@ EXPECTED_FILES = [
     "docs/evidence-boundary.md",
     "scripts/run_qwen3_sglang_smoke.py",
     "scripts/run_qwen3_sglang_smoke.sh",
+    "scripts/run_qwen3_sglang_inference_in_bwrap_rootfs.sh",
 ]
 
 
@@ -139,6 +140,24 @@ def test_qwen3_sglang_shell_wrapper_is_thin_and_executable() -> None:
     assert wrapper.stat().st_mode & 0o111
     assert "exec \"${PYTHON:-python}\"" in text
     assert "run_qwen3_sglang_smoke.py" in text
+    assert "8000" not in text
+    assert "8080" not in text
+    assert "18080" not in text
+
+
+def test_qwen3_sglang_rootfs_operator_script_is_host_control_and_delegates() -> None:
+    wrapper = GINKGO_ROOT / "scripts" / "run_qwen3_sglang_inference_in_bwrap_rootfs.sh"
+    text = wrapper.read_text()
+
+    assert wrapper.stat().st_mode & 0o111
+    assert "materialize_default_local_environment" in text
+    assert "run_qwen3_sglang_smoke.py" in text
+    assert "ginkgo/local-env/qwen3-sglang.yaml" in text
+    assert "exec \"${PYTHON:-python}\"" in text
+    assert "host-control script" in text
+    assert "bwrap command" in text
+    assert "exec \"${REPO_ROOT}/scripts/run\"" not in text
+    assert "MONARCH_ROOTFS" in text
     assert "8000" not in text
     assert "8080" not in text
     assert "18080" not in text

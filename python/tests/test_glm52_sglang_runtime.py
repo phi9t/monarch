@@ -1571,6 +1571,28 @@ def test_validate_model_snapshot_requires_all_indexed_shards(tmp_path: Path) -> 
     assert evidence["missing_shard_count"] == 0
 
 
+def test_validate_model_snapshot_accepts_single_safetensors_file(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "model.safetensors").write_text("weights")
+
+    evidence = validate_model_snapshot(snapshot)
+
+    assert evidence["status"] == "complete"
+    assert evidence["format"] == "single_safetensors"
+    assert evidence["shard_count"] == 1
+    assert evidence["missing_shard_count"] == 0
+
+
+def test_validate_model_snapshot_rejects_snapshot_without_safetensors(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}\n")
+
+    with pytest.raises(RuntimeConfigError, match="missing model.safetensors"):
+        validate_model_snapshot(snapshot)
+
+
 def test_load_local_environment_accepts_absolute_host_paths(tmp_path: Path) -> None:
     local_env = load_local_environment(write_spec(tmp_path / "local-env.yaml", VALID_LOCAL_ENV))
 

@@ -106,7 +106,18 @@ def parse_models_response(
 def validate_model_snapshot(snapshot_path: Path) -> dict[str, Any]:
     index_path = snapshot_path / "model.safetensors.index.json"
     if not index_path.exists():
-        raise RuntimeConfigError(f"missing model.safetensors.index.json in {snapshot_path}")
+        weights_path = snapshot_path / "model.safetensors"
+        if not weights_path.is_file():
+            raise RuntimeConfigError(f"missing model.safetensors or model.safetensors.index.json in {snapshot_path}")
+        return {
+            "status": "complete",
+            "snapshot_path": str(snapshot_path),
+            "format": "single_safetensors",
+            "weight_path": str(weights_path),
+            "shard_count": 1,
+            "missing_shard_count": 0,
+            "metadata": {},
+        }
     try:
         index = json.loads(index_path.read_text())
     except json.JSONDecodeError as error:
@@ -3177,6 +3188,13 @@ def _with_prepared_model_snapshot(
     return effective
 
 
+def with_prepared_model_snapshot(
+    config: MaterializedSglangRuntimeConfig,
+    model_cache_record: dict[str, Any],
+) -> MaterializedSglangRuntimeConfig:
+    return _with_prepared_model_snapshot(config, model_cache_record)
+
+
 def _with_stable_preparation_record_paths(
     config: MaterializedSglangRuntimeConfig,
     *,
@@ -3211,6 +3229,19 @@ def _with_stable_preparation_record_paths(
         probes=config.probes,
         artifacts=config.artifacts,
         resolved_paths=resolved_paths,
+    )
+
+
+def with_stable_preparation_record_paths(
+    config: MaterializedSglangRuntimeConfig,
+    *,
+    declared: DeclaredSglangLaunchSpec,
+    local_environment: LocalEnvironmentConfig,
+) -> MaterializedSglangRuntimeConfig:
+    return _with_stable_preparation_record_paths(
+        config,
+        declared=declared,
+        local_environment=local_environment,
     )
 
 

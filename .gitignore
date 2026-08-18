@@ -65,6 +65,7 @@ scripts/**/__pycache__/
 control-plane-results/
 glm52-serving-results/
 glm52-benchmark-results/
+ginkgo/local-env/qwen3-sglang.yaml
 .scratch/glm52-local-serving/cache/
 .scratch/glm52-local-serving/run/
 .scratch/glm52-local-serving/tmp/
