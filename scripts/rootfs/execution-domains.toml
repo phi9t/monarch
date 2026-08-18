@@ -18,6 +18,9 @@
 #   controlled-ci           GitHub Actions workflow definitions
 #   meta-internal           Buck/fbcode-only tooling, never run in OSS locally
 #   remote-orchestration    drive remote/MAST/cluster jobs from a launcher host
+#   local-inference         host-controlled local SGLang/Ginkgo/GLM serving and
+#                           verifier orchestration that enters Insula/rootfs as
+#                           needed
 
 [domains.host-bootstrap]
 patterns = [
@@ -110,4 +113,14 @@ patterns = [
     "examples/remotemount/*.py",
     "examples/torchtitan_mast/*.sh",
     "examples/torchtitan_mast/**/*.py",
+]
+
+[domains.local-inference]
+patterns = [
+    ".scratch/glm52-local-serving/wizards/*.sh",
+    "ginkgo/scripts/*.sh",
+    "ginkgo/scripts/run_*.py",
+    "scripts/ginkgo_host_survey.py",
+    "scripts/glm52_*.py",
+    "scripts/run_glm52_*.sh",
 ]
