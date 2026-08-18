@@ -43,3 +43,16 @@ Ginkgo configs.
 Every launch uses run-owned custom ports. Default ports `8000`, `8080`, and
 `18080` are disallowed as active serving defaults. Every process must have an
 owned process record before teardown signals are sent.
+
+## Local Run Module
+
+`ginkgo.local_run` is the module seam for bwrap-rootfs SGLang workloads. It owns
+stage logging, materialization, preparation refresh, launch, effective-config
+reload, probes, teardown, failure reporting, and evidence manifests. Workload
+adapters, such as `Qwen3SglangWorkload`, own workload-specific declared-spec
+validation, materialized-config validation, generated-text extraction, and
+manifest metadata.
+
+Shell entrypoints stay host-control adapters. They may resolve machine-local
+paths and print wrapper stages for humans, but the Local Run module owns the
+bringup, inference, teardown, and Contract Artifact flow.

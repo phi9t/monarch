@@ -10,6 +10,10 @@ from typing import Any
 
 import pytest
 
+from ginkgo.local_run import RuntimeBackedLocalRunAdapter
+from ginkgo.local_run import SglangLocalRun
+from ginkgo.local_run import Qwen3SglangWorkload
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "ginkgo" / "scripts" / "run_qwen3_sglang_smoke.py"
@@ -380,3 +384,48 @@ def test_qwen3_sglang_smoke_tears_down_after_chat_failure(tmp_path: Path) -> Non
 
     assert runtime.calls[-1] == "teardown"
     assert "[ginkgo] stage=teardown" in output.getvalue()
+
+
+def test_ginkgo_local_run_writes_failure_manifest_for_probe_failure(tmp_path: Path) -> None:
+    runtime = FakeRuntime(tmp_path=tmp_path)
+    output = io.StringIO()
+
+    def fail_chat(config: Any) -> dict[str, Any]:
+        runtime.calls.append("chat")
+        raise RuntimeError("chat failed")
+
+    runtime.probe_chat = fail_chat  # type: ignore[method-assign]
+    declared = tmp_path / "smoke-qwen3-dense.yaml"
+    declared.write_text("placeholder: true\n")
+    local_env = tmp_path / "local-env.yaml"
+    local_env.write_text("placeholder: true\n")
+
+    local_run = SglangLocalRun(
+        workload=Qwen3SglangWorkload(),
+        runtime=RuntimeBackedLocalRunAdapter(runtime),
+    )
+
+    with pytest.raises(RuntimeError, match="chat failed"):
+        local_run.run(
+            declared_spec=declared,
+            local_environment=local_env,
+            run_id="qwen3-smoke-test",
+            port=19007,
+            output=output,
+        )
+
+    failure_manifest = tmp_path / "results" / "qwen3-smoke-test" / "qwen3-sglang-smoke-evidence.json"
+    manifest = json.loads(failure_manifest.read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["failure"]["stage"] == "inference_request"
+    assert manifest["failure"]["exception_type"] == "RuntimeError"
+    assert manifest["failure"]["message"] == "chat failed"
+    assert manifest["run_id"] == "qwen3-smoke-test"
+    assert manifest["port"] == 19007
+    assert manifest["logs"]["stderr_tail"].endswith("output=OK\n")
+    assert manifest["teardown"]["status"] == "teardown_passed"
+
+    text = output.getvalue()
+    assert "========== GINKGO FAILURE ==========" in text
+    assert "stage=inference_request" in text
+    assert "chat failed" in text

@@ -19,6 +19,16 @@ LOCAL_ENVIRONMENT="${GINKGO_QWEN3_LOCAL_ENVIRONMENT:-$DEFAULT_LOCAL_ENV}"
 DECLARED_SPEC="${GINKGO_QWEN3_DECLARED_SPEC:-$DEFAULT_DECLARED_SPEC}"
 LOCAL_ENVIRONMENT_EXPLICIT=0
 
+log_stage() {
+  printf '[ginkgo-wrapper] stage=%s' "$1"
+  shift
+  while [[ $# -gt 0 ]]; do
+    printf ' %s' "$1"
+    shift
+  done
+  printf '\n'
+}
+
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +68,7 @@ done
 
 materialize_default_local_environment() {
   local rootfs="${MONARCH_ROOTFS:-${REPO_ROOT}/scripts/rootfs/rootfs}"
+  log_stage resolve_default_local_environment "path=${LOCAL_ENVIRONMENT}" "rootfs=${rootfs}"
   if [[ "$rootfs" != /* ]]; then
     echo "error: MONARCH_ROOTFS must be an absolute path: $rootfs" >&2
     exit 2
@@ -78,7 +89,10 @@ roots:
 rootfs:
   monarch-default: $rootfs
 EOF
+  log_stage wrote_default_local_environment "path=${LOCAL_ENVIRONMENT}"
 }
+
+log_stage start "repo=${REPO_ROOT}" "declared_spec=${DECLARED_SPEC}" "local_environment=${LOCAL_ENVIRONMENT}"
 
 if [[ ! -f "$LOCAL_ENVIRONMENT" ]]; then
   if [[ "$LOCAL_ENVIRONMENT_EXPLICIT" -eq 1 || -n "${GINKGO_QWEN3_LOCAL_ENVIRONMENT:-}" ]]; then
@@ -92,11 +106,14 @@ EOF
     exit 2
   fi
   materialize_default_local_environment
+else
+  log_stage use_existing_local_environment "path=${LOCAL_ENVIRONMENT}"
 fi
 
 # This host-control script is intentionally not executed through scripts/run:
 # it materializes host paths and the Python launcher validates the resolved
 # bwrap command. SGLang itself still runs inside the governed rootfs.
+log_stage delegate_to_python "python=${PYTHON:-python}" "runner=${REPO_ROOT}/ginkgo/scripts/run_qwen3_sglang_smoke.py"
 exec "${PYTHON:-python}" "${REPO_ROOT}/ginkgo/scripts/run_qwen3_sglang_smoke.py" \
   --local-environment "$LOCAL_ENVIRONMENT" \
   --declared-spec "$DECLARED_SPEC" \

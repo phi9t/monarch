@@ -51,6 +51,8 @@ EXPECTED_FILES = [
     "docs/operator-workflow.md",
     "docs/verification-ladder.md",
     "docs/evidence-boundary.md",
+    "__init__.py",
+    "local_run.py",
     "scripts/run_qwen3_sglang_smoke.py",
     "scripts/run_qwen3_sglang_smoke.sh",
     "scripts/run_qwen3_sglang_inference_in_bwrap_rootfs.sh",
