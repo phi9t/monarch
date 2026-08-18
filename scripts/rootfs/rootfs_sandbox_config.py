@@ -246,6 +246,8 @@ def parse_bwrap_argv(argv: list[str]) -> tuple[list[Mount], dict[str, str], str]
             if index + 1 >= len(argv):
                 raise SandboxConfigError(f"{arg} requires a path")
             index += 2
+        elif arg == "--":
+            break
         elif arg.startswith("--"):
             index += 1
         else:

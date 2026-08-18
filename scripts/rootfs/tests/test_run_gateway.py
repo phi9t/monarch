@@ -104,3 +104,21 @@ def test_run_maps_a_checkout_subdirectory() -> None:
         cwd=str(REPO_ROOT / "docs"),
     )
     assert result.stdout.strip() == "/workspace/monarch/docs"
+
+
+def test_run_gateway_resolves_insula_cli_from_checkout_subdirectory() -> None:
+    result = subprocess.run(
+        ["../scripts/run", "python", "-c", "print('subdir-ok')"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT / "docs"),
+    )
+    assert result.stdout.strip() == "subdir-ok"
+
+
+def test_run_gateway_routes_through_insula_cli() -> None:
+    text = RUN.read_text()
+
+    assert "python3 -m ginkgo.insula.cli monarch-run" in text
+    assert "PYTHONPATH" in text

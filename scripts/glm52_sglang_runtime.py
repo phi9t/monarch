@@ -27,6 +27,17 @@ import uuid
 
 import yaml
 
+from ginkgo.insula.bwrap_plan import build_bwrap_argv
+from ginkgo.insula.bwrap_plan import emit_plan as emit_insula_plan
+from ginkgo.insula.bwrap_plan import validate_plan as validate_insula_plan
+from ginkgo.insula.local_environment import local_environment_from_mapping as insula_local_environment_from_mapping
+from ginkgo.insula.materialize import materialize_invocation as materialize_insula_invocation
+from ginkgo.insula.schema import InsulaBindSpec
+from ginkgo.insula.schema import InsulaCommandSpec
+from ginkgo.insula.schema import InsulaConfigError
+from ginkgo.insula.schema import InsulaEnvironmentSpec
+from ginkgo.insula.schema import InsulaInvocationSpec
+
 SGLANG_VENV_SANDBOX_PATH = "/cache/glm52/venvs/sglang"
 SGLANG_VENV_PYTHON = f"{SGLANG_VENV_SANDBOX_PATH}/bin/python"
 SGLANG_HF_HOME_SANDBOX_PATH = "/cache/glm52/hf-home"
@@ -1709,26 +1720,7 @@ def _emit_preparation_rootfs_plan(
     run: Any | None = None,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    plan_path = _preparation_plan_path(config)
-    command_env = dict(env or {})
-    command = _rootfs_preparation_argv(config, inner_command, env=command_env, emit_plan_path=plan_path)
-    process_env = {
-        **_runtime_subprocess_env(config),
-        **command_env,
-        "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1",
-    }
-    runner = subprocess.run if run is None else run
-    completed = runner(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=_runtime_subprocess_cwd(config),
-        env=process_env,
-    )
-    if completed.returncode != 0:
-        raise RuntimeConfigError(f"rootfs plan emission failed: {completed.stderr}")
-    return load_yaml_mapping(plan_path)
+    return _emit_insula_rootfs_plan(config, inner_argv=inner_command, env=env)
 
 
 def _preparation_plan_path(config: MaterializedSglangRuntimeConfig) -> Path:
@@ -1756,6 +1748,76 @@ def _preparation_plan(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]
             for mount in config.sandbox["mounts"]
         ],
     }
+
+
+def _emit_insula_rootfs_plan(
+    config: MaterializedSglangRuntimeConfig,
+    *,
+    inner_argv: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    resolved_plan_path: Path | None = None,
+) -> dict[str, Any]:
+    invocation = _materialized_insula_invocation_for(config, inner_argv=inner_argv, env=env)
+    insula_plan = emit_insula_plan(invocation)
+    try:
+        validate_insula_plan(invocation, insula_plan)
+    except InsulaConfigError as error:
+        raise RuntimeConfigError(f"Insula rootfs plan validation failed: {error}") from error
+    plan = _legacy_rootfs_plan_from_insula(config=config, insula_plan=insula_plan)
+    validate_sglang_rootfs_overlay(
+        config=config,
+        plan=plan,
+        expected_inner_argv=list(inner_argv) if inner_argv is not None else None,
+    )
+    if resolved_plan_path is not None:
+        resolved_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
+    return plan
+
+
+def _legacy_rootfs_plan_from_insula(
+    *,
+    config: MaterializedSglangRuntimeConfig,
+    insula_plan: Any,
+) -> dict[str, Any]:
+    return {
+        "schema_version": insula_plan.schema_version,
+        "rootfs": insula_plan.rootfs_path,
+        "cwd": insula_plan.cwd,
+        "inner_argv": list(insula_plan.command_argv),
+        "repo_projection_mode": _insula_repo_projection_mode(insula_plan),
+        "network": insula_plan.network,
+        "gpu": _legacy_gpu_mode(str(insula_plan.gpu)),
+        "env_allowlist": list(config.sandbox["env_allowlist"]),
+        "env": dict(insula_plan.env),
+        "mounts": [
+            {
+                "host_path": _required_section_str(mount, "host", "insula_plan.mounts"),
+                "sandbox_path": _required_section_str(mount, "sandbox", "insula_plan.mounts"),
+                "mode": _required_section_str(mount, "mode", "insula_plan.mounts"),
+            }
+            for mount in insula_plan.mounts
+            if mount.get("sandbox") != "/"
+        ],
+        "insula": {
+            "invocation_id": insula_plan.invocation_id,
+            "recipe_sha256": insula_plan.recipe_sha256,
+            "bwrap_argv_sha256": insula_plan.bwrap_argv_sha256,
+        },
+    }
+
+
+def _insula_repo_projection_mode(insula_plan: Any) -> str:
+    repo_mounts = [mount for mount in insula_plan.mounts if mount.get("sandbox") == "/workspace/monarch"]
+    if len(repo_mounts) != 1:
+        raise RuntimeConfigError("Insula rootfs plan must contain one repo projection")
+    return _required_section_str(repo_mounts[0], "mode", "insula_plan.repo_mount")
+
+
+def _legacy_gpu_mode(gpu: str) -> str:
+    if gpu == "nvidia-if-present":
+        return "dev-bind-nvidia-when-present"
+    return gpu
 
 
 def _stable_json_digest(value: dict[str, Any]) -> str:
@@ -1844,26 +1906,7 @@ def emit_and_load_rootfs_plan(
     *,
     resolved_plan_path: Path,
 ) -> dict[str, Any]:
-    command = _resolved_outer_argv(config)
-    if str(resolved_plan_path) not in command:
-        raise RuntimeConfigError("launch.outer_argv must include artifacts.resolved_rootfs_plan")
-    env = {
-        **_runtime_subprocess_env(config),
-        "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1",
-    }
-    process = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=_runtime_subprocess_cwd(config),
-        env=env,
-    )
-    if process.returncode != 0:
-        raise RuntimeConfigError(f"rootfs plan emission failed: {process.stderr}")
-    plan = load_yaml_mapping(resolved_plan_path)
-    validate_sglang_rootfs_overlay(config=config, plan=plan)
-    return plan
+    return _emit_insula_rootfs_plan(config, resolved_plan_path=resolved_plan_path)
 
 
 def wait_for_models_probe(
@@ -2657,24 +2700,254 @@ def _resolved_rootfs_path(config: MaterializedSglangRuntimeConfig) -> str:
     )
 
 
-def _resolved_outer_argv(config: MaterializedSglangRuntimeConfig) -> list[str]:
-    outer = _required_str_sequence(config.launch.get("outer_argv"), "launch.outer_argv")
-    logical_plan_path = _required_section_str(config.artifacts, "resolved_rootfs_plan", "artifacts")
-    resolved_plan_path = str(_resolve_host_path_ref(config, logical_plan_path))
-    resolved = [
-        _resolve_bind_spec(config, resolved_plan_path if arg == logical_plan_path else arg)
-        for arg in outer
+def build_insula_invocation_spec(config: MaterializedSglangRuntimeConfig) -> InsulaInvocationSpec:
+    runtime_binds, runtime_env = _rootfs_runtime_binds_and_env(config)
+    return InsulaInvocationSpec(
+        schema_version=1,
+        name=config.run_group,
+        rootfs_ref=_required_section_str(config.sandbox, "rootfs_ref", "sandbox"),
+        repo=InsulaBindSpec(
+            name="repo",
+            host="repo://",
+            sandbox="/workspace/monarch",
+            mode="ro",
+            create=False,
+            required=True,
+        ),
+        binds=[
+            InsulaBindSpec(
+                name=str(mount["sandbox_path"]).strip("/").replace("/", "-") or "root",
+                host=_required_section_str(mount, "host_path_ref", "sandbox.mounts"),
+                sandbox=_required_section_str(mount, "sandbox_path", "sandbox.mounts"),
+                mode=_insula_bind_mode(_required_section_str(mount, "mode", "sandbox.mounts")),
+                create=True,
+                required=True,
+            )
+            for mount in _require_list(config.sandbox.get("mounts"), "sandbox.mounts")
+            if _required_section_str(mount, "sandbox_path", "sandbox.mounts") != "/workspace/monarch"
+        ]
+        + runtime_binds,
+        environment=InsulaEnvironmentSpec(
+            clear=True,
+            values={**runtime_env, **{str(key): str(value) for key, value in config.launch["env"].items()}},
+            inherit_allowlist=[],
+        ),
+        command=InsulaCommandSpec(
+            cwd=_required_section_str(config.sandbox, "cwd", "sandbox"),
+            argv=list(config.launch["inner_argv"]),
+        ),
+        artifacts={
+            "root": "run://insula",
+            "stdout": config.artifacts["stdout_log"],
+            "stderr": config.artifacts["stderr_log"],
+            "plan": config.artifacts["resolved_rootfs_plan"],
+            "result": "run://insula/result.json",
+        },
+        network="share-net",
+        gpu="nvidia-if-present",
+        die_with_parent=True,
+        unshare_all=True,
+    )
+
+
+def _rootfs_runtime_binds_and_env(config: MaterializedSglangRuntimeConfig) -> tuple[list[InsulaBindSpec], dict[str, str]]:
+    run_group = config.run_group
+    rootfs_cache = "repo://scripts/rootfs/cache"
+    cargo_target = f"{rootfs_cache}/target/bwrap/{_rootfs_recipe_digest(config)}"
+    binds = [
+        InsulaBindSpec(
+            name="rootfs-cache",
+            host=rootfs_cache,
+            sandbox="/workspace/monarch/scripts/rootfs/cache",
+            mode="rw",
+            create=True,
+            required=True,
+        ),
+        InsulaBindSpec(
+            name="cargo-target",
+            host=cargo_target,
+            sandbox=f"/workspace/monarch/target/bwrap/{_rootfs_recipe_digest(config)}",
+            mode="rw",
+            create=True,
+            required=True,
+        ),
     ]
-    repo = _required_section_str(config.resolved_paths, "repo", "resolved_paths")
-    if resolved:
-        resolved[0] = _join_host_path(repo, resolved[0])
-    if "--rootfs" not in resolved:
-        try:
-            marker = resolved.index("--")
-        except ValueError as error:
-            raise RuntimeConfigError("launch.outer_argv must contain -- before inner argv") from error
-        resolved[marker:marker] = ["--rootfs", _resolved_rootfs_path(config)]
-    return resolved
+    for name in ("resolv.conf", "hosts"):
+        host_path = Path("/etc") / name
+        if host_path.exists():
+            binds.append(
+                InsulaBindSpec(
+                    name=f"etc-{name}",
+                    host=f"host://{host_path}",
+                    sandbox=str(host_path),
+                    mode="ro",
+                    create=False,
+                    required=True,
+                )
+            )
+
+    have_nvidia = False
+    for dev in sorted(Path("/dev").glob("nvidia*")):
+        have_nvidia = True
+        binds.append(
+            InsulaBindSpec(
+                name=f"dev-{dev.name}",
+                host=f"host://{dev}",
+                sandbox=str(dev),
+                mode="dev",
+                create=False,
+                required=True,
+            )
+        )
+    nvidia_host_dir = f"cache://{run_group}/nvidia-host"
+    libs = sorted(Path("/usr/lib/x86_64-linux-gnu").glob("libcuda.so*")) + sorted(
+        Path("/usr/lib/x86_64-linux-gnu").glob("libnvidia-*.so*")
+    )
+    if libs:
+        have_nvidia = True
+        binds.append(
+            InsulaBindSpec(
+                name="nvidia-host",
+                host=nvidia_host_dir,
+                sandbox="/run/nvidia-host",
+                mode="rw",
+                create=True,
+                required=True,
+            )
+        )
+        for lib in libs:
+            binds.append(
+                InsulaBindSpec(
+                    name=f"nvidia-lib-{lib.name.replace('.', '-')}",
+                    host=f"host://{lib}",
+                    sandbox=f"/run/nvidia-host/{lib.name}",
+                    mode="ro",
+                    create=False,
+                    required=True,
+                )
+            )
+    nvidia_smi = Path("/usr/bin/nvidia-smi")
+    if nvidia_smi.is_file():
+        have_nvidia = True
+        binds.append(
+            InsulaBindSpec(
+                name="nvidia-smi",
+                host=f"host://{nvidia_smi}",
+                sandbox="/run/nvidia-host/nvidia-smi",
+                mode="ro",
+                create=False,
+                required=True,
+            )
+        )
+
+    env = {
+        "HOME": "/home/monarch",
+        "PATH": "/opt/cuda-synth/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin:/run/nvidia-host",
+        "UV_PROJECT_ENVIRONMENT": "/workspace/monarch/.venv-rootfs",
+        "UV_CACHE_DIR": "/workspace/monarch/scripts/rootfs/cache/uv",
+        "CARGO_HOME": "/workspace/monarch/scripts/rootfs/cache/cargo",
+        "CARGO_TARGET_DIR": f"/workspace/monarch/target/bwrap/{_rootfs_recipe_digest(config)}",
+        "npm_config_cache": "/workspace/monarch/scripts/rootfs/cache/npm",
+        "XDG_CACHE_HOME": "/workspace/monarch/scripts/rootfs/cache/xdg",
+        "RUSTUP_HOME": "/opt/rustup",
+        "CUDA_HOME": "/opt/cuda-synth",
+        "CUDA_PATH": "/opt/cuda-synth",
+        "MONARCH_IN_ROOTFS": "1",
+        "MONARCH_ROOTFS_RECIPE_SHA256": _rootfs_recipe_digest(config),
+        "NVIDIA_VISIBLE_DEVICES": "all",
+    }
+    if have_nvidia:
+        env["LD_LIBRARY_PATH"] = "/run/nvidia-host:/opt/cuda-synth/lib64"
+        env["LIBRARY_PATH"] = "/run/nvidia-host:/opt/cuda-synth/lib64"
+    return binds, dict(sorted(env.items()))
+
+
+def _insula_local_environment(config: MaterializedSglangRuntimeConfig):
+    return insula_local_environment_from_mapping(
+        {
+            "schema_version": 1,
+            "repo": _required_section_str(config.resolved_paths, "repo", "resolved_paths"),
+            "rootfs": dict(_require_mapping(config.resolved_paths.get("rootfs"), "resolved_paths.rootfs")),
+            "cache": _required_section_str(config.resolved_paths, "cache", "resolved_paths"),
+            "temp": _required_section_str(config.resolved_paths, "temp", "resolved_paths"),
+            "run": _resolve_host_path_ref(config, "run://"),
+            "results": _resolve_host_path_ref(config, "repo://glm52-serving-results"),
+            "shared_memory": {},
+            "gpu": {"mode": "nvidia-if-present"},
+        }
+    )
+
+
+def _materialized_insula_invocation(config: MaterializedSglangRuntimeConfig):
+    return _materialized_insula_invocation_for(config)
+
+
+def _materialized_insula_invocation_for(
+    config: MaterializedSglangRuntimeConfig,
+    *,
+    inner_argv: list[str] | None = None,
+    env: dict[str, str] | None = None,
+):
+    spec = build_insula_invocation_spec(config)
+    if inner_argv is not None:
+        spec = InsulaInvocationSpec(
+            schema_version=spec.schema_version,
+            name=spec.name,
+            rootfs_ref=spec.rootfs_ref,
+            repo=spec.repo,
+            binds=spec.binds,
+            environment=spec.environment,
+            command=InsulaCommandSpec(cwd=spec.command.cwd, argv=list(inner_argv)),
+            artifacts=spec.artifacts,
+            network=spec.network,
+            gpu=spec.gpu,
+            die_with_parent=spec.die_with_parent,
+            unshare_all=spec.unshare_all,
+        )
+    if env:
+        spec = InsulaInvocationSpec(
+            schema_version=spec.schema_version,
+            name=spec.name,
+            rootfs_ref=spec.rootfs_ref,
+            repo=spec.repo,
+            binds=spec.binds,
+            environment=InsulaEnvironmentSpec(
+                clear=spec.environment.clear,
+                values={**spec.environment.values, **dict(env)},
+                inherit_allowlist=list(spec.environment.inherit_allowlist),
+            ),
+            command=spec.command,
+            artifacts=spec.artifacts,
+            network=spec.network,
+            gpu=spec.gpu,
+            die_with_parent=spec.die_with_parent,
+            unshare_all=spec.unshare_all,
+        )
+    try:
+        return materialize_insula_invocation(
+            spec=spec,
+            local_environment=_insula_local_environment(config),
+            invocation_id=config.run_id,
+            compatibility={"adapter": "glm52-sglang-runtime"},
+        )
+    except InsulaConfigError as error:
+        raise RuntimeConfigError(f"failed to materialize Insula invocation: {error}") from error
+
+
+def _insula_bind_mode(mode: str) -> str:
+    if mode in {"ro", "rw"}:
+        return mode
+    raise RuntimeConfigError(f"unsupported Insula bind mode: {mode}")
+
+
+def _resolved_outer_argv(config: MaterializedSglangRuntimeConfig) -> list[str]:
+    return build_bwrap_argv(_materialized_insula_invocation(config))
+
+
+def _require_list(value: Any, path: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise RuntimeConfigError(f"{path} must be a list")
+    return value
 
 
 def _resolve_bind_spec(config: MaterializedSglangRuntimeConfig, arg: str) -> str:

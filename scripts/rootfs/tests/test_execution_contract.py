@@ -12,6 +12,14 @@ import os
 import subprocess
 from pathlib import Path
 
+from ginkgo.insula.bwrap_plan import build_bwrap_argv
+from ginkgo.insula.local_environment import local_environment_from_mapping
+from ginkgo.insula.materialize import materialize_invocation
+from ginkgo.insula.schema import InsulaBindSpec
+from ginkgo.insula.schema import InsulaCommandSpec
+from ginkgo.insula.schema import InsulaEnvironmentSpec
+from ginkgo.insula.schema import InsulaInvocationSpec
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONTRACT = REPO_ROOT / "scripts/rootfs/execution_contract.sh"
 CONTRACT_ENV = REPO_ROOT / "scripts/rootfs/contract.env"
@@ -185,15 +193,74 @@ def test_builder_uses_every_reviewed_tool_pin() -> None:
 
 def test_entry_uses_read_only_root_and_clear_environment() -> None:
     entry = (REPO_ROOT / "scripts/rootfs/enter_rootfs.sh").read_text()
-    assert '--ro-bind "$ROOTFS" /' in entry
-    assert "--clearenv" in entry
-    assert "--chdir" in entry
-    assert "--setenv CARGO_TARGET_DIR" in entry
-    assert "--setenv UV_CACHE_DIR" in entry
-    assert "--setenv npm_config_cache" in entry
+    compatibility = (REPO_ROOT / "ginkgo/insula/compatibility.py").read_text()
+    rootfs = REPO_ROOT / "scripts/rootfs/rootfs"
+    invocation = materialize_invocation(
+        spec=InsulaInvocationSpec(
+            schema_version=1,
+            name="contract-test",
+            rootfs_ref="rootfs://monarch-default",
+            repo=InsulaBindSpec("repo", "repo://", "/workspace/monarch", "ro", False, True),
+            binds=[],
+            environment=InsulaEnvironmentSpec(
+                clear=True,
+                values={
+                    "CARGO_TARGET_DIR": "/workspace/monarch/target/bwrap/test",
+                    "UV_CACHE_DIR": "/workspace/monarch/scripts/rootfs/cache/uv",
+                    "npm_config_cache": "/workspace/monarch/scripts/rootfs/cache/npm",
+                },
+                inherit_allowlist=[],
+            ),
+            command=InsulaCommandSpec("/workspace/monarch", ["python", "-c", "print('ok')"]),
+            artifacts={
+                "root": "run://insula",
+                "stdout": "run://stdout.log",
+                "stderr": "run://stderr.log",
+                "plan": "run://plan.yaml",
+                "result": "run://result.json",
+            },
+            network="share-net",
+            gpu="nvidia-if-present",
+            die_with_parent=True,
+            unshare_all=True,
+        ),
+        local_environment=local_environment_from_mapping(
+            {
+                "schema_version": 1,
+                "repo": str(REPO_ROOT),
+                "rootfs": {"monarch-default": str(rootfs)},
+                "cache": str(REPO_ROOT / "scripts/rootfs/cache"),
+                "temp": str(REPO_ROOT / "scripts/rootfs/tmp"),
+                "run": str(REPO_ROOT / "scripts/rootfs/run"),
+                "results": str(REPO_ROOT / "rootfs-results"),
+                "shared_memory": {},
+                "gpu": {"mode": "nvidia-if-present"},
+            }
+        ),
+        invocation_id="contract-test",
+        compatibility={"adapter": "test"},
+    )
+    argv = build_bwrap_argv(invocation)
+
+    assert "ginkgo.insula.cli enter-rootfs-compat" in entry
+    assert "PYTHONPATH" in entry
+    assert "--clearenv" in argv
+    assert "--chdir" in argv
+    assert _argv_setenv(argv, "CARGO_TARGET_DIR") == "/workspace/monarch/target/bwrap/test"
+    assert _argv_setenv(argv, "UV_CACHE_DIR") == "/workspace/monarch/scripts/rootfs/cache/uv"
+    assert _argv_setenv(argv, "npm_config_cache") == "/workspace/monarch/scripts/rootfs/cache/npm"
     # Host compiler and Python variables never cross the boundary.
-    assert "--setenv CC" not in entry
-    assert "--setenv PYTHONPATH" not in entry
+    assert '"CC"' in compatibility
+    assert '"PYTHONPATH"' in compatibility
+    assert _argv_setenv(argv, "CC") is None
+    assert _argv_setenv(argv, "PYTHONPATH") is None
+
+
+def _argv_setenv(argv: list[str], key: str) -> str | None:
+    for index, value in enumerate(argv):
+        if value == "--setenv" and index + 2 < len(argv) and argv[index + 1] == key:
+            return argv[index + 2]
+    return None
 
 
 def test_contract_env_holds_the_reviewed_pins() -> None:

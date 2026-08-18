@@ -32,6 +32,8 @@ class DeclaredSpecForTest:
     port_range_start: int
     port_range_end: int
     disallowed_ports: list[int]
+    cuda_visible_devices: str = "0"
+    tensor_parallel_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -356,6 +358,50 @@ def test_qwen3_sglang_smoke_rejects_default_fallback_ports(tmp_path: Path) -> No
             port=8000,
             runtime=runtime,
         )
+
+
+@pytest.mark.parametrize(
+    ("cuda_visible_devices", "tensor_parallel_size", "match"),
+    [
+        ("0,1", 1, "Qwen3 SGLang smoke must use exactly one visible GPU"),
+        ("0", 2, "Qwen3 SGLang smoke tensor_parallel_size must be 1"),
+    ],
+)
+def test_qwen3_sglang_smoke_rejects_multi_gpu_declared_specs(
+    tmp_path: Path,
+    cuda_visible_devices: str,
+    tensor_parallel_size: int,
+    match: str,
+) -> None:
+    runtime = FakeRuntime(tmp_path=tmp_path)
+
+    def load_declared_spec(path: Path) -> Any:
+        runtime.calls.append(f"load_declared:{path.name}")
+        return DeclaredSpecForTest(
+            run_group="ginkgo-smoke-qwen3-dense",
+            port_range_start=19000,
+            port_range_end=19100,
+            disallowed_ports=[8000, 8080, 18080],
+            cuda_visible_devices=cuda_visible_devices,
+            tensor_parallel_size=tensor_parallel_size,
+        )
+
+    runtime.load_declared_spec = load_declared_spec  # type: ignore[method-assign]
+    declared = tmp_path / "smoke-qwen3-dense.yaml"
+    declared.write_text("placeholder: true\n")
+    local_env = tmp_path / "local-env.yaml"
+    local_env.write_text("placeholder: true\n")
+
+    with pytest.raises(run_qwen3_sglang_smoke.SmokeError, match=match):
+        run_qwen3_sglang_smoke.run_smoke(
+            declared_spec=declared,
+            local_environment=local_env,
+            run_id="qwen3-smoke-test",
+            port=19007,
+            runtime=runtime,
+        )
+
+    assert runtime.calls == ["load_declared:smoke-qwen3-dense.yaml"]
 
 
 def test_qwen3_sglang_smoke_tears_down_after_chat_failure(tmp_path: Path) -> None:

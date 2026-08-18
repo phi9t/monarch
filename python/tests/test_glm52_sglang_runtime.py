@@ -2024,6 +2024,41 @@ def test_should_teardown_after_failure_defaults_true(tmp_path: Path) -> None:
     assert should_teardown_after_failure(config) is True
 
 
+def test_build_insula_invocation_spec_preserves_sglang_runtime_contract(tmp_path: Path) -> None:
+    config = materialized_for_tests(tmp_path)
+
+    spec = glm52_sglang_runtime.build_insula_invocation_spec(config)
+    outer_argv = glm52_sglang_runtime._resolved_outer_argv(config)
+
+    assert spec.name == "glm52-sglang-local"
+    assert spec.rootfs_ref == "rootfs://monarch-default"
+    assert spec.command.cwd == "/workspace/monarch"
+    assert spec.command.argv == config.launch["inner_argv"]
+    for key, value in config.launch["env"].items():
+        assert spec.environment.values[key] == value
+    assert spec.environment.values["PATH"].startswith("/opt/cuda-synth/bin:")
+    assert spec.environment.values["CUDA_HOME"] == "/opt/cuda-synth"
+    assert spec.environment.values["UV_PROJECT_ENVIRONMENT"] == "/workspace/monarch/.venv-rootfs"
+    assert spec.environment.values["MONARCH_IN_ROOTFS"] == "1"
+    assert spec.repo.mode == "ro"
+    assert {bind.sandbox for bind in spec.binds} >= {
+        "/run/glm52",
+        "/tmp/glm52",
+        "/cache/glm52",
+        "/cache/glm52/venvs/sglang",
+        "/cache/glm52/hf-home",
+        "/cache/glm52/sglang",
+        "/workspace/monarch/scripts/rootfs/cache",
+        f"/workspace/monarch/target/bwrap/{glm52_sglang_runtime._rootfs_recipe_digest(config)}",
+    }
+    assert any(bind.sandbox == "/etc/hosts" for bind in spec.binds)
+    assert outer_argv[0] == "bwrap"
+    assert "scripts/rootfs/enter_rootfs.sh" not in outer_argv
+    assert outer_argv[-len(config.launch["inner_argv"]) :] == config.launch["inner_argv"]
+    assert "--setenv" in outer_argv
+    assert "CUDA_HOME" in outer_argv
+
+
 def test_debug_mode_can_leave_process_running_only_when_explicit(tmp_path: Path) -> None:
     declared_text = VALID_DECLARED.replace("debug_mode: false", "debug_mode: true").replace(
         "leave_running_on_failure: false",
@@ -2769,19 +2804,6 @@ rootfs:
 
     def fake_run(command, **kwargs):
         calls.append({"command": list(command), **kwargs})
-        if kwargs.get("env", {}).get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") == "1":
-            plan_path = Path(command[command.index("--emit-plan") + 1])
-            config = materialize_runtime_config(
-                declared=load_declared_spec(declared),
-                local_environment=load_local_environment(local_env),
-                run_id="prepare-venv",
-                port=19000,
-            )
-            inner = list(command)[list(command).index("--") + 1 :]
-            plan = valid_emitted_preparation_plan(config, inner)
-            plan_path.parent.mkdir(parents=True, exist_ok=True)
-            plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
-            return FakeCompletedProcess()
         inner = list(command)[list(command).index("--") + 1 :]
         if inner[:2] == ["uv", "venv"]:
             return FakeCompletedProcess("Using Python 3.12\nCreating virtual environment\n")
@@ -2821,13 +2843,12 @@ rootfs:
     )
 
     assert rc == 0
-    command_calls = [call for call in calls if call["env"].get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") != "1"]
-    assert len(command_calls) == 5
-    venv_call = command_calls[0]["command"][command_calls[0]["command"].index("--") + 1 :]
-    install_call = command_calls[1]["command"][command_calls[1]["command"].index("--") + 1 :]
-    patch_call = command_calls[2]["command"][command_calls[2]["command"].index("--") + 1 :]
-    probe_call = command_calls[3]["command"][command_calls[3]["command"].index("--") + 1 :]
-    help_call = command_calls[4]["command"][command_calls[4]["command"].index("--") + 1 :]
+    assert len(calls) == 5
+    venv_call = calls[0]["command"][calls[0]["command"].index("--") + 1 :]
+    install_call = calls[1]["command"][calls[1]["command"].index("--") + 1 :]
+    patch_call = calls[2]["command"][calls[2]["command"].index("--") + 1 :]
+    probe_call = calls[3]["command"][calls[3]["command"].index("--") + 1 :]
+    help_call = calls[4]["command"][calls[4]["command"].index("--") + 1 :]
     assert venv_call == [
         "uv",
         "venv",
@@ -2861,10 +2882,11 @@ rootfs:
         "sglang.launch_server",
         "--help",
     ]
-    for call in command_calls:
+    for call in calls:
         command = call["command"]
-        assert command[0] == str(tmp_path / "repo" / "scripts" / "rootfs" / "enter_rootfs.sh")
-        assert "--repo-readonly" in command
+        assert command[0] == "bwrap"
+        assert str(tmp_path / "rootfs") in command
+        assert str(tmp_path / "repo") in command
         assert "python" not in command
         assert call["env"]["UV_CACHE_DIR"] == "/cache/glm52/uv"
         assert call["env"]["TORCHINDUCTOR_CACHE_DIR"] == "/cache/glm52/torchinductor"
@@ -2884,6 +2906,9 @@ rootfs:
     assert evidence["checks"]["offloader_patch"]["patch_id"] == "glm52-offloader-v1-plain-tensor-attrs-v1"
     assert evidence["checks"]["offloader_patch"]["sha256_after"] == "patched-sha"
     assert "plan_sha256" in evidence["bwrap_plan"]
+    plan = load_yaml_mapping(tmp_path / "repo" / "glm52-serving-results" / "prepare-venv" / "sandbox" / "sglang_venv_record-bwrap-plan.yaml")
+    assert plan["insula"]["invocation_id"] == "prepare-venv"
+    assert plan["inner_argv"] == ["uv", "venv", "/cache/glm52/venvs/sglang", "--python", "3.12", "--clear"]
 
 
 def test_prepare_model_cache_cli_downloads_validates_and_writes_evidence(
@@ -2916,19 +2941,6 @@ rootfs:
 
     def fake_run(command, **kwargs):
         calls.append({"command": list(command), **kwargs})
-        if kwargs.get("env", {}).get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") == "1":
-            plan_path = Path(command[command.index("--emit-plan") + 1])
-            config = materialize_runtime_config(
-                declared=load_declared_spec(declared),
-                local_environment=load_local_environment(local_env),
-                run_id="prepare-model",
-                port=19000,
-            )
-            inner = list(command)[list(command).index("--") + 1 :]
-            plan = valid_emitted_preparation_plan(config, inner, env={"TRANSFORMERS_CACHE": "/cache/glm52/hf-home"})
-            plan_path.parent.mkdir(parents=True, exist_ok=True)
-            plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
-            return FakeCompletedProcess('{"snapshot_path": ""}')
         snapshot.mkdir(parents=True, exist_ok=True)
         (snapshot / "model-00001-of-00001.safetensors").write_text("shard")
         (snapshot / "model.safetensors.index.json").write_text(
@@ -2963,14 +2975,14 @@ rootfs:
     )
 
     assert rc == 0
-    command_calls = [call for call in calls if call["env"].get("MONARCH_ROOTFS_EMIT_PLAN_ONLY") != "1"]
-    assert len(command_calls) == 1
-    command = command_calls[0]["command"][command_calls[0]["command"].index("--") + 1 :]
+    assert len(calls) == 1
+    command = calls[0]["command"][calls[0]["command"].index("--") + 1 :]
     assert command[:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.MODEL_CACHE_PREPARE_SCRIPT]
     assert command[3:] == ["zai-org/GLM-5.2"]
-    assert command_calls[0]["env"]["HF_HOME"] == "/cache/glm52/hf-home"
-    assert command_calls[0]["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
-    assert command_calls[0]["env"]["TRANSFORMERS_CACHE"] == "/cache/glm52/hf-home"
+    assert calls[0]["command"][0] == "bwrap"
+    assert calls[0]["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert calls[0]["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert calls[0]["env"]["TRANSFORMERS_CACHE"] == "/cache/glm52/hf-home"
     assert validator_paths == [snapshot]
     evidence = glm52_sglang_runtime._load_json_mapping(
         tmp_path / "repo" / "glm52-serving-results" / "prepare-model" / "model-cache.json"
@@ -2981,6 +2993,9 @@ rootfs:
     assert evidence["model_cache"]["shard_count"] == 1
     assert evidence["model_cache"]["missing_shard_count"] == 0
     assert "plan_sha256" in evidence["bwrap_plan"]
+    plan = load_yaml_mapping(tmp_path / "repo" / "glm52-serving-results" / "prepare-model" / "sandbox" / "model_cache_record-bwrap-plan.yaml")
+    assert plan["insula"]["invocation_id"] == "prepare-model"
+    assert plan["inner_argv"][:3] == ["/cache/glm52/venvs/sglang/bin/python", "-c", glm52_sglang_runtime.MODEL_CACHE_PREPARE_SCRIPT]
 
 
 def test_rootfs_plan_emission_uses_materialized_env_cwd_and_rootfs(
@@ -3016,43 +3031,32 @@ rootfs:
             config.artifacts["resolved_rootfs_plan"],
         )
     )
-    calls: list[dict[str, object]] = []
-
-    class FakeCompletedProcess:
-        returncode = 0
-        stdout = ""
-        stderr = ""
 
     def fake_run(command, **kwargs):
-        calls.append({"command": list(command), **kwargs})
-        plan = valid_rootfs_plan(config)
-        plan["rootfs"] = str(tmp_path / "rootfs")
-        for mount in plan["mounts"]:
-            for expected in config.sandbox["mounts"]:
-                if mount["sandbox_path"] == expected["sandbox_path"]:
-                    mount["host_path"] = glm52_sglang_runtime._resolve_host_path_ref(
-                        config,
-                        expected["host_path_ref"],
-                    )
-        resolved_plan_path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
-        return FakeCompletedProcess()
+        raise AssertionError(f"plan emission must not shell out: {command}")
 
     monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
 
     emit_and_load_rootfs_plan = glm52_sglang_runtime.emit_and_load_rootfs_plan
-    emit_and_load_rootfs_plan(config, resolved_plan_path=resolved_plan_path)
+    plan = emit_and_load_rootfs_plan(config, resolved_plan_path=resolved_plan_path)
 
-    assert calls
-    command = calls[0]["command"]
-    assert command[0] == str(tmp_path / "repo" / "scripts" / "rootfs" / "enter_rootfs.sh")
-    assert str(tmp_path / "rootfs") in command
-    assert all(not str(arg).startswith(("run://", "rootfs://")) for arg in command)
-    assert calls[0]["cwd"] == str(tmp_path / "repo")
-    assert calls[0]["env"] == {
-        **glm52_sglang_runtime._runtime_subprocess_env(config),
-        "MONARCH_ROOTFS_EMIT_PLAN_ONLY": "1",
-    }
+    assert resolved_plan_path.exists()
+    assert load_yaml_mapping(resolved_plan_path) == plan
+    assert plan["rootfs"] == str(tmp_path / "rootfs")
+    assert plan["cwd"] == "/workspace/monarch"
+    assert plan["inner_argv"] == config.launch["inner_argv"]
+    for key, value in config.launch["env"].items():
+        assert plan["env"][key] == value
+    assert plan["env"]["HF_HOME"] == "/cache/glm52/hf-home"
+    assert plan["env"]["SGLANG_CACHE_DIR"] == "/cache/glm52/sglang"
+    assert plan["env"]["CUDA_HOME"] == "/opt/cuda-synth"
+    assert plan["env"]["UV_PROJECT_ENVIRONMENT"] == "/workspace/monarch/.venv-rootfs"
+    assert plan["env"]["MONARCH_IN_ROOTFS"] == "1"
+    assert plan["repo_projection_mode"] == "ro"
+    by_sandbox = {mount["sandbox_path"]: mount for mount in plan["mounts"]}
+    assert by_sandbox["/workspace/monarch"]["host_path"] == str(tmp_path / "repo")
+    assert by_sandbox["/workspace/monarch"]["mode"] == "ro"
+    assert by_sandbox["/cache/glm52"]["host_path"] == str(tmp_path / "cache" / "glm52-sglang-local")
 
 
 def test_runtime_subprocess_cwd_uses_sandbox_cwd_inside_rootfs(
@@ -3110,27 +3114,14 @@ rootfs:
         )
     )
 
-    class FakeCompletedProcess:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    original_legacy_converter = glm52_sglang_runtime._legacy_rootfs_plan_from_insula
 
-    def fake_run(command, **kwargs):
-        plan = valid_rootfs_plan(config)
-        plan["rootfs"] = str(tmp_path / "rootfs")
+    def drifted_legacy_converter(**kwargs):
+        plan = original_legacy_converter(**kwargs)
         plan["env"] = {**plan["env"], env_key: value}
-        for mount in plan["mounts"]:
-            for expected in config.sandbox["mounts"]:
-                if mount["sandbox_path"] == expected["sandbox_path"]:
-                    mount["host_path"] = glm52_sglang_runtime._resolve_host_path_ref(
-                        config,
-                        expected["host_path_ref"],
-                    )
-        resolved_plan_path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_plan_path.write_text(glm52_sglang_runtime.yaml.safe_dump(plan, sort_keys=False))
-        return FakeCompletedProcess()
+        return plan
 
-    monkeypatch.setattr(glm52_sglang_runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(glm52_sglang_runtime, "_legacy_rootfs_plan_from_insula", drifted_legacy_converter)
 
     with pytest.raises(RuntimeConfigError, match=match):
         glm52_sglang_runtime.emit_and_load_rootfs_plan(config, resolved_plan_path=resolved_plan_path)

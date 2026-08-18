@@ -5,104 +5,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# The sole Linux-local gateway for Monarch development, build, test, and docs
-# commands. It re-execs into the hermetic bwrap rootfs, maps the caller's
-# working directory to the matching checkout-relative directory inside the
-# sandbox, activates the rootfs virtual environment, and runs the command with
-# its arguments and exit status preserved.
-#
-# Usage:
-#   scripts/run [--] <command> [args...]
-#   scripts/run                      # interactive shell inside the rootfs
-#
-# Set MONARCH_ROOTFS to an absolute rootfs directory to use an already-built
-# rootfs outside scripts/rootfs/rootfs. The directory must still satisfy the
-# current rootfs contract; this is a storage-location override, not a contract
-# bypass.
-#
-# Host bootstrap (building and entering the rootfs) is the only Linux-local work
-# that does not go through this gateway. GitHub Actions, native macOS, installed
-# wheels, Meta-internal builds, and remote workers are separate execution
-# domains and never nest this local bwrap.
+# Thin compatibility adapter. Insula owns the governed local bwrap-rootfs
+# protocol; keep this shell entrypoint small so human, automation, and CI-style
+# local runs cross the same schema-backed module.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# shellcheck source=scripts/rootfs/contract.env
-source "$REPO_ROOT/scripts/rootfs/contract.env"
-# shellcheck source=scripts/rootfs/execution_contract.sh
-source "$REPO_ROOT/scripts/rootfs/execution_contract.sh"
-
-# Strip an optional leading -- so `scripts/run -- cmd` and `scripts/run cmd` are
-# equivalent.
-if [[ "${1:-}" == "--" ]]; then
-  shift
-fi
-
-if monarch_in_valid_rootfs "$REPO_ROOT"; then
-  # Inside the rootfs: require the full contract, activate the venv, record the
-  # original command for diagnostics, then exec.
-  "$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs python uv cargo >/dev/null
-
-  # bwrap --clearenv drops host toolchain variables at entry, but scripts/run may
-  # also be called from a shell already inside the rootfs. Defend the boundary in
-  # both cases by dropping host compiler, Python, and linker leak variables
-  # before activation so the controlled command sees only the rootfs toolchain.
-  unset CC CXX CPP LD CFLAGS CXXFLAGS CPPFLAGS LDFLAGS \
-    PYTHONPATH PYTHONHOME LIBCLANG_PATH \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
-
-  # shellcheck source=scripts/rootfs/activate_environment.sh
-  source "$REPO_ROOT/scripts/rootfs/activate_environment.sh"
-
-  if [[ $# -eq 0 ]]; then
-    exec /bin/bash -l
-  fi
-
-  MONARCH_ORIGINAL_COMMAND="$(printf '%q ' "$@")"
-  export MONARCH_ORIGINAL_COMMAND="${MONARCH_ORIGINAL_COMMAND% }"
-  exec "$@"
-fi
-
-# Outside the rootfs: fail fast on unsupported platforms before entry.
-host_arch="$(uname -m)"
-if [[ "$host_arch" != "$MONARCH_ROOTFS_ARCH" ]]; then
-  echo "error: unsupported architecture $host_arch: scripts/run supports $MONARCH_ROOTFS_ARCH only" >&2
-  exit 2
-fi
-if [[ "${MONARCH_GPU_PLATFORM:-}" == "rocm" ]]; then
-  echo "error: unsupported platform: MONARCH_GPU_PLATFORM=rocm is not supported by the rootfs" >&2
-  exit 2
-fi
-
-# Map the caller's working directory to a checkout-relative path. Only paths
-# below the checkout map; anything else starts at the checkout root.
-cwd="$(pwd -P)"
-checkout_rel=""
-if [[ "$cwd" == "$REPO_ROOT" ]]; then
-  checkout_rel=""
-elif [[ "$cwd" == "$REPO_ROOT"/* ]]; then
-  checkout_rel="${cwd#"$REPO_ROOT"/}"
-fi
-
-rootfs_args=()
-if [[ -n "${MONARCH_ROOTFS:-}" ]]; then
-  if [[ "$MONARCH_ROOTFS" != /* ]]; then
-    echo "error: MONARCH_ROOTFS must be an absolute path: $MONARCH_ROOTFS" >&2
-    exit 2
-  fi
-  rootfs_args=(--rootfs "$MONARCH_ROOTFS")
-fi
-
-emit_plan_args=()
-if [[ -n "${MONARCH_ROOTFS_EMIT_PLAN:-}" ]]; then
-  if [[ "$MONARCH_ROOTFS_EMIT_PLAN" != /* ]]; then
-    echo "error: MONARCH_ROOTFS_EMIT_PLAN must be an absolute path: $MONARCH_ROOTFS_EMIT_PLAN" >&2
-    exit 2
-  fi
-  emit_plan_args=(--emit-plan "$MONARCH_ROOTFS_EMIT_PLAN")
-fi
-
-exec "$REPO_ROOT/scripts/rootfs/enter_rootfs.sh" \
-  "${rootfs_args[@]}" "${emit_plan_args[@]}" --chdir "$checkout_rel" -- /workspace/monarch/scripts/run "$@"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m ginkgo.insula.cli monarch-run "$@"

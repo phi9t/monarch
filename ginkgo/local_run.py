@@ -451,6 +451,11 @@ class Qwen3SglangWorkload:
             raise LocalRunError("declared smoke config must disallow default fallback ports")
         if requested_port in disallowed:
             raise LocalRunError(f"disallowed serving port requested: {requested_port}")
+        cuda_visible_devices = _declared_cuda_visible_devices(declared)
+        if len(_visible_cuda_devices(cuda_visible_devices)) != 1:
+            raise LocalRunError("Qwen3 SGLang smoke must use exactly one visible GPU")
+        if _declared_tensor_parallel_size(declared) != 1:
+            raise LocalRunError("Qwen3 SGLang smoke tensor_parallel_size must be 1")
         if requested_port is not None:
             start = _declared_port_range_start(declared)
             end = _declared_port_range_end(declared)
@@ -606,6 +611,24 @@ def _declared_disallowed_ports(declared: Any) -> list[int]:
     if isinstance(value, list):
         return [int(port) for port in value]
     return [int(port) for port in declared.port_policy.disallowed_ports]
+
+
+def _declared_cuda_visible_devices(declared: Any) -> str:
+    value = getattr(declared, "cuda_visible_devices", None)
+    if isinstance(value, str):
+        return value
+    return str(declared.runtime.cuda_visible_devices)
+
+
+def _declared_tensor_parallel_size(declared: Any) -> int:
+    value = getattr(declared, "tensor_parallel_size", None)
+    if isinstance(value, int):
+        return value
+    return int(declared.runtime.tensor_parallel_size)
+
+
+def _visible_cuda_devices(cuda_visible_devices: str) -> list[str]:
+    return [device.strip() for device in cuda_visible_devices.split(",") if device.strip()]
 
 
 def _default_run_id(run_group: str) -> str:

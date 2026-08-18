@@ -15,8 +15,8 @@ model:
   expected_model_ids: [Qwen/Qwen3-30B-A3B]
 runtime:
   kind: sglang_openai
-  cuda_visible_devices: "0,1,2,3"
-  tensor_parallel_size: 4
+  cuda_visible_devices: "0"
+  tensor_parallel_size: 1
   dtype: bfloat16
   context_length: 32768
   kv_cache_dtype: bfloat16
