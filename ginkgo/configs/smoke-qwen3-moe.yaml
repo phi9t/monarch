@@ -65,6 +65,7 @@ probes:
   chat_required: true
   prompt: "Say OK."
   max_new_tokens: 2
+  throughput_max_new_tokens: 16
   chat_template_kwargs:
     enable_thinking: false
 repeatability:

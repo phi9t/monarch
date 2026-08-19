@@ -48,6 +48,8 @@ GLM52_RUNTIME_LOCKFILE_REF = "repo://uv.lock"
 SGLANG_PREPARE_PACKAGES = ["sglang[all]==0.5.17"]
 SGLANG_PREPARE_RUN_ID = "prepare-venv"
 MODEL_CACHE_PREPARE_RUN_ID = "prepare-model"
+DEFAULT_GLM52_DECLARED_SPEC = ".scratch/glm52-local-serving/config/sglang-local.yaml"
+DEFAULT_GLM52_LOCAL_ENVIRONMENT = ".scratch/glm52-local-serving/tmp/local-environment.vartmp-resolved.yaml"
 SGLANG_OFFLOADER_PATCH_ID = "glm52-offloader-v1-plain-tensor-attrs-v1"
 SGLANG_OFFLOADER_PATH = f"{SGLANG_VENV_SANDBOX_PATH}/lib/python3.12/site-packages/sglang/srt/utils/offloader.py"
 SGLANG_OFFLOADER_PATCH_SCRIPT = "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py"
@@ -282,6 +284,7 @@ class ProbeSpec:
     chat_required: bool
     prompt: str
     max_new_tokens: int
+    throughput_max_new_tokens: int
     chat_template_kwargs: dict[str, Any]
 
 
@@ -312,6 +315,7 @@ class DeclaredSglangLaunchSpec:
     local_paths: LocalPathsSpec
     probes: ProbeSpec
     repeatability: RepeatabilitySpec
+    source_path: Path | None = None
 
 
 def load_declared_spec(path: Path) -> DeclaredSglangLaunchSpec:
@@ -355,6 +359,7 @@ def load_declared_spec(path: Path) -> DeclaredSglangLaunchSpec:
         local_paths=_parse_local_paths(mapping.get("local_paths")),
         probes=_parse_probes(mapping.get("probes")),
         repeatability=_parse_repeatability(mapping.get("repeatability")),
+        source_path=path,
     )
     _validate_device_sandbox_contract(declared.runtime, declared.sandbox)
     return declared
@@ -647,6 +652,7 @@ def _parse_probes(data: Any) -> ProbeSpec:
             "chat_required",
             "prompt",
             "max_new_tokens",
+            "throughput_max_new_tokens",
             "chat_template_kwargs",
         },
         "probes",
@@ -658,6 +664,9 @@ def _parse_probes(data: Any) -> ProbeSpec:
     max_new_tokens = _required_int(mapping, "max_new_tokens", "probes")
     if max_new_tokens <= 0:
         raise RuntimeConfigError("probes.max_new_tokens must be positive")
+    throughput_max_new_tokens = _required_int(mapping, "throughput_max_new_tokens", "probes")
+    if throughput_max_new_tokens <= 0:
+        raise RuntimeConfigError("probes.throughput_max_new_tokens must be positive")
     chat_template_kwargs = _require_mapping(mapping.get("chat_template_kwargs"), "probes.chat_template_kwargs")
     if chat_template_kwargs.get("enable_thinking") is not False:
         raise RuntimeConfigError("probes.chat_template_kwargs.enable_thinking must be false")
@@ -675,6 +684,7 @@ def _parse_probes(data: Any) -> ProbeSpec:
         chat_required=_required_bool(mapping, "chat_required", "probes"),
         prompt=prompt,
         max_new_tokens=max_new_tokens,
+        throughput_max_new_tokens=throughput_max_new_tokens,
         chat_template_kwargs=dict(chat_template_kwargs),
     )
 
@@ -695,6 +705,7 @@ class LocalEnvironmentConfig:
     cache: str
     temp: str
     rootfs: dict[str, str]
+    source_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -817,6 +828,7 @@ def load_local_environment(path: Path) -> LocalEnvironmentConfig:
             str(name): _absolute_host_path(str(value), f"local_environment.rootfs.{name}")
             for name, value in rootfs.items()
         },
+        source_path=path,
     )
     if not config.rootfs:
         raise RuntimeConfigError("local_environment.rootfs must not be empty")
@@ -978,6 +990,7 @@ def materialize_runtime_config(
         probes={
             "models_url": f"{base_url}/models",
             "generate_url": f"http://{declared.port_policy.bind_host}:{selected_port}/generate",
+            "throughput_url": f"http://{declared.port_policy.bind_host}:{selected_port}/generate",
             "completions_url": f"{base_url}/completions",
             "chat_url": f"{base_url}/chat/completions",
             "startup_timeout_seconds": declared.probes.startup_timeout_seconds,
@@ -987,6 +1000,14 @@ def materialize_runtime_config(
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": declared.probes.max_new_tokens,
+                },
+            },
+            "throughput_payload": {
+                "text": declared.probes.prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": declared.probes.throughput_max_new_tokens,
+                    "ignore_eos": True,
                 },
             },
             "completion_payload": {
@@ -1013,6 +1034,7 @@ def materialize_runtime_config(
             "resolved_rootfs_plan": "run://sandbox/resolved-bwrap-plan.yaml",
             "models_probe": "run://probes/models.json",
             "generate_probe": "run://probes/generate.json",
+            "throughput_probe": "run://probes/throughput.json",
             "completion_probe": "run://probes/completions.json",
             "chat_probe": "run://probes/chat-completions.json",
             "stdout_log": "run://logs/stdout.log",
@@ -1422,6 +1444,8 @@ def validate_preparation_records(
         raise RuntimeConfigError("model cache snapshot path must be under /cache/glm52/hf-home")
     if _required_section_int(model_cache, "missing_shard_count", "model_cache_record.model_cache") != 0:
         raise RuntimeConfigError("model cache preparation record has missing shard files")
+    if _required_section_str(model_cache, "model_id", "model_cache_record.model_cache") != _required_section_str(config.model, "id", "model"):
+        raise RuntimeConfigError("model cache preparation record model id mismatch")
 
     expected_digest = _rootfs_recipe_digest(config)
     for name, key, record, inner_command, env in (
@@ -1438,6 +1462,129 @@ def validate_preparation_records(
         "sglang_venv": venv_record,
         "model_cache": model_record,
     }
+
+
+def _validate_sglang_venv_preparation_record_probe(
+    config: MaterializedSglangRuntimeConfig,
+) -> None:
+    venv_record = _load_preparation_record(config, "sglang_venv_record", "missing SGLang venv preparation record")
+    venv = _require_mapping(venv_record.get("venv"), "sglang_venv_record.venv")
+    if _required_section_str(venv, "python", "sglang_venv_record.venv") != SGLANG_VENV_PYTHON:
+        raise RuntimeConfigError("SGLang venv preparation record Python does not match rootfs venv")
+    packages = venv.get("packages")
+    if not isinstance(packages, list) or packages != SGLANG_PREPARE_PACKAGES:
+        raise RuntimeConfigError("SGLang venv preparation record package contract mismatch")
+    installed_packages = _require_mapping(venv.get("installed_packages"), "sglang_venv_record.venv.installed_packages")
+    if not installed_packages.get("sglang"):
+        raise RuntimeConfigError("SGLang venv preparation record missing installed package: sglang")
+    dependency_resolution = _require_mapping(
+        venv_record.get("dependency_resolution"),
+        "sglang_venv_record.dependency_resolution",
+    )
+    if _required_section_str(dependency_resolution, "group", "sglang_venv_record.dependency_resolution") != GLM52_RUNTIME_DEPENDENCY_GROUP:
+        raise RuntimeConfigError("SGLang venv preparation record must use the GLM52 runtime dependency group")
+    if _required_section_str(dependency_resolution, "lockfile", "sglang_venv_record.dependency_resolution") != GLM52_RUNTIME_LOCKFILE_REF:
+        raise RuntimeConfigError("SGLang venv preparation record must use repo://uv.lock")
+    if not _required_section_str(dependency_resolution, "lock_sha256", "sglang_venv_record.dependency_resolution"):
+        raise RuntimeConfigError("SGLang venv preparation record missing uv.lock digest")
+    checks = _require_mapping(venv_record.get("checks"), "sglang_venv_record.checks")
+    if checks.get("served_model_name_flag") is not True:
+        raise RuntimeConfigError("SGLang venv preparation record missing served_model_name_flag")
+    platform_checks = _require_mapping(checks.get("platform"), "sglang_venv_record.checks.platform")
+    _validate_sglang_platform_checks(
+        platform_checks,
+        device=_required_section_str(config.runtime, "device", "runtime"),
+        source="SGLang venv preparation record",
+    )
+    offloader_patch = _require_mapping(checks.get("offloader_patch"), "sglang_venv_record.checks.offloader_patch")
+    if _required_section_str(offloader_patch, "patch_id", "sglang_venv_record.checks.offloader_patch") != SGLANG_OFFLOADER_PATCH_ID:
+        raise RuntimeConfigError("SGLang venv preparation record has wrong offloader patch id")
+    rootfs = _require_mapping(venv_record.get("rootfs"), "SGLang venv preparation record rootfs")
+    if _required_section_str(rootfs, "recipe_sha256", "SGLang venv preparation record rootfs") != _rootfs_recipe_digest(config):
+        raise RuntimeConfigError("SGLang venv preparation record rootfs recipe digest mismatch")
+    preparation_config = _preparation_config_for_record(config, "sglang_venv_record")
+    _validate_preparation_record_plan(
+        preparation_config,
+        "sglang_venv_record",
+        venv_record,
+        _sglang_venv_prepare_command(),
+        env=None,
+    )
+
+
+def _validate_model_cache_preparation_record_probe(
+    config: MaterializedSglangRuntimeConfig,
+) -> None:
+    model_record = _load_preparation_record(config, "model_cache_record", "missing model cache preparation record")
+    model_cache = _require_mapping(model_record.get("model_cache"), "model_cache_record.model_cache")
+    snapshot_path = _required_section_str(model_cache, "snapshot_path", "model_cache_record.model_cache")
+    if not _is_under_sandbox_path(snapshot_path, SGLANG_HF_HOME_SANDBOX_PATH):
+        raise RuntimeConfigError("model cache snapshot path must be under /cache/glm52/hf-home")
+    if _required_section_int(model_cache, "missing_shard_count", "model_cache_record.model_cache") != 0:
+        raise RuntimeConfigError("model cache preparation record has missing shard files")
+    if _required_section_str(model_cache, "model_id", "model_cache_record.model_cache") != _required_section_str(config.model, "id", "model"):
+        raise RuntimeConfigError("model cache preparation record model id mismatch")
+    rootfs = _require_mapping(model_record.get("rootfs"), "model cache preparation record rootfs")
+    if _required_section_str(rootfs, "recipe_sha256", "model cache preparation record rootfs") != _rootfs_recipe_digest(config):
+        raise RuntimeConfigError("model cache preparation record rootfs recipe digest mismatch")
+    preparation_config = _preparation_config_for_record(config, "model_cache_record")
+    _validate_preparation_record_plan(
+        preparation_config,
+        "model_cache_record",
+        model_record,
+        _model_cache_prepare_command(config),
+        env=_model_cache_prepare_env(),
+    )
+
+
+def _stale_preparation_record_names(config: MaterializedSglangRuntimeConfig) -> list[str]:
+    stale: list[str] = []
+    for name, probe in (
+        ("sglang_venv_record", _validate_sglang_venv_preparation_record_probe),
+        ("model_cache_record", _validate_model_cache_preparation_record_probe),
+    ):
+        try:
+            probe(config)
+        except RuntimeConfigError:
+            stale.append(name)
+    return stale
+
+
+def ensure_preparation_records(
+    *,
+    config: MaterializedSglangRuntimeConfig,
+    declared: DeclaredSglangLaunchSpec,
+    local_environment: LocalEnvironmentConfig,
+    declared_path: Path | None = None,
+    local_environment_path: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        validate_preparation_records(config=config)
+    except RuntimeConfigError:
+        stale = _stale_preparation_record_names(config)
+        if not stale:
+            stale = ["sglang_venv_record", "model_cache_record"]
+        if declared_path is None:
+            declared_path = declared.source_path or Path(_resolve_local_path_ref(local_environment, f"repo://{DEFAULT_GLM52_DECLARED_SPEC}"))
+        if local_environment_path is None:
+            local_environment_path = local_environment.source_path or Path(
+                _resolve_local_path_ref(local_environment, f"repo://{DEFAULT_GLM52_LOCAL_ENVIRONMENT}")
+            )
+        if "sglang_venv_record" in stale:
+            prepare_sglang_venv(
+                declared_path=declared_path,
+                local_environment_path=local_environment_path,
+                run_id=SGLANG_PREPARE_RUN_ID,
+            )
+        if "model_cache_record" in stale:
+            prepare_model_cache(
+                declared_path=declared_path,
+                local_environment_path=local_environment_path,
+                run_id=MODEL_CACHE_PREPARE_RUN_ID,
+            )
+        validate_preparation_records(config=config)
+        return {"status": "healed", "regenerated": stale}
+    return {"status": "already_valid", "regenerated": []}
 
 
 def _validate_sglang_platform_checks(platform_checks: dict[str, Any], *, device: str, source: str) -> None:
@@ -2143,6 +2290,47 @@ def probe_generate(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
     return {"content": content, "payload": payload}
 
 
+def probe_throughput(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
+    timeout_seconds = _required_section_int(config.probes, "chat_timeout_seconds", "probes")
+    request = urllib.request.Request(
+        _required_section_str(config.probes, "throughput_url", "probes"),
+        data=json.dumps(config.probes["throughput_payload"]).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", response.getcode())
+            body = response.read()
+    except (TimeoutError, socket.timeout) as error:
+        raise RuntimeLaunchError(f"throughput probe timed out after {timeout_seconds}s") from error
+    if status != 200:
+        raise RuntimeLaunchError(f"throughput probe returned HTTP {status}")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeLaunchError("invalid throughput /generate JSON") from error
+    content = _generate_content(payload)
+    if not content:
+        raise RuntimeLaunchError("throughput probe returned empty text")
+    meta_info = _require_mapping(payload.get("meta_info"), "throughput /generate response meta_info")
+    completion_tokens = _required_section_int(meta_info, "completion_tokens", "throughput /generate response meta_info")
+    e2e_latency_s = _required_section_float(meta_info, "e2e_latency", "throughput /generate response meta_info")
+    if completion_tokens <= 0:
+        raise RuntimeLaunchError("throughput probe completion_tokens must be positive")
+    if e2e_latency_s <= 0:
+        raise RuntimeLaunchError("throughput probe e2e_latency must be positive")
+    return {
+        "content": content,
+        "payload": payload,
+        "metrics": {
+            "completion_tokens": completion_tokens,
+            "e2e_latency_s": e2e_latency_s,
+            "tokens_per_second": completion_tokens / e2e_latency_s,
+        },
+    }
+
+
 def probe_completion(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
     timeout_seconds = _required_section_int(config.probes, "chat_timeout_seconds", "probes")
     request = urllib.request.Request(
@@ -2256,6 +2444,8 @@ def launch_runtime(
             _write_json(artifact_paths["completion_probe"], completion_probe)
             chat_probe = probe_chat(config)
             _write_json(artifact_paths["chat_probe"], chat_probe)
+            throughput_probe = probe_throughput(config)
+            _write_json(artifact_paths["throughput_probe"], throughput_probe)
             summary = {
                 "status": "launch_passed",
                 "run_id": config.run_id,
@@ -2579,6 +2769,11 @@ def repeat_runtime(
                 )
                 raise RuntimeConfigError(f"repeat cycle GPU-free wait failed: {wait_error}") from wait_error
         try:
+            cycle_summary["prepare_heal"] = ensure_preparation_records(
+                config=config,
+                declared=declared,
+                local_environment=local_environment,
+            )
             cycle_summary["launch"] = launch_runtime(config, local_environment=local_environment)
         except Exception as launch_error:
             cycle_summary["launch"] = {
@@ -3474,11 +3669,13 @@ def _validate_probe_urls(base_url: str, probes: dict[str, Any], service_port: in
         raise RuntimeConfigError("probe URLs must derive from service.base_url")
     if _required_section_str(probes, "generate_url", "probes") != expected_generate_url:
         raise RuntimeConfigError("probe URLs must derive from service.base_url")
+    if _required_section_str(probes, "throughput_url", "probes") != expected_generate_url:
+        raise RuntimeConfigError("probe URLs must derive from service.base_url")
     if _required_section_str(probes, "completions_url", "probes") != expected_completions_url:
         raise RuntimeConfigError("probe URLs must derive from service.base_url")
     if _required_section_str(probes, "chat_url", "probes") != expected_chat_url:
         raise RuntimeConfigError("probe URLs must derive from service.base_url")
-    for key in ("models_url", "generate_url", "completions_url", "chat_url"):
+    for key in ("models_url", "generate_url", "throughput_url", "completions_url", "chat_url"):
         parsed = urlparse(probes[key])
         if parsed.hostname != parsed_base.hostname or parsed.port != service_port:
             raise RuntimeConfigError("probe URLs must derive from service.base_url")
@@ -3529,6 +3726,7 @@ def _reject_disallowed_ports(config: MaterializedSglangRuntimeConfig, disallowed
         _parsed_url_port(_required_section_str(config.service, "base_url", "service"), "service.base_url"),
         _parsed_url_port(_required_section_str(config.probes, "models_url", "probes"), "probes.models_url"),
         _parsed_url_port(_required_section_str(config.probes, "generate_url", "probes"), "probes.generate_url"),
+        _parsed_url_port(_required_section_str(config.probes, "throughput_url", "probes"), "probes.throughput_url"),
         _parsed_url_port(_required_section_str(config.probes, "completions_url", "probes"), "probes.completions_url"),
         _parsed_url_port(_required_section_str(config.probes, "chat_url", "probes"), "probes.chat_url"),
         int(_argv_value(_required_str_sequence(config.launch.get("inner_argv"), "launch.inner_argv"), "--port")),
