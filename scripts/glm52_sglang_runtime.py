@@ -1382,13 +1382,10 @@ def prepare_model_cache(
     return record
 
 
-def validate_preparation_records(
-    *,
+def _validate_sglang_venv_preparation_record(
     config: MaterializedSglangRuntimeConfig,
-) -> dict[str, Any]:
-    venv_record = _load_preparation_record(config, "sglang_venv_record", "missing SGLang venv preparation record")
-    model_record = _load_preparation_record(config, "model_cache_record", "missing model cache preparation record")
-
+    venv_record: dict[str, Any],
+) -> None:
     venv = _require_mapping(venv_record.get("venv"), "sglang_venv_record.venv")
     if _required_section_str(venv, "python", "sglang_venv_record.venv") != SGLANG_VENV_PYTHON:
         raise RuntimeConfigError("SGLang venv preparation record Python does not match rootfs venv")
@@ -1437,68 +1434,6 @@ def validate_preparation_records(
         raise RuntimeConfigError("SGLang venv preparation record has wrong offloader patch id")
     if not _required_section_str(offloader_patch, "sha256_after", "sglang_venv_record.checks.offloader_patch"):
         raise RuntimeConfigError("SGLang venv preparation record missing offloader patch hash")
-
-    model_cache = _require_mapping(model_record.get("model_cache"), "model_cache_record.model_cache")
-    snapshot_path = _required_section_str(model_cache, "snapshot_path", "model_cache_record.model_cache")
-    if not _is_under_sandbox_path(snapshot_path, SGLANG_HF_HOME_SANDBOX_PATH):
-        raise RuntimeConfigError("model cache snapshot path must be under /cache/glm52/hf-home")
-    if _required_section_int(model_cache, "missing_shard_count", "model_cache_record.model_cache") != 0:
-        raise RuntimeConfigError("model cache preparation record has missing shard files")
-    if _required_section_str(model_cache, "model_id", "model_cache_record.model_cache") != _required_section_str(config.model, "id", "model"):
-        raise RuntimeConfigError("model cache preparation record model id mismatch")
-
-    expected_digest = _rootfs_recipe_digest(config)
-    for name, key, record, inner_command, env in (
-        ("SGLang venv", "sglang_venv_record", venv_record, _sglang_venv_prepare_command(), None),
-        ("model cache", "model_cache_record", model_record, _model_cache_prepare_command(config), _model_cache_prepare_env()),
-    ):
-        rootfs = _require_mapping(record.get("rootfs"), f"{name} preparation record rootfs")
-        if _required_section_str(rootfs, "recipe_sha256", f"{name} preparation record rootfs") != expected_digest:
-            raise RuntimeConfigError(f"{name} preparation record rootfs recipe digest mismatch")
-        preparation_config = _preparation_config_for_record(config, key)
-        _validate_preparation_record_plan(preparation_config, key, record, inner_command, env=env)
-
-    return {
-        "sglang_venv": venv_record,
-        "model_cache": model_record,
-    }
-
-
-def _validate_sglang_venv_preparation_record_probe(
-    config: MaterializedSglangRuntimeConfig,
-) -> None:
-    venv_record = _load_preparation_record(config, "sglang_venv_record", "missing SGLang venv preparation record")
-    venv = _require_mapping(venv_record.get("venv"), "sglang_venv_record.venv")
-    if _required_section_str(venv, "python", "sglang_venv_record.venv") != SGLANG_VENV_PYTHON:
-        raise RuntimeConfigError("SGLang venv preparation record Python does not match rootfs venv")
-    packages = venv.get("packages")
-    if not isinstance(packages, list) or packages != SGLANG_PREPARE_PACKAGES:
-        raise RuntimeConfigError("SGLang venv preparation record package contract mismatch")
-    installed_packages = _require_mapping(venv.get("installed_packages"), "sglang_venv_record.venv.installed_packages")
-    if not installed_packages.get("sglang"):
-        raise RuntimeConfigError("SGLang venv preparation record missing installed package: sglang")
-    dependency_resolution = _require_mapping(
-        venv_record.get("dependency_resolution"),
-        "sglang_venv_record.dependency_resolution",
-    )
-    if _required_section_str(dependency_resolution, "group", "sglang_venv_record.dependency_resolution") != GLM52_RUNTIME_DEPENDENCY_GROUP:
-        raise RuntimeConfigError("SGLang venv preparation record must use the GLM52 runtime dependency group")
-    if _required_section_str(dependency_resolution, "lockfile", "sglang_venv_record.dependency_resolution") != GLM52_RUNTIME_LOCKFILE_REF:
-        raise RuntimeConfigError("SGLang venv preparation record must use repo://uv.lock")
-    if not _required_section_str(dependency_resolution, "lock_sha256", "sglang_venv_record.dependency_resolution"):
-        raise RuntimeConfigError("SGLang venv preparation record missing uv.lock digest")
-    checks = _require_mapping(venv_record.get("checks"), "sglang_venv_record.checks")
-    if checks.get("served_model_name_flag") is not True:
-        raise RuntimeConfigError("SGLang venv preparation record missing served_model_name_flag")
-    platform_checks = _require_mapping(checks.get("platform"), "sglang_venv_record.checks.platform")
-    _validate_sglang_platform_checks(
-        platform_checks,
-        device=_required_section_str(config.runtime, "device", "runtime"),
-        source="SGLang venv preparation record",
-    )
-    offloader_patch = _require_mapping(checks.get("offloader_patch"), "sglang_venv_record.checks.offloader_patch")
-    if _required_section_str(offloader_patch, "patch_id", "sglang_venv_record.checks.offloader_patch") != SGLANG_OFFLOADER_PATCH_ID:
-        raise RuntimeConfigError("SGLang venv preparation record has wrong offloader patch id")
     rootfs = _require_mapping(venv_record.get("rootfs"), "SGLang venv preparation record rootfs")
     if _required_section_str(rootfs, "recipe_sha256", "SGLang venv preparation record rootfs") != _rootfs_recipe_digest(config):
         raise RuntimeConfigError("SGLang venv preparation record rootfs recipe digest mismatch")
@@ -1512,10 +1447,10 @@ def _validate_sglang_venv_preparation_record_probe(
     )
 
 
-def _validate_model_cache_preparation_record_probe(
+def _validate_model_cache_preparation_record(
     config: MaterializedSglangRuntimeConfig,
+    model_record: dict[str, Any],
 ) -> None:
-    model_record = _load_preparation_record(config, "model_cache_record", "missing model cache preparation record")
     model_cache = _require_mapping(model_record.get("model_cache"), "model_cache_record.model_cache")
     snapshot_path = _required_section_str(model_cache, "snapshot_path", "model_cache_record.model_cache")
     if not _is_under_sandbox_path(snapshot_path, SGLANG_HF_HOME_SANDBOX_PATH):
@@ -1524,6 +1459,9 @@ def _validate_model_cache_preparation_record_probe(
         raise RuntimeConfigError("model cache preparation record has missing shard files")
     if _required_section_str(model_cache, "model_id", "model_cache_record.model_cache") != _required_section_str(config.model, "id", "model"):
         raise RuntimeConfigError("model cache preparation record model id mismatch")
+    snapshot_evidence = validate_model_snapshot(Path(_host_path_from_cache_sandbox_path(config, snapshot_path)))
+    if _snapshot_shard_count(snapshot_evidence) != _required_section_int(model_cache, "shard_count", "model_cache_record.model_cache"):
+        raise RuntimeConfigError("model cache preparation record shard count mismatch")
     rootfs = _require_mapping(model_record.get("rootfs"), "model cache preparation record rootfs")
     if _required_section_str(rootfs, "recipe_sha256", "model cache preparation record rootfs") != _rootfs_recipe_digest(config):
         raise RuntimeConfigError("model cache preparation record rootfs recipe digest mismatch")
@@ -1535,6 +1473,36 @@ def _validate_model_cache_preparation_record_probe(
         _model_cache_prepare_command(config),
         env=_model_cache_prepare_env(),
     )
+
+
+def validate_preparation_records(
+    *,
+    config: MaterializedSglangRuntimeConfig,
+) -> dict[str, Any]:
+    venv_record = _load_preparation_record(config, "sglang_venv_record", "missing SGLang venv preparation record")
+    model_record = _load_preparation_record(config, "model_cache_record", "missing model cache preparation record")
+
+    _validate_sglang_venv_preparation_record(config, venv_record)
+    _validate_model_cache_preparation_record(config, model_record)
+
+    return {
+        "sglang_venv": venv_record,
+        "model_cache": model_record,
+    }
+
+
+def _validate_sglang_venv_preparation_record_probe(
+    config: MaterializedSglangRuntimeConfig,
+) -> None:
+    venv_record = _load_preparation_record(config, "sglang_venv_record", "missing SGLang venv preparation record")
+    _validate_sglang_venv_preparation_record(config, venv_record)
+
+
+def _validate_model_cache_preparation_record_probe(
+    config: MaterializedSglangRuntimeConfig,
+) -> None:
+    model_record = _load_preparation_record(config, "model_cache_record", "missing model cache preparation record")
+    _validate_model_cache_preparation_record(config, model_record)
 
 
 def _stale_preparation_record_names(config: MaterializedSglangRuntimeConfig) -> list[str]:
@@ -1557,6 +1525,8 @@ def ensure_preparation_records(
     local_environment: LocalEnvironmentConfig,
     declared_path: Path | None = None,
     local_environment_path: Path | None = None,
+    prepare_sglang_venv_fn: Any | None = None,
+    prepare_model_cache_fn: Any | None = None,
 ) -> dict[str, Any]:
     try:
         validate_preparation_records(config=config)
@@ -1564,20 +1534,32 @@ def ensure_preparation_records(
         stale = _stale_preparation_record_names(config)
         if not stale:
             stale = ["sglang_venv_record", "model_cache_record"]
-        if declared_path is None:
-            declared_path = declared.source_path or Path(_resolve_local_path_ref(local_environment, f"repo://{DEFAULT_GLM52_DECLARED_SPEC}"))
-        if local_environment_path is None:
-            local_environment_path = local_environment.source_path or Path(
-                _resolve_local_path_ref(local_environment, f"repo://{DEFAULT_GLM52_LOCAL_ENVIRONMENT}")
-            )
+        declared_path = _preparation_source_path(
+            declared_path,
+            declared.source_path,
+            local_environment=local_environment,
+            default_ref=f"repo://{DEFAULT_GLM52_DECLARED_SPEC}",
+            description="declared spec",
+        )
+        local_environment_path = _preparation_source_path(
+            local_environment_path,
+            local_environment.source_path,
+            local_environment=local_environment,
+            default_ref=f"repo://{DEFAULT_GLM52_LOCAL_ENVIRONMENT}",
+            description="local environment",
+        )
+        if prepare_sglang_venv_fn is None:
+            prepare_sglang_venv_fn = prepare_sglang_venv
+        if prepare_model_cache_fn is None:
+            prepare_model_cache_fn = prepare_model_cache
         if "sglang_venv_record" in stale:
-            prepare_sglang_venv(
+            prepare_sglang_venv_fn(
                 declared_path=declared_path,
                 local_environment_path=local_environment_path,
                 run_id=SGLANG_PREPARE_RUN_ID,
             )
         if "model_cache_record" in stale:
-            prepare_model_cache(
+            prepare_model_cache_fn(
                 declared_path=declared_path,
                 local_environment_path=local_environment_path,
                 run_id=MODEL_CACHE_PREPARE_RUN_ID,
@@ -1585,6 +1567,22 @@ def ensure_preparation_records(
         validate_preparation_records(config=config)
         return {"status": "healed", "regenerated": stale}
     return {"status": "already_valid", "regenerated": []}
+
+
+def _preparation_source_path(
+    explicit_path: Path | None,
+    loaded_path: Path | None,
+    *,
+    local_environment: LocalEnvironmentConfig,
+    default_ref: str,
+    description: str,
+) -> Path:
+    path = explicit_path or loaded_path
+    if path is None:
+        path = Path(_resolve_local_path_ref(local_environment, default_ref))
+    if not path.exists():
+        raise RuntimeConfigError(f"{description} source path is required for preparation healing: {path}")
+    return path
 
 
 def _validate_sglang_platform_checks(platform_checks: dict[str, Any], *, device: str, source: str) -> None:
@@ -1912,7 +1910,14 @@ def _rootfs_recipe_digest(config: MaterializedSglangRuntimeConfig) -> str:
 
 
 def _locked_dependency_sync_command(python: str) -> list[str]:
+    # uv resolves the target environment from VIRTUAL_ENV / UV_PROJECT_ENVIRONMENT,
+    # which the rootfs env pins to the read-only repo .venv-rootfs. Set both inside
+    # the sandbox with an env prefix so the locked group installs into the SGLang
+    # venv regardless of the inherited rootfs environment.
     return [
+        "env",
+        f"VIRTUAL_ENV={SGLANG_VENV_SANDBOX_PATH}",
+        f"UV_PROJECT_ENVIRONMENT={SGLANG_VENV_SANDBOX_PATH}",
         "uv",
         "sync",
         "--active",
@@ -1928,7 +1933,12 @@ def _locked_dependency_sync_command(python: str) -> list[str]:
 
 
 def _locked_dependency_sync_env(venv_path: str) -> dict[str, str]:
-    return {"VIRTUAL_ENV": venv_path}
+    # The rootfs env pins VIRTUAL_ENV / UV_PROJECT_ENVIRONMENT to the read-only
+    # repo .venv-rootfs and clears the host overlay, so the sync command sets them
+    # inside the sandbox via an env prefix (see _locked_dependency_sync_command).
+    # This mapping is retained only for the recorded command env; the effective
+    # override happens in-sandbox.
+    return {"VIRTUAL_ENV": venv_path, "UV_PROJECT_ENVIRONMENT": venv_path}
 
 
 def _locked_dependency_resolution_record() -> dict[str, str]:
@@ -2320,6 +2330,15 @@ def probe_throughput(config: MaterializedSglangRuntimeConfig) -> dict[str, Any]:
         raise RuntimeLaunchError("throughput probe completion_tokens must be positive")
     if e2e_latency_s <= 0:
         raise RuntimeLaunchError("throughput probe e2e_latency must be positive")
+    expected_completion_tokens = _required_section_int(
+        _require_mapping(config.probes["throughput_payload"].get("sampling_params"), "probes.throughput_payload.sampling_params"),
+        "max_new_tokens",
+        "probes.throughput_payload.sampling_params",
+    )
+    if completion_tokens != expected_completion_tokens:
+        raise RuntimeLaunchError(
+            f"throughput probe generated {completion_tokens} token(s), expected {expected_completion_tokens}"
+        )
     return {
         "content": content,
         "payload": payload,
@@ -2459,7 +2478,14 @@ def launch_runtime(
         teardown_action = "not_started"
         diagnostic_action: dict[str, Any] = {"status": "not_sent", "reason": "process_not_started"}
         if process_record_written and should_teardown_after_failure(config):
-            diagnostic_action = emit_failure_diagnostic_signal(config, reason="probe_failure")
+            try:
+                diagnostic_action = emit_failure_diagnostic_signal(config, reason="probe_failure")
+            except Exception as diagnostic_error:
+                diagnostic_action = {
+                    "status": "failed",
+                    "reason": "diagnostic_signal_failed",
+                    "error": str(diagnostic_error),
+                }
             teardown_action = "teardown_runtime"
             try:
                 teardown_runtime(config, local_environment=local_environment)
@@ -2578,6 +2604,8 @@ def emit_failure_diagnostic_signal(config: MaterializedSglangRuntimeConfig, *, r
     record = load_yaml_mapping(process_record_path)
     _validate_process_record_matches_config(config, record)
     process_group = _required_int(record, "process_group", "process_record")
+    port = _required_section_int(config.service, "port", "service")
+    _validate_live_process_command_guard(record, port)
     try:
         os.killpg(process_group, signal.SIGQUIT)
     except ProcessLookupError:
@@ -3843,6 +3871,33 @@ def _validate_live_process_command_guard(record: dict[str, Any], port: int) -> N
         raise RuntimeConfigError("process record command guard missing sglang.launch_server")
     if _argv_value(inner, "--port") != str(port):
         raise RuntimeConfigError("process record command guard port mismatch")
+    pid = _required_int(record, "pid", "process_record")
+    process_group = _required_int(record, "process_group", "process_record")
+    try:
+        live_process_group = os.getpgid(pid)
+    except ProcessLookupError:
+        if _process_group_exists(process_group):
+            raise RuntimeConfigError("live process command guard cannot prove ownership after pid disappeared")
+        return
+    except PermissionError as error:
+        raise RuntimeConfigError("live process command guard cannot inspect recorded pid") from error
+    if live_process_group != process_group:
+        raise RuntimeConfigError("live process command guard process group mismatch")
+    live_argv = _live_process_argv(pid)
+    if live_argv is None:
+        raise RuntimeConfigError("live process command guard cannot inspect recorded pid command")
+    if "sglang.launch_server" not in live_argv:
+        raise RuntimeConfigError("live process command guard missing sglang.launch_server")
+    if _argv_value(live_argv, "--port") != str(port):
+        raise RuntimeConfigError("live process command guard port mismatch")
+
+
+def _live_process_argv(pid: int) -> list[str] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
 
 
 def _record_to_mapping(record: Any) -> dict[str, Any] | None:

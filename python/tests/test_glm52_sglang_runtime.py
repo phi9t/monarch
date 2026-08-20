@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -187,6 +188,17 @@ def test_load_yaml_mapping_rejects_non_mapping_documents(tmp_path: Path) -> None
 
     with pytest.raises(RuntimeConfigError, match="must be a mapping"):
         load_yaml_mapping(path)
+
+
+def test_locked_dependency_sync_env_targets_sglang_venv() -> None:
+    # The sandbox launch env pins UV_PROJECT_ENVIRONMENT to the read-only
+    # .venv-rootfs. The locked dependency sync must override it so uv installs
+    # the glm52-runtime group into the SGLang venv rather than failing on the
+    # read-only repo mount.
+    env = glm52_sglang_runtime._locked_dependency_sync_env("/cache/glm52/venvs/sglang")
+
+    assert env["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+    assert env["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
 
 
 def test_load_declared_spec_accepts_complete_spec(tmp_path: Path) -> None:
@@ -690,6 +702,9 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
         if inner[:2] == ["uv", "venv"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
         expected_sync_prefix = [
+            "env",
+            "VIRTUAL_ENV=/cache/glm52/venvs/sglang",
+            "UV_PROJECT_ENVIRONMENT=/cache/glm52/venvs/sglang",
             "uv",
             "sync",
             "--active",
@@ -704,6 +719,7 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
             assert "--python" in inner
             assert inner[inner.index("--python") + 1] == "/cache/glm52/venvs/sglang/bin/python"
             assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
             return subprocess.CompletedProcess(argv, 0, stdout="resolved glm52 runtime deps\n", stderr="")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
@@ -766,6 +782,7 @@ def test_prepare_sglang_venv_uses_rootfs_managed_python_and_uv(tmp_path: Path) -
     assert record["dependency_resolution"]["selection"] == "only_group"
     assert record["dependency_resolution"]["sources"] == "standard_metadata_for_torch"
     assert record["commands"][1]["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+    assert record["commands"][1]["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
     assert record["checks"]["offloader_patch"]["patch_id"] == "glm52-offloader-v1-plain-tensor-attrs-v1"
     assert record["checks"]["offloader_patch"]["sha256_after"] == "patched-sha"
     assert record["bwrap_plan"]["plan_sha256"] == glm52_sglang_runtime._stable_json_digest(emitted_plans[0])
@@ -777,6 +794,9 @@ def test_prepare_sglang_venv_accepts_cuda_platform_for_cuda_declared_spec(tmp_pa
         if inner[:2] == ["uv", "venv"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
         expected_sync_prefix = [
+            "env",
+            "VIRTUAL_ENV=/cache/glm52/venvs/sglang",
+            "UV_PROJECT_ENVIRONMENT=/cache/glm52/venvs/sglang",
             "uv",
             "sync",
             "--active",
@@ -789,6 +809,7 @@ def test_prepare_sglang_venv_accepts_cuda_platform_for_cuda_declared_spec(tmp_pa
         ]
         if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
             assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
             return subprocess.CompletedProcess(argv, 0, stdout="resolved glm52 runtime deps\n", stderr="")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
@@ -1142,6 +1163,9 @@ def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path
         if inner[:2] == ["uv", "venv"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Using Python 3.12\nCreating virtual environment\n", stderr="")
         expected_sync_prefix = [
+            "env",
+            "VIRTUAL_ENV=/cache/glm52/venvs/sglang",
+            "UV_PROJECT_ENVIRONMENT=/cache/glm52/venvs/sglang",
             "uv",
             "sync",
             "--active",
@@ -1154,6 +1178,7 @@ def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path
         ]
         if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
             assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
             return subprocess.CompletedProcess(argv, 0, stdout="resolved glm52 runtime deps\n", stderr="")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
@@ -1215,6 +1240,12 @@ def test_validate_preparation_records_accepts_generated_prepare_records(tmp_path
         local_environment=load_local_environment(local_environment_path),
         run_id="prepare-generated",
         port=19000,
+    )
+    write_model_snapshot_for_record(
+        config,
+        glm52_sglang_runtime._load_json_mapping(
+            glm52_sglang_runtime._preparation_record_path(config, "model_cache_record")
+        ),
     )
 
     records = validate_preparation_records(config=config)
@@ -1307,6 +1338,23 @@ def valid_preparation_records_for_config(
     }
 
 
+def write_model_snapshot_for_record(
+    config,
+    model_record: dict[str, object],
+) -> Path:
+    model_cache = model_record["model_cache"]
+    assert isinstance(model_cache, dict)
+    snapshot_path = Path(
+        glm52_sglang_runtime._host_path_from_cache_sandbox_path(
+            config,
+            str(model_cache["snapshot_path"]),
+        )
+    )
+    snapshot_path.mkdir(parents=True, exist_ok=True)
+    (snapshot_path / "model.safetensors").write_text("weights")
+    return snapshot_path
+
+
 def write_valid_preparation_records_for_config(
     config,
     *,
@@ -1331,6 +1379,8 @@ def write_valid_preparation_records_for_config(
         "model_cache_record": (glm52_sglang_runtime._model_cache_prepare_command(config), glm52_sglang_runtime._model_cache_prepare_env()),
     }
     for name, record in records.items():
+        if name == "model_cache_record":
+            write_model_snapshot_for_record(config, record)
         preparation_config = glm52_sglang_runtime._preparation_config_for_record(config, name)
         inner_argv, env = command_specs[name]
         record["run_id"] = preparation_config.run_id
@@ -1417,6 +1467,183 @@ def test_ensure_preparation_records_regenerates_stale_model_record(
     validate_preparation_records(config=config)
 
 
+def test_ensure_preparation_records_regenerates_incomplete_model_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared_path = write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)
+    local_environment_path = write_local_environment(tmp_path)
+    declared = load_declared_spec(declared_path)
+    local_env = load_local_environment(local_environment_path)
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19021,
+    )
+    config = glm52_sglang_runtime.with_stable_preparation_record_paths(
+        config,
+        declared=declared,
+        local_environment=local_env,
+    )
+    records = write_valid_preparation_records_for_config(config)
+    snapshot_path = Path(
+        glm52_sglang_runtime._host_path_from_cache_sandbox_path(
+            config,
+            records["model_cache_record"]["model_cache"]["snapshot_path"],
+        )
+    )
+    (snapshot_path / "model.safetensors").unlink()
+    prepare_calls: list[str] = []
+
+    def fake_prepare_sglang_venv(**_kwargs):
+        prepare_calls.append("venv")
+        raise AssertionError("valid venv record should not be regenerated")
+
+    def fake_prepare_model_cache(
+        *,
+        declared_path: Path,
+        local_environment_path: Path,
+        run_id: str,
+    ):
+        prepare_calls.append("model")
+        assert declared_path == declared.source_path
+        assert local_environment_path == local_env.source_path
+        assert run_id == glm52_sglang_runtime.MODEL_CACHE_PREPARE_RUN_ID
+        return write_valid_preparation_records_for_config(config)["model_cache_record"]
+
+    monkeypatch.setattr(glm52_sglang_runtime, "prepare_sglang_venv", fake_prepare_sglang_venv)
+    monkeypatch.setattr(glm52_sglang_runtime, "prepare_model_cache", fake_prepare_model_cache)
+
+    result = glm52_sglang_runtime.ensure_preparation_records(
+        config=config,
+        declared=declared,
+        local_environment=local_env,
+    )
+
+    assert result == {"status": "healed", "regenerated": ["model_cache_record"]}
+    assert prepare_calls == ["model"]
+    validate_preparation_records(config=config)
+
+
+def test_ensure_preparation_records_regenerates_stale_venv_record_with_strict_only_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared_path = write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)
+    local_environment_path = write_local_environment(tmp_path)
+    declared = load_declared_spec(declared_path)
+    local_env = load_local_environment(local_environment_path)
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19021,
+    )
+    config = glm52_sglang_runtime.with_stable_preparation_record_paths(
+        config,
+        declared=declared,
+        local_environment=local_env,
+    )
+    records = write_valid_preparation_records_for_config(config)
+    del records["sglang_venv_record"]["checks"]["offloader_patch"]["sha256_after"]
+    glm52_sglang_runtime._write_json(
+        glm52_sglang_runtime._preparation_record_path(config, "sglang_venv_record"),
+        records["sglang_venv_record"],
+    )
+    prepare_calls: list[str] = []
+
+    def fake_prepare_sglang_venv(
+        *,
+        declared_path: Path,
+        local_environment_path: Path,
+        run_id: str,
+    ):
+        prepare_calls.append("venv")
+        assert declared_path == declared.source_path
+        assert local_environment_path == local_env.source_path
+        assert run_id == glm52_sglang_runtime.SGLANG_PREPARE_RUN_ID
+        records = write_valid_preparation_records_for_config(config)
+        return records["sglang_venv_record"]
+
+    def fake_prepare_model_cache(**_kwargs):
+        prepare_calls.append("model")
+        raise AssertionError("valid model record should not be regenerated")
+
+    monkeypatch.setattr(glm52_sglang_runtime, "prepare_sglang_venv", fake_prepare_sglang_venv)
+    monkeypatch.setattr(glm52_sglang_runtime, "prepare_model_cache", fake_prepare_model_cache)
+
+    result = glm52_sglang_runtime.ensure_preparation_records(
+        config=config,
+        declared=declared,
+        local_environment=local_env,
+    )
+
+    assert result["status"] == "healed"
+    assert result["regenerated"] == ["sglang_venv_record"]
+    assert prepare_calls == ["venv"]
+    validate_preparation_records(config=config)
+
+
+def test_ensure_preparation_records_real_model_prepare_targets_stable_record_path(
+    tmp_path: Path,
+) -> None:
+    declared_path = write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY)
+    local_environment_path = write_local_environment(tmp_path)
+    declared = load_declared_spec(declared_path)
+    local_env = load_local_environment(local_environment_path)
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19021,
+    )
+    config = glm52_sglang_runtime.with_stable_preparation_record_paths(
+        config,
+        declared=declared,
+        local_environment=local_env,
+    )
+    records = write_valid_preparation_records_for_config(config)
+    records["model_cache_record"]["model_cache"]["model_id"] = "Qwen/Qwen3-0.6B"
+    glm52_sglang_runtime._write_json(
+        glm52_sglang_runtime._preparation_record_path(config, "model_cache_record"),
+        records["model_cache_record"],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"snapshot_path": "/cache/glm52/hf-home/hub/models--zai-org--GLM-5.2/snapshots/abc"}',
+            stderr="",
+        )
+
+    result = glm52_sglang_runtime.ensure_preparation_records(
+        config=config,
+        declared=declared,
+        local_environment=local_env,
+        declared_path=declared_path,
+        local_environment_path=local_environment_path,
+        prepare_model_cache_fn=lambda **kwargs: glm52_sglang_runtime.prepare_model_cache(
+            **kwargs,
+            run=fake_run,
+            snapshot_validator=lambda path: {"snapshot_path": str(path), "shard_count": 1, "missing_shard_count": 0},
+            plan_emitter=lambda prepare_config, inner_argv, env=None: valid_emitted_preparation_plan(
+                prepare_config,
+                inner_argv,
+                env=env,
+            ),
+        ),
+    )
+
+    assert result == {"status": "healed", "regenerated": ["model_cache_record"]}
+    assert calls
+    assert glm52_sglang_runtime._preparation_record_path(config, "model_cache_record").exists()
+    validate_preparation_records(config=config)
+
+
 def test_ensure_preparation_records_reraises_when_regeneration_still_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1500,6 +1727,46 @@ def test_ensure_preparation_records_noop_when_valid(
 
     assert result["status"] == "already_valid"
     assert result["regenerated"] == []
+
+
+def test_ensure_preparation_records_requires_existing_source_paths_for_heal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = load_declared_spec(write_spec(tmp_path / "declared.yaml", VALID_DECLARED_WITH_OVERLAY))
+    local_env = load_local_environment(write_local_environment(tmp_path))
+    config = materialize_runtime_config(
+        declared=declared,
+        local_environment=local_env,
+        run_id="glm52-sglang-local-001",
+        port=19021,
+    )
+    config = glm52_sglang_runtime.with_stable_preparation_record_paths(
+        config,
+        declared=declared,
+        local_environment=local_env,
+    )
+    records = write_valid_preparation_records_for_config(config)
+    records["model_cache_record"]["model_cache"]["model_id"] = "Qwen/Qwen3-0.6B"
+    glm52_sglang_runtime._write_json(
+        glm52_sglang_runtime._preparation_record_path(config, "model_cache_record"),
+        records["model_cache_record"],
+    )
+    declared_without_source = replace(declared, source_path=None)
+    local_env_without_source = replace(local_env, source_path=None)
+
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "prepare_model_cache",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("prepare should not run without source paths")),
+    )
+
+    with pytest.raises(RuntimeConfigError, match="declared spec source path is required for preparation healing"):
+        glm52_sglang_runtime.ensure_preparation_records(
+            config=config,
+            declared=declared_without_source,
+            local_environment=local_env_without_source,
+        )
 
 
 def test_repeatability_rejects_default_ports(tmp_path: Path) -> None:
@@ -1745,6 +2012,7 @@ def test_launch_runtime_probe_failure_emits_owned_diagnostic_signal(
         lambda _config: (_ for _ in ()).throw(RuntimeLaunchError("generate probe timed out after 300s")),
     )
     monkeypatch.setattr(glm52_sglang_runtime.os, "getpgid", lambda _pid: 12345)
+    monkeypatch.setattr(glm52_sglang_runtime, "_live_process_argv", lambda _pid: config.launch["inner_argv"])
     monkeypatch.setattr(
         glm52_sglang_runtime.os,
         "killpg",
@@ -1798,6 +2066,40 @@ def test_launch_runtime_probe_failure_emits_owned_diagnostic_signal(
     }
 
 
+def test_emit_failure_diagnostic_signal_rejects_live_command_drift_before_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = materialized_config_for_test(tmp_path, port=19017)
+    artifact_paths = glm52_sglang_runtime._resolve_artifact_paths(config)
+    artifact_paths["process_record"].parent.mkdir(parents=True, exist_ok=True)
+    glm52_sglang_runtime._write_yaml(
+        artifact_paths["process_record"],
+        {
+            "schema_version": 1,
+            "run_id": config.run_id,
+            "status": "running",
+            "pid": 12345,
+            "pgid": 12345,
+            "process_group": 12345,
+            "port": config.service["port"],
+            "outer_argv": glm52_sglang_runtime._resolved_outer_argv(config),
+            "inner_argv": config.launch["inner_argv"],
+            "env": config.launch["env"],
+        },
+    )
+    sent_signals: list[int] = []
+
+    monkeypatch.setattr(glm52_sglang_runtime.os, "getpgid", lambda _pid: 12345)
+    monkeypatch.setattr(glm52_sglang_runtime, "_live_process_argv", lambda _pid: ["python", "-m", "unrelated.server", "--port", "19017"])
+    monkeypatch.setattr(glm52_sglang_runtime.os, "killpg", lambda pgid, sig: sent_signals.append(sig))
+
+    with pytest.raises(RuntimeConfigError, match="live process command guard missing sglang.launch_server"):
+        glm52_sglang_runtime.emit_failure_diagnostic_signal(config, reason="probe_failure")
+
+    assert sent_signals == []
+
+
 def test_launch_runtime_writes_required_throughput_probe_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1832,6 +2134,7 @@ def test_launch_runtime_writes_required_throughput_probe_artifact(
         lambda _config: {"status": "free", "checked_gpus": []},
     )
     monkeypatch.setattr(glm52_sglang_runtime.os, "getpgid", lambda _pid: 12346)
+    monkeypatch.setattr(glm52_sglang_runtime, "_live_process_argv", lambda _pid: config.launch["inner_argv"])
     monkeypatch.setattr(glm52_sglang_runtime.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(
         glm52_sglang_runtime,
@@ -1914,6 +2217,8 @@ def test_teardown_reports_killed_when_group_clears_after_escalation(
     monkeypatch.setattr(glm52_sglang_runtime, "_is_port_open", lambda _host, _port: False)
     monkeypatch.setattr(glm52_sglang_runtime.time, "time", lambda: next(time_values))
     monkeypatch.setattr(glm52_sglang_runtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(glm52_sglang_runtime.os, "getpgid", lambda _pid: 12345)
+    monkeypatch.setattr(glm52_sglang_runtime, "_live_process_argv", lambda _pid: config.launch["inner_argv"])
 
     summary = glm52_sglang_runtime.teardown_runtime(config)
 
@@ -1957,6 +2262,8 @@ def test_teardown_treats_zombie_only_group_as_stopped_after_escalation(
     monkeypatch.setattr(glm52_sglang_runtime, "_is_port_open", lambda _host, _port: False)
     monkeypatch.setattr(glm52_sglang_runtime.time, "time", lambda: next(time_values))
     monkeypatch.setattr(glm52_sglang_runtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(glm52_sglang_runtime.os, "getpgid", lambda _pid: 12345)
+    monkeypatch.setattr(glm52_sglang_runtime, "_live_process_argv", lambda _pid: config.launch["inner_argv"])
 
     summary = glm52_sglang_runtime.teardown_runtime(config)
     record = load_yaml_mapping(artifact_paths["process_record"])
@@ -2866,6 +3173,33 @@ def test_probe_throughput_reports_tokens_per_second(
     assert result["payload"]["meta_info"]["completion_tokens"] == 128
 
 
+def test_probe_throughput_rejects_short_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = materialized_for_tests(tmp_path)
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return b'{"text":"warm throughput text","meta_info":{"completion_tokens":17,"e2e_latency":4.0}}'
+
+    monkeypatch.setattr(glm52_sglang_runtime.urllib.request, "urlopen", lambda _request, *, timeout: FakeResponse())
+
+    with pytest.raises(RuntimeLaunchError, match=r"throughput probe generated 17 token\(s\), expected 128"):
+        glm52_sglang_runtime.probe_throughput(config)
+
+
 def test_probe_throughput_uses_native_generate_and_ignore_eos(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3465,7 +3799,12 @@ rootfs:
         tmp_path / "repo" / "glm52-serving-results" / config.run_id / "launch-summary.json"
     )
     assert summary["status"] == "launch_failed"
-    assert summary["teardown_action"] == "teardown_runtime"
+    assert summary["diagnostic_action"] == {
+        "status": "failed",
+        "reason": "diagnostic_signal_failed",
+        "error": "live process command guard cannot inspect recorded pid command",
+    }
+    assert summary["teardown_action"] == "teardown_failed: live process command guard cannot inspect recorded pid command"
 
 
 def test_models_probe_fails_fast_when_scheduler_logs_fatal_startup_error(
@@ -3750,6 +4089,9 @@ rootfs:
         if inner[:2] == ["uv", "venv"]:
             return FakeCompletedProcess("Using Python 3.12\nCreating virtual environment\n")
         expected_sync_prefix = [
+            "env",
+            "VIRTUAL_ENV=/cache/glm52/venvs/sglang",
+            "UV_PROJECT_ENVIRONMENT=/cache/glm52/venvs/sglang",
             "uv",
             "sync",
             "--active",
@@ -3762,6 +4104,7 @@ rootfs:
         ]
         if inner[: len(expected_sync_prefix)] == expected_sync_prefix:
             assert kwargs["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+            assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
             return FakeCompletedProcess("resolved glm52 runtime deps\n")
         if inner[:4] == [
             "/cache/glm52/venvs/sglang/bin/python",
@@ -3815,6 +4158,9 @@ rootfs:
         "--clear",
     ]
     assert install_call == [
+        "env",
+        "VIRTUAL_ENV=/cache/glm52/venvs/sglang",
+        "UV_PROJECT_ENVIRONMENT=/cache/glm52/venvs/sglang",
         "uv",
         "sync",
         "--active",
@@ -3828,6 +4174,7 @@ rootfs:
         "/cache/glm52/venvs/sglang/bin/python",
     ]
     assert calls[1]["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+    assert calls[1]["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
     assert patch_call == [
         "/cache/glm52/venvs/sglang/bin/python",
         "/workspace/monarch/scripts/glm52_sglang_offloader_patch.py",
@@ -3870,6 +4217,7 @@ rootfs:
     assert evidence["dependency_resolution"]["selection"] == "only_group"
     assert evidence["dependency_resolution"]["sources"] == "standard_metadata_for_torch"
     assert evidence["commands"][1]["env"]["VIRTUAL_ENV"] == "/cache/glm52/venvs/sglang"
+    assert evidence["commands"][1]["env"]["UV_PROJECT_ENVIRONMENT"] == "/cache/glm52/venvs/sglang"
     assert evidence["checks"]["served_model_name_flag"] is True
     assert evidence["checks"]["platform"]["is_cuda"] is True
     assert evidence["checks"]["platform"]["rotary_base_is_cuda"] is True
@@ -4196,6 +4544,11 @@ rootfs:
         teardown_runs.append(config.run_id)
         return {"status": "teardown_passed", "run_id": config.run_id}
 
+    monkeypatch.setattr(
+        glm52_sglang_runtime,
+        "ensure_preparation_records",
+        lambda **_kwargs: {"status": "already_valid", "regenerated": []},
+    )
     monkeypatch.setattr(glm52_sglang_runtime, "launch_runtime", fake_launch_runtime)
     monkeypatch.setattr(glm52_sglang_runtime, "teardown_runtime", fake_teardown_runtime)
 
