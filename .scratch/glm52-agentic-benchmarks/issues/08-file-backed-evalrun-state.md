@@ -1,7 +1,7 @@
 # File-Backed EvalRun State
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 07
 
 ## Objective
@@ -62,3 +62,52 @@ scripts/run python -m pytest python/tests/test_glm52_benchmark_verifier.py -q
 - Resume succeeds only for matching manifest hashes.
 - Resume fails loudly for mismatched, missing, or malformed state.
 - Existing benchmark verifier tests still pass.
+
+## Resolution
+
+- Added `ginkgo.eval.orchestrator`, a deterministic file-backed
+  `evalrun-state.json` state module for campaign materialization, suite
+  preparation, trial generation, grading, suite summary, and campaign summary.
+- Wired active verifier artifact writers through the EvalRun state module,
+  including fixture, prepare, conformance, Responses smoke/calibration, bwrap
+  codegen smoke, and Harbor smoke/failure paths.
+- Preserved the existing `run.json` `manifest_sha256` compatibility rule and
+  tightened EvalRun resume validation to reject run id, mode, or suite-set
+  mismatches before overwriting state.
+- Kept `scripts/glm52_benchmark_verifier.py` as the CLI facade and left suite
+  scoring behavior unchanged.
+
+## Evidence
+
+Red:
+
+```sh
+scripts/run python -m pytest python/tests/test_glm52_agentic_benchmark_platform.py -q
+```
+
+Failed at collection with:
+
+```text
+ModuleNotFoundError: No module named 'ginkgo.eval.orchestrator'
+```
+
+Verifier integration red:
+
+```sh
+scripts/run python -m pytest python/tests/test_glm52_benchmark_verifier.py -q
+```
+
+Failed because `evalrun-state.json` was not emitted and corrupt state did not
+block resume.
+
+Green:
+
+```sh
+scripts/run python -m pyright ginkgo/eval/orchestrator.py ginkgo/eval/manifest.py python/tests/test_glm52_agentic_benchmark_platform.py
+scripts/run python -m py_compile ginkgo/eval/orchestrator.py ginkgo/eval/manifest.py python/tests/test_glm52_agentic_benchmark_platform.py python/tests/test_glm52_benchmark_verifier.py scripts/glm52_benchmark_verifier.py
+scripts/run python -m pytest python/tests/test_glm52_agentic_benchmark_platform.py python/tests/test_glm52_benchmark_verifier.py -q
+git diff --check
+```
+
+Result: pyright reported `0 errors`; pytest reported `186 passed`; diff check
+passed.

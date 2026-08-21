@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -191,6 +193,14 @@ def campaign_manifest_from_mapping(data: object) -> CampaignManifest:
         defaults=_defaults_from_mapping(mapping["defaults"]),
         suites=_suites_from_sequence(mapping["suites"]),
     )
+
+
+def campaign_manifest_sha256(payload: dict[str, Any]) -> str:
+    """Hash a materialized campaign manifest with the verifier JSON contract."""
+
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode()
+    ).hexdigest()
 
 
 def _campaign_from_mapping(data: object) -> Campaign:

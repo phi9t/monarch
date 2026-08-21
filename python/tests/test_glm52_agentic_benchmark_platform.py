@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
+from ginkgo.eval.orchestrator import EvalRunStateError
+from ginkgo.eval.orchestrator import begin_campaign_materialization
+from ginkgo.eval.orchestrator import begin_campaign_summary
+from ginkgo.eval.orchestrator import begin_grading
+from ginkgo.eval.orchestrator import begin_suite_preparation
+from ginkgo.eval.orchestrator import begin_suite_summary
+from ginkgo.eval.orchestrator import begin_trial_generation
+from ginkgo.eval.orchestrator import complete_campaign_materialization
+from ginkgo.eval.orchestrator import complete_campaign_summary
+from ginkgo.eval.orchestrator import complete_grading
+from ginkgo.eval.orchestrator import complete_suite_preparation
+from ginkgo.eval.orchestrator import complete_suite_summary
+from ginkgo.eval.orchestrator import complete_trial_generation
+from ginkgo.eval.orchestrator import resume_eval_run_state
 from ginkgo.eval.manifest import CampaignManifestError
 from ginkgo.eval.manifest import campaign_manifest_from_mapping
+from ginkgo.eval.manifest import campaign_manifest_sha256
 from ginkgo.eval.manifest import load_campaign_manifest
 
 
@@ -155,3 +171,218 @@ def test_campaign_manifest_rejects_unknown_model_endpoint_ref() -> None:
         match="model_under_test.endpoint_ref must reference a declared endpoint",
     ):
         campaign_manifest_from_mapping(data)
+
+
+def test_campaign_manifest_sha256_uses_materialized_json_contract() -> None:
+    first = {"b": 2, "a": {"d": 4, "c": 3}}
+    second = {"a": {"c": 3, "d": 4}, "b": 2}
+
+    assert campaign_manifest_sha256(first) == campaign_manifest_sha256(second)
+
+
+def test_evalrun_state_records_artifact_bearing_transitions(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "run"
+
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id="agentic-pilot-001",
+        manifest_sha256="manifest-a",
+        mode="pilot",
+        suite_ids=["gsm8k"],
+    )
+    complete_campaign_materialization(
+        result_dir=result_dir,
+        artifacts=["benchmark-manifest.json", "environment.json"],
+    )
+    materialized = resume_eval_run_state(
+        result_dir=result_dir,
+        manifest_sha256="manifest-a",
+    )
+    assert materialized.campaign_materialization.status == "completed"
+    assert materialized.suite_preparation == {}
+
+    begin_suite_preparation(result_dir=result_dir, suite_id="gsm8k")
+    complete_suite_preparation(
+        result_dir=result_dir,
+        suite_id="gsm8k",
+        artifacts=["gsm8k/prepare.json"],
+    )
+    begin_trial_generation(result_dir=result_dir, suite_id="gsm8k", trials_total=5)
+    complete_trial_generation(
+        result_dir=result_dir,
+        suite_id="gsm8k",
+        artifacts=["gsm8k/samples.jsonl"],
+        trials_total=5,
+    )
+    begin_grading(result_dir=result_dir, suite_id="gsm8k")
+    complete_grading(
+        result_dir=result_dir,
+        suite_id="gsm8k",
+        artifacts=["gsm8k/metrics.json"],
+        trials_graded=5,
+    )
+    begin_suite_summary(result_dir=result_dir, suite_id="gsm8k")
+    complete_suite_summary(
+        result_dir=result_dir,
+        suite_id="gsm8k",
+        artifacts=["gsm8k/summary.json"],
+        status="passed",
+    )
+    begin_campaign_summary(result_dir=result_dir)
+    complete_campaign_summary(
+        result_dir=result_dir,
+        artifacts=["summary.json", "run.json"],
+        status="passed",
+    )
+
+    state = resume_eval_run_state(result_dir=result_dir, manifest_sha256="manifest-a")
+    assert state.manifest_sha256 == "manifest-a"
+    assert state.campaign_materialization.status == "completed"
+    assert state.suite_preparation["gsm8k"].status == "completed"
+    assert state.trial_generation["gsm8k"].trials_total == 5
+    assert state.grading["gsm8k"].trials_graded == 5
+    assert state.suite_summary["gsm8k"].status == "passed"
+    assert state.campaign_summary.status == "passed"
+
+    raw_state = (result_dir / "evalrun-state.json").read_text(encoding="utf-8")
+    assert raw_state.endswith("\n")
+    assert '"campaign_materialization"' in raw_state
+
+
+def test_evalrun_state_rejects_resume_when_manifest_hash_changes(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "run"
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id="agentic-pilot-001",
+        manifest_sha256="manifest-a",
+        mode="pilot",
+        suite_ids=["gsm8k"],
+    )
+
+    with pytest.raises(EvalRunStateError, match="manifest_sha256 mismatch"):
+        resume_eval_run_state(result_dir=result_dir, manifest_sha256="manifest-b")
+
+
+def test_evalrun_state_rejects_resume_when_identity_changes(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "run"
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id="agentic-pilot-001",
+        manifest_sha256="manifest-a",
+        mode="smoke",
+        suite_ids=["gsm8k"],
+    )
+
+    with pytest.raises(EvalRunStateError, match="run_id mismatch"):
+        resume_eval_run_state(
+            result_dir=result_dir,
+            manifest_sha256="manifest-a",
+            run_id="different-run",
+        )
+    with pytest.raises(EvalRunStateError, match="mode mismatch"):
+        resume_eval_run_state(
+            result_dir=result_dir,
+            manifest_sha256="manifest-a",
+            mode="calibration",
+        )
+    with pytest.raises(EvalRunStateError, match="suite_ids mismatch"):
+        resume_eval_run_state(
+            result_dir=result_dir,
+            manifest_sha256="manifest-a",
+            suite_ids=["aime"],
+        )
+
+
+def test_evalrun_state_resume_accepts_same_suite_set_in_different_order(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "run"
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id="agentic-pilot-001",
+        manifest_sha256="manifest-a",
+        mode="smoke",
+        suite_ids=["humaneval", "mbpp"],
+    )
+
+    state = resume_eval_run_state(
+        result_dir=result_dir,
+        manifest_sha256="manifest-a",
+        suite_ids=["mbpp", "humaneval"],
+    )
+
+    assert state.suite_ids == ["humaneval", "mbpp"]
+
+
+def test_evalrun_state_rejects_duplicate_suite_ids(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "run"
+    with pytest.raises(EvalRunStateError, match="suite_ids must not contain duplicates"):
+        begin_campaign_materialization(
+            result_dir=result_dir,
+            run_id="agentic-pilot-001",
+            manifest_sha256="manifest-a",
+            mode="smoke",
+            suite_ids=["humaneval", "humaneval"],
+        )
+
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id="agentic-pilot-001",
+        manifest_sha256="manifest-a",
+        mode="smoke",
+        suite_ids=["humaneval"],
+    )
+    state_path = result_dir / "evalrun-state.json"
+    payload = json.loads(state_path.read_text())
+    payload["suite_ids"] = ["humaneval", "humaneval"]
+    state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(EvalRunStateError, match="suite_ids must not contain duplicates"):
+        resume_eval_run_state(result_dir=result_dir, manifest_sha256="manifest-a")
+
+
+def test_evalrun_state_rejects_duplicate_current_suite_ids(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "run"
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id="agentic-pilot-001",
+        manifest_sha256="manifest-a",
+        mode="smoke",
+        suite_ids=["humaneval"],
+    )
+
+    with pytest.raises(EvalRunStateError, match="suite_ids must not contain duplicates"):
+        resume_eval_run_state(
+            result_dir=result_dir,
+            manifest_sha256="manifest-a",
+            suite_ids=["humaneval", "humaneval"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("contents", "match"),
+    [
+        (None, "invalid_artifact: missing evalrun state"),
+        ("not json", "invalid_artifact: malformed evalrun state"),
+        ("[]", "invalid_artifact: evalrun state must be a mapping"),
+    ],
+)
+def test_evalrun_state_treats_missing_or_malformed_state_as_invalid_artifact(
+    tmp_path: Path, contents: str | None, match: str
+) -> None:
+    result_dir = tmp_path / "run"
+    result_dir.mkdir()
+    if contents is not None:
+        (result_dir / "evalrun-state.json").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(EvalRunStateError, match=match):
+        resume_eval_run_state(result_dir=result_dir, manifest_sha256="manifest-a")

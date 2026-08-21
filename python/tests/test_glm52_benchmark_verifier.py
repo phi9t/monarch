@@ -90,6 +90,23 @@ SWEBENCH_SMOKE_IMAGE_DIGEST = (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_glm52_benchmark_verifier_script_help_runs_without_pythonpath() -> None:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(HELPER_PATH), "--help"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+
+
 class _JsonModelsResponse:
     def __enter__(self) -> "_JsonModelsResponse":
         return self
@@ -593,6 +610,7 @@ def test_write_fixture_benchmark_run_emits_required_artifacts(tmp_path: Path) ->
 
     result_dir = summary_path.parent
     assert (result_dir / "run.json").is_file()
+    assert (result_dir / "evalrun-state.json").is_file()
     assert (result_dir / "environment.json").is_file()
     assert (result_dir / "benchmark-manifest.json").is_file()
     assert (result_dir / "published-scores.json").is_file()
@@ -620,8 +638,18 @@ def test_write_fixture_benchmark_run_emits_required_artifacts(tmp_path: Path) ->
     assert archive_manifest["run_id"] == "smoke-test"
     assert archive_manifest["summary_status"] == "pass"
     assert archive_manifest["summary_path"] == "summary.json"
+    assert "evalrun-state.json" in archive_manifest["contract_artifacts"]
     assert "needle-smoke/samples.jsonl" in archive_manifest["contract_artifacts"]
     assert "needle-smoke/metrics.json" in archive_manifest["contract_artifacts"]
+    state = json.loads((result_dir / "evalrun-state.json").read_text())
+    run_record = json.loads((result_dir / "run.json").read_text())
+    assert state["manifest_sha256"] == run_record["manifest_sha256"]
+    assert state["campaign_materialization"]["status"] == "completed"
+    assert state["suite_preparation"]["needle-smoke"]["status"] == "completed"
+    assert state["trial_generation"]["needle-smoke"]["status"] == "completed"
+    assert state["grading"]["needle-smoke"]["status"] == "completed"
+    assert state["suite_summary"]["needle-smoke"]["status"] == "pass"
+    assert state["campaign_summary"]["status"] == "pass"
 
 
 def test_write_fixture_benchmark_run_records_serving_inputs(
@@ -1016,6 +1044,163 @@ def test_write_fixture_benchmark_run_resumes_completed_matching_suite(
     summary = json.loads(resumed_summary_path.read_text())
     assert summary["suites"][0]["suite"] == "ruler"
     assert summary["suites"][0]["tasks_passed"] == 1
+    state = json.loads((resumed_summary_path.parent / "evalrun-state.json").read_text())
+    assert state["trial_generation"]["ruler"] == {
+        "artifacts": ["ruler/samples.jsonl", "ruler/failures.jsonl"],
+        "status": "completed",
+        "trials_total": 1,
+    }
+
+
+def test_fixture_benchmark_run_rejects_stale_evalrun_state(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "suites": [
+            {
+                "id": "ruler",
+                "profile": "long-context",
+                "dataset_revision": "fixture-dataset",
+                "harness_revision": "fixture-harness",
+                "prompt_template": "ruler-v1",
+                "execution_backend": "bwrap_rootfs",
+                "decoding_profile": {"temperature": 0},
+                "metric": "exact_match",
+            }
+        ]
+    }
+    results_root = tmp_path / "results"
+    run_root = tmp_path / "run"
+
+    summary_path = write_fixture_benchmark_run(
+        results_root=results_root,
+        run_root=run_root,
+        run_id="resume-stale-state",
+        mode="smoke",
+        suite_ids=["ruler"],
+        manifest=manifest,
+        published_scores=None,
+        execution_backend="bwrap_rootfs",
+    )
+    state_path = summary_path.parent / "evalrun-state.json"
+    state = json.loads(state_path.read_text())
+    state["manifest_sha256"] = "different-manifest"
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(Exception, match="manifest_sha256 mismatch"):
+        write_fixture_benchmark_run(
+            results_root=results_root,
+            run_root=run_root,
+            run_id="resume-stale-state",
+            mode="smoke",
+            suite_ids=["ruler"],
+            manifest=manifest,
+            published_scores=None,
+            execution_backend="bwrap_rootfs",
+        )
+
+
+def test_fixture_benchmark_run_rejects_stale_evalrun_state_when_mode_changes(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "suites": [
+            {
+                "id": "ruler",
+                "profile": "long-context",
+                "dataset_revision": "fixture-dataset",
+                "harness_revision": "fixture-harness",
+                "prompt_template": "ruler-v1",
+                "execution_backend": "bwrap_rootfs",
+                "decoding_profile": {"temperature": 0},
+                "metric": "exact_match",
+            }
+        ]
+    }
+    results_root = tmp_path / "results"
+    run_root = tmp_path / "run"
+
+    summary_path = write_fixture_benchmark_run(
+        results_root=results_root,
+        run_root=run_root,
+        run_id="resume-stale-state-mode",
+        mode="smoke",
+        suite_ids=["ruler"],
+        manifest=manifest,
+        published_scores=None,
+        execution_backend="bwrap_rootfs",
+    )
+    state_path = summary_path.parent / "evalrun-state.json"
+    state = json.loads(state_path.read_text())
+    assert state["mode"] == "smoke"
+
+    with pytest.raises(Exception, match="mode mismatch"):
+        write_fixture_benchmark_run(
+            results_root=results_root,
+            run_root=run_root,
+            run_id="resume-stale-state-mode",
+            mode="calibration",
+            suite_ids=["ruler"],
+            manifest=manifest,
+            published_scores=None,
+            execution_backend="bwrap_rootfs",
+        )
+
+
+@pytest.mark.parametrize(
+    ("contents", "match"),
+    [
+        (None, "invalid_artifact: missing evalrun state"),
+        ("not json", "invalid_artifact: malformed evalrun state"),
+    ],
+)
+def test_fixture_benchmark_run_rejects_invalid_evalrun_state(
+    tmp_path: Path, contents: str | None, match: str
+) -> None:
+    manifest = {
+        "suites": [
+            {
+                "id": "ruler",
+                "profile": "long-context",
+                "dataset_revision": "fixture-dataset",
+                "harness_revision": "fixture-harness",
+                "prompt_template": "ruler-v1",
+                "execution_backend": "bwrap_rootfs",
+                "decoding_profile": {"temperature": 0},
+                "metric": "exact_match",
+            }
+        ]
+    }
+    results_root = tmp_path / "results"
+    run_root = tmp_path / "run"
+
+    summary_path = write_fixture_benchmark_run(
+        results_root=results_root,
+        run_root=run_root,
+        run_id="resume-invalid-state",
+        mode="smoke",
+        suite_ids=["ruler"],
+        manifest=manifest,
+        published_scores=None,
+        execution_backend="bwrap_rootfs",
+    )
+    state_path = summary_path.parent / "evalrun-state.json"
+    if contents is None:
+        state_path.unlink()
+    else:
+        state_path.write_text(contents)
+
+    with pytest.raises(Exception, match=match):
+        write_fixture_benchmark_run(
+            results_root=results_root,
+            run_root=run_root,
+            run_id="resume-invalid-state",
+            mode="smoke",
+            suite_ids=["ruler"],
+            manifest=manifest,
+            published_scores=None,
+            execution_backend="bwrap_rootfs",
+        )
 
 
 def test_fixture_benchmark_run_does_not_resume_stale_metrics_schema(
@@ -1086,7 +1271,7 @@ def test_fixture_benchmark_run_does_not_resume_stale_metrics_schema(
     assert regenerated_metrics["prompt_template"] == "ruler-v1"
 
 
-def test_fixture_benchmark_run_does_not_resume_when_mode_changes(
+def test_fixture_benchmark_run_rejects_existing_evalrun_state_when_mode_changes(
     tmp_path: Path,
 ) -> None:
     manifest = {
@@ -1119,21 +1304,18 @@ def test_fixture_benchmark_run_does_not_resume_when_mode_changes(
     sample_path = summary_path.parent / "ruler" / "samples.jsonl"
     sample_path.write_text(sample_path.read_text().replace("fixture pass", "stale pass"))
 
-    calibration_summary_path = write_fixture_benchmark_run(
-        results_root=results_root,
-        run_root=run_root,
-        run_id="resume-mode-change",
-        mode="calibration",
-        suite_ids=["ruler"],
-        manifest=manifest,
-        published_scores=None,
-        execution_backend="bwrap_rootfs",
-    )
-
-    assert "stale pass" not in sample_path.read_text()
-    run_record = json.loads((calibration_summary_path.parent / "run.json").read_text())
-    assert run_record["mode"] == "calibration"
-    assert run_record["suites"][0]["status"] == "completed"
+    with pytest.raises(Exception, match="mode mismatch"):
+        write_fixture_benchmark_run(
+            results_root=results_root,
+            run_root=run_root,
+            run_id="resume-mode-change",
+            mode="calibration",
+            suite_ids=["ruler"],
+            manifest=manifest,
+            published_scores=None,
+            execution_backend="bwrap_rootfs",
+        )
+    assert "stale pass" in sample_path.read_text()
 
 
 def test_static_math_extractors_follow_gsm8k_and_aime_contracts() -> None:
@@ -1388,6 +1570,7 @@ def test_humaneval_single_suite_real_adapter_uses_responses_endpoint(
         "environment.json",
         "benchmark-manifest.json",
         "run.json",
+        "evalrun-state.json",
         "summary.json",
         "archive-manifest.json",
     ]:
@@ -1606,6 +1789,7 @@ def test_mbpp_single_suite_real_adapter_uses_responses_endpoint(
         "environment.json",
         "benchmark-manifest.json",
         "run.json",
+        "evalrun-state.json",
         "summary.json",
         "archive-manifest.json",
     ]:
@@ -1859,6 +2043,7 @@ def test_gsm8k_single_suite_real_adapter_uses_responses_endpoint(
         "environment.json",
         "benchmark-manifest.json",
         "run.json",
+        "evalrun-state.json",
         "summary.json",
     }
 
@@ -4939,6 +5124,15 @@ def test_write_harbor_environment_failure_records_classified_summary(
     assert environment["responses_base_url"] == "http://host.docker.internal:8080/v1"
     assert environment["local_host_route"] == "host.docker.internal"
     assert environment["local_container_runtime"] == "docker"
+    state = json.loads((summary_path.parent / "evalrun-state.json").read_text())
+    assert state["campaign_materialization"]["status"] == "completed"
+    assert state["trial_generation"]["terminal-bench-2"]["status"] == "completed"
+    assert state["grading"]["terminal-bench-2"]["status"] == "completed"
+    assert (
+        state["suite_summary"]["terminal-bench-2"]["status"]
+        == "environment_setup_failed"
+    )
+    assert state["campaign_summary"]["status"] == "environment_setup_failed"
     archive_manifest = json.loads(
         (summary_path.parent / "archive-manifest.json").read_text()
     )
@@ -4946,6 +5140,7 @@ def test_write_harbor_environment_failure_records_classified_summary(
     assert "run.json" in archive_manifest["contract_artifacts"]
     assert "environment.json" in archive_manifest["contract_artifacts"]
     assert "benchmark-manifest.json" in archive_manifest["contract_artifacts"]
+    assert "evalrun-state.json" in archive_manifest["contract_artifacts"]
     assert "harbor/trials.jsonl" in archive_manifest["contract_artifacts"]
     assert (
         "harbor/configs/terminal-bench-2-smoke.yaml"
@@ -5683,8 +5878,15 @@ def test_terminal_bench_smoke_invokes_harbor_and_archives_trials(
     assert archive_manifest["summary_status"] == "pass"
     assert "environment.json" in archive_manifest["contract_artifacts"]
     assert "benchmark-manifest.json" in archive_manifest["contract_artifacts"]
+    assert "evalrun-state.json" in archive_manifest["contract_artifacts"]
     assert "harbor/trials.jsonl" in archive_manifest["contract_artifacts"]
     assert "harbor/artifacts/trial-1.json" in archive_manifest["contract_artifacts"]
+    state = json.loads((result_dir / "evalrun-state.json").read_text())
+    assert state["campaign_materialization"]["status"] == "completed"
+    assert state["trial_generation"]["terminal-bench-2"]["status"] == "completed"
+    assert state["grading"]["terminal-bench-2"]["status"] == "completed"
+    assert state["suite_summary"]["terminal-bench-2"]["status"] == "pass"
+    assert state["campaign_summary"]["status"] == "pass"
     final_run_state = json.loads(
         (tmp_path / "run" / "benchmark-tbench2-harbor-pass.json").read_text()
     )
@@ -7691,8 +7893,15 @@ def test_ruler_single_suite_real_adapter_uses_responses_endpoint(
         "environment.json",
         "benchmark-manifest.json",
         "run.json",
+        "evalrun-state.json",
         "summary.json",
     }
+    state = json.loads((result_dir / "evalrun-state.json").read_text())
+    assert state["campaign_materialization"]["status"] == "completed"
+    assert state["trial_generation"]["ruler"]["status"] == "completed"
+    assert state["grading"]["ruler"]["status"] == "completed"
+    assert state["suite_summary"]["ruler"]["status"] == "pass"
+    assert state["campaign_summary"]["status"] == "pass"
 
 
 def test_ruler_single_suite_real_adapter_classifies_responses_failure(
@@ -7828,6 +8037,59 @@ def test_ruler_single_suite_real_adapter_rejects_missing_cache_sample(
 
     assert fake_responses_server.requests == []
     assert not (tmp_path / "results" / "ruler-missing-cache" / "ruler").exists()
+
+
+def test_ruler_single_suite_real_adapter_rejects_stale_state_before_endpoint_call(
+    tmp_path: Path,
+    fake_responses_server: object,
+) -> None:
+    manifest_path = _write_ruler_cache_and_manifest(tmp_path)
+    result_dir = tmp_path / "results" / "ruler-stale-state"
+    result_dir.mkdir(parents=True)
+    (result_dir / "evalrun-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": "different-run",
+                "mode": "smoke",
+                "manifest_sha256": "different-manifest",
+                "suite_ids": ["ruler"],
+                "campaign_materialization": {"status": "running", "artifacts": []},
+                "suite_preparation": {},
+                "trial_generation": {},
+                "grading": {},
+                "suite_summary": {},
+                "campaign_summary": {"status": "running", "artifacts": []},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    args = build_parser().parse_args(
+        [
+            "smoke",
+            "--suite",
+            "ruler",
+            "--manifest",
+            str(manifest_path),
+            "--execution-backend",
+            "bwrap_rootfs",
+            "--responses-base-url",
+            fake_responses_server.url,
+            "--run-id",
+            "ruler-stale-state",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-root",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    with pytest.raises(glm52_benchmark_verifier.BenchmarkVerifierError, match="mismatch"):
+        args.func(args)
+
+    assert fake_responses_server.requests == []
 
 
 def test_ruler_mixed_smoke_stays_on_fixture_path(
@@ -9763,13 +10025,23 @@ def test_write_bwrap_codegen_smoke_run_records_task_roots(
     assert (result_dir / "run.json").is_file()
     assert (result_dir / "environment.json").is_file()
     assert (result_dir / "benchmark-manifest.json").is_file()
+    assert (result_dir / "evalrun-state.json").is_file()
     run_record = json.loads((result_dir / "run.json").read_text())
     assert run_record["status"] == "completed"
     assert {suite["id"] for suite in run_record["suites"]} == {"humaneval", "mbpp"}
+    state = json.loads((result_dir / "evalrun-state.json").read_text())
+    assert state["campaign_materialization"]["status"] == "completed"
+    assert set(state["suite_ids"]) == {"humaneval", "mbpp"}
+    assert state["trial_generation"]["humaneval"]["status"] == "completed"
+    assert state["trial_generation"]["mbpp"]["status"] == "completed"
+    assert state["grading"]["humaneval"]["status"] == "completed"
+    assert state["grading"]["mbpp"]["status"] == "completed"
+    assert state["campaign_summary"]["status"] == "pass"
     archive_manifest = json.loads((result_dir / "archive-manifest.json").read_text())
     assert "run.json" in archive_manifest["contract_artifacts"]
     assert "environment.json" in archive_manifest["contract_artifacts"]
     assert "benchmark-manifest.json" in archive_manifest["contract_artifacts"]
+    assert "evalrun-state.json" in archive_manifest["contract_artifacts"]
     cleanup = json.loads(
         (tmp_path / "run" / "cleanup-code-bwrap-smoke.json").read_text()
     )
@@ -9918,6 +10190,65 @@ def test_bwrap_codegen_smoke_command_writes_summary_for_runner_failure(
     assert failure["state"] == "environment_crashed"
     assert failure["failure_category"] == "infrastructure"
     assert "bwrap rootfs is not built" in failure["stderr"]
+
+
+def test_bwrap_codegen_smoke_command_rejects_stale_state_before_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = tmp_path / "benchmark-manifest.yaml"
+    _write_humaneval_manifest(manifest_path)
+    result_dir = tmp_path / "results" / "codegen-stale-state"
+    result_dir.mkdir(parents=True)
+    (result_dir / "evalrun-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": "different-run",
+                "mode": "smoke",
+                "manifest_sha256": "different-manifest",
+                "suite_ids": ["humaneval"],
+                "campaign_materialization": {"status": "running", "artifacts": []},
+                "suite_preparation": {},
+                "trial_generation": {},
+                "grading": {},
+                "suite_summary": {},
+                "campaign_summary": {"status": "running", "artifacts": []},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    def fail_if_runner_starts(
+        *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("bwrap runner started before EvalRun state validation")
+
+    monkeypatch.setattr(glm52_benchmark_verifier.subprocess, "run", fail_if_runner_starts)
+    args = build_parser().parse_args(
+        [
+            "smoke",
+            "--suite",
+            "humaneval",
+            "--manifest",
+            str(manifest_path),
+            "--pool",
+            "code_sandbox",
+            "--execution-backend",
+            "bwrap_rootfs",
+            "--run-id",
+            "codegen-stale-state",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-root",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    with pytest.raises(glm52_benchmark_verifier.BenchmarkVerifierError, match="mismatch"):
+        args.func(args)
 
 
 def test_bwrap_codegen_smoke_command_preserves_runner_latency(

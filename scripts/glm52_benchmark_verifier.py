@@ -26,7 +26,27 @@ from pathlib import Path
 from typing import Any
 from typing import Literal
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import yaml
+
+from ginkgo.eval.manifest import campaign_manifest_sha256
+from ginkgo.eval.orchestrator import EvalRunStateError
+from ginkgo.eval.orchestrator import begin_campaign_materialization
+from ginkgo.eval.orchestrator import begin_campaign_summary
+from ginkgo.eval.orchestrator import begin_grading
+from ginkgo.eval.orchestrator import begin_suite_preparation
+from ginkgo.eval.orchestrator import begin_suite_summary
+from ginkgo.eval.orchestrator import begin_trial_generation
+from ginkgo.eval.orchestrator import complete_campaign_materialization
+from ginkgo.eval.orchestrator import complete_campaign_summary
+from ginkgo.eval.orchestrator import complete_grading
+from ginkgo.eval.orchestrator import complete_suite_preparation
+from ginkgo.eval.orchestrator import complete_suite_summary
+from ginkgo.eval.orchestrator import complete_trial_generation
+from ginkgo.eval.orchestrator import resume_eval_run_state
 
 
 DEFAULT_RESULTS_ROOT = Path("glm52-benchmark-results")
@@ -936,6 +956,13 @@ def write_conformance_validation_artifact(
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     manifest_sha256 = _json_sha256(manifest)
     published_scores_sha256 = _json_sha256(published_scores)
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode="conformance",
+        manifest=manifest,
+        suite_ids=[suite["id"] for suite in selected],
+    )
     (result_dir / "benchmark-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -1013,6 +1040,32 @@ def write_conformance_validation_artifact(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
+    for suite in selected:
+        _begin_evalrun_suite(result_dir, suite["id"])
+        _complete_evalrun_trial_generation(
+            result_dir=result_dir,
+            suite_dir=result_dir,
+            suite_id=suite["id"],
+            tasks_total=1,
+            samples_artifacts=["conformance.json"],
+        )
+        _begin_evalrun_grading(result_dir, suite["id"])
+        _complete_evalrun_suite(
+            result_dir=result_dir,
+            suite_dir=result_dir,
+            suite_id=suite["id"],
+            tasks_graded=1,
+            status="validated",
+            metrics_artifacts=["conformance.json"],
+            summary_artifacts=["conformance.json"],
+        )
+    _begin_evalrun_campaign_summary(result_dir)
+    _complete_evalrun_campaign_summary(
+        result_dir=result_dir,
+        status="validated",
+        artifacts=["conformance.json", "run.json"],
+    )
     write_archive_manifest(result_dir=result_dir, summary=payload, summary_path="conformance.json")
     return path
 
@@ -1036,6 +1089,17 @@ def write_prepare_artifact(
         validate_suite_fields(suite)
     result_dir = results_root / run_id
     result_dir.mkdir(parents=True, exist_ok=True)
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode="prepare",
+        manifest=manifest,
+        suite_ids=[
+            suite["id"]
+            for suite in manifest["suites"]
+            if isinstance(suite, dict) and isinstance(suite.get("id"), str)
+        ],
+    )
     endpoint_preflight = endpoint_results or []
     tool_preflight = tool_results or []
     gold_path_preflight = gold_path_results or []
@@ -1097,6 +1161,32 @@ def write_prepare_artifact(
             sort_keys=True,
         )
         + "\n"
+    )
+    _complete_evalrun_materialization(result_dir)
+    for suite_id in payload["suites"]:
+        _begin_evalrun_suite(result_dir, suite_id)
+        _complete_evalrun_trial_generation(
+            result_dir=result_dir,
+            suite_dir=result_dir,
+            suite_id=suite_id,
+            tasks_total=1,
+            samples_artifacts=["prepare.json"],
+        )
+        _begin_evalrun_grading(result_dir, suite_id)
+        _complete_evalrun_suite(
+            result_dir=result_dir,
+            suite_dir=result_dir,
+            suite_id=suite_id,
+            tasks_graded=1,
+            status="prepared",
+            metrics_artifacts=["prepare.json"],
+            summary_artifacts=["prepare.json"],
+        )
+    _begin_evalrun_campaign_summary(result_dir)
+    _complete_evalrun_campaign_summary(
+        result_dir=result_dir,
+        status="prepared",
+        artifacts=["prepare.json", "run.json"],
     )
     write_archive_manifest(
         result_dir=result_dir,
@@ -1866,6 +1956,13 @@ def write_fixture_benchmark_run(
         and previous_run.get("published_scores_sha256") == published_scores_sha256
         and previous_run.get("mode") == mode
     )
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=[suite["id"] for suite in selected],
+    )
     (result_dir / "environment.json").write_text(
         json.dumps(
             {
@@ -1927,6 +2024,10 @@ def write_fixture_benchmark_run(
         created_at=created_at,
         result_dir=result_dir,
     )
+    (result_dir / "run.json").write_text(
+        json.dumps(run_record, indent=2, sort_keys=True) + "\n"
+    )
+    _complete_evalrun_materialization(result_dir)
 
     summaries = []
     suite_records = []
@@ -1936,7 +2037,14 @@ def write_fixture_benchmark_run(
         if can_resume_run and _fixture_suite_complete(suite_dir, suite["id"]):
             metrics = _read_json_object(suite_dir / "metrics.json")
             suite_status = "resumed"
+            _complete_evalrun_trial_generation(
+                result_dir=result_dir,
+                suite_dir=suite_dir,
+                suite_id=suite["id"],
+                tasks_total=metrics["tasks_total"],
+            )
         else:
+            _begin_evalrun_suite(result_dir, suite["id"])
             samples = _fixture_samples(
                 run_id,
                 suite,
@@ -1950,6 +2058,13 @@ def write_fixture_benchmark_run(
             )
             (suite_dir / "failures.jsonl").write_text("")
             passed_count = sum(1 for sample in samples if sample["passed"])
+            _complete_evalrun_trial_generation(
+                result_dir=result_dir,
+                suite_dir=suite_dir,
+                suite_id=suite["id"],
+                tasks_total=len(samples),
+            )
+            _begin_evalrun_grading(result_dir, suite["id"])
             metrics = {
                 "schema_version": 1,
                 "suite": suite["id"],
@@ -1966,6 +2081,13 @@ def write_fixture_benchmark_run(
                 json.dumps(metrics, indent=2, sort_keys=True) + "\n"
             )
             suite_status = "completed"
+        _complete_evalrun_suite(
+            result_dir=result_dir,
+            suite_dir=suite_dir,
+            suite_id=suite["id"],
+            tasks_graded=metrics["tasks_total"],
+            status="pass" if metrics["model_failures"] == 0 else "fail",
+        )
         summaries.append(metrics)
         suite_records.append(
             {
@@ -1986,6 +2108,7 @@ def write_fixture_benchmark_run(
         "suites": summaries,
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = suite_records
@@ -1996,6 +2119,7 @@ def write_fixture_benchmark_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -2249,6 +2373,13 @@ def write_needle_smoke_responses_run(
     suite_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
 
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=["needle-smoke"],
+    )
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     (result_dir / "environment.json").write_text(
         json.dumps(
@@ -2305,7 +2436,9 @@ def write_needle_smoke_responses_run(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
 
+    _begin_evalrun_suite(result_dir, "needle-smoke")
     samples = _needle_smoke_responses_samples(
         run_id=run_id,
         suite=suite,
@@ -2323,6 +2456,13 @@ def write_needle_smoke_responses_run(
 
     tasks_total = len(samples)
     tasks_passed = sum(1 for sample in samples if sample["passed"])
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="needle-smoke",
+        tasks_total=tasks_total,
+    )
+    _begin_evalrun_grading(result_dir, "needle-smoke")
     model_failures = sum(
         1
         for sample in samples
@@ -2348,6 +2488,13 @@ def write_needle_smoke_responses_run(
     (suite_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="needle-smoke",
+        tasks_graded=tasks_total,
+        status=_benchmark_status([metrics]),
+    )
 
     summary = {
         "schema_version": 1,
@@ -2363,6 +2510,7 @@ def write_needle_smoke_responses_run(
         "suites": [metrics],
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = [
@@ -2381,6 +2529,7 @@ def write_needle_smoke_responses_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -2411,6 +2560,13 @@ def write_gsm8k_responses_run(
     suite_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
 
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=["gsm8k"],
+    )
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     (result_dir / "environment.json").write_text(
         json.dumps(
@@ -2468,6 +2624,8 @@ def write_gsm8k_responses_run(
         result_dir=result_dir,
     )
 
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, "gsm8k")
     sample = _gsm8k_responses_sample(
         run_id=run_id,
         suite=suite,
@@ -2488,6 +2646,13 @@ def write_gsm8k_responses_run(
 
     tasks_total = len(samples)
     tasks_passed = sum(1 for sample in samples if sample["passed"])
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="gsm8k",
+        tasks_total=tasks_total,
+    )
+    _begin_evalrun_grading(result_dir, "gsm8k")
     model_failures = sum(
         1
         for sample in samples
@@ -2513,6 +2678,13 @@ def write_gsm8k_responses_run(
     (suite_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="gsm8k",
+        tasks_graded=tasks_total,
+        status=_benchmark_status([metrics]),
+    )
 
     summary = {
         "schema_version": 1,
@@ -2528,6 +2700,7 @@ def write_gsm8k_responses_run(
         "suites": [metrics],
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = [
@@ -2546,6 +2719,7 @@ def write_gsm8k_responses_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -2576,6 +2750,13 @@ def write_aime_responses_run(
     suite_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
 
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=["aime"],
+    )
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     (result_dir / "environment.json").write_text(
         json.dumps(
@@ -2633,6 +2814,8 @@ def write_aime_responses_run(
         result_dir=result_dir,
     )
 
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, "aime")
     sample = _aime_responses_sample(
         run_id=run_id,
         suite=suite,
@@ -2653,6 +2836,13 @@ def write_aime_responses_run(
 
     tasks_total = len(samples)
     tasks_passed = sum(1 for sample in samples if sample["passed"])
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="aime",
+        tasks_total=tasks_total,
+    )
+    _begin_evalrun_grading(result_dir, "aime")
     model_failures = sum(
         1
         for sample in samples
@@ -2678,6 +2868,13 @@ def write_aime_responses_run(
     (suite_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="aime",
+        tasks_graded=tasks_total,
+        status=_benchmark_status([metrics]),
+    )
 
     summary = {
         "schema_version": 1,
@@ -2693,6 +2890,7 @@ def write_aime_responses_run(
         "suites": [metrics],
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = [
@@ -2711,6 +2909,7 @@ def write_aime_responses_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -2742,6 +2941,13 @@ def write_humaneval_responses_run(
     run_root.mkdir(parents=True, exist_ok=True)
 
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=["humaneval"],
+    )
     (result_dir / "environment.json").write_text(
         json.dumps(
             {
@@ -2797,6 +3003,8 @@ def write_humaneval_responses_run(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, "humaneval")
 
     sample = _humaneval_responses_sample(
         run_id=run_id,
@@ -2814,6 +3022,12 @@ def write_humaneval_responses_run(
     failures = [sample for sample in samples if not sample["passed"]]
     (suite_dir / "failures.jsonl").write_text(
         "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in failures)
+    )
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="humaneval",
+        tasks_total=len(samples),
     )
 
     tasks_total = len(samples)
@@ -2846,6 +3060,7 @@ def write_humaneval_responses_run(
         "pass_at_1": None,
     }
     metrics.update(_suite_condition_fields(suite, execution_backend))
+    _begin_evalrun_grading(result_dir, "humaneval")
     (suite_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
@@ -2873,6 +3088,7 @@ def write_humaneval_responses_run(
         "suites": [metrics],
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = [
@@ -2891,6 +3107,18 @@ def write_humaneval_responses_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="humaneval",
+        tasks_graded=tasks_total,
+        status=summary["status"],
+        summary_artifacts=[
+            str((suite_dir / "metrics.json").relative_to(result_dir)),
+            str((suite_dir / "official-harness.json").relative_to(result_dir)),
+        ],
+    )
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -2922,6 +3150,13 @@ def write_mbpp_responses_run(
     run_root.mkdir(parents=True, exist_ok=True)
 
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=["mbpp"],
+    )
     (result_dir / "environment.json").write_text(
         json.dumps(
             {
@@ -2977,6 +3212,8 @@ def write_mbpp_responses_run(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, "mbpp")
 
     sample = _mbpp_responses_sample(
         run_id=run_id,
@@ -2994,6 +3231,12 @@ def write_mbpp_responses_run(
     failures = [sample for sample in samples if not sample["passed"]]
     (suite_dir / "failures.jsonl").write_text(
         "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in failures)
+    )
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="mbpp",
+        tasks_total=len(samples),
     )
 
     tasks_total = len(samples)
@@ -3026,6 +3269,7 @@ def write_mbpp_responses_run(
         "pass_at_1": None,
     }
     metrics.update(_suite_condition_fields(suite, execution_backend))
+    _begin_evalrun_grading(result_dir, "mbpp")
     (suite_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
@@ -3053,6 +3297,7 @@ def write_mbpp_responses_run(
         "suites": [metrics],
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = [
@@ -3071,6 +3316,18 @@ def write_mbpp_responses_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="mbpp",
+        tasks_graded=tasks_total,
+        status=summary["status"],
+        summary_artifacts=[
+            str((suite_dir / "metrics.json").relative_to(result_dir)),
+            str((suite_dir / "official-harness.json").relative_to(result_dir)),
+        ],
+    )
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -3095,24 +3352,19 @@ def write_ruler_responses_run(
             f"suite {suite['id']} requires backend {suite['execution_backend']}"
         )
 
-    sample = _ruler_responses_sample(
-        run_id=run_id,
-        suite=suite,
-        execution_backend=execution_backend,
-        responses_base_url=responses_base_url,
-        model=str(manifest.get("model", "")),
-        dataset_cache_root=run_root.parent / "benchmarks",
-        prepare_artifact_path=results_root / "prepare" / "prepare.json",
-    )
-    samples = [sample]
-
     result_dir = results_root / run_id
     suite_dir = result_dir / "ruler"
     result_dir.mkdir(parents=True, exist_ok=True)
-    suite_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
 
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode=mode,
+        manifest=manifest,
+        suite_ids=["ruler"],
+    )
     (result_dir / "environment.json").write_text(
         json.dumps(
             {
@@ -3168,6 +3420,21 @@ def write_ruler_responses_run(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, "ruler")
+
+    sample = _ruler_responses_sample(
+        run_id=run_id,
+        suite=suite,
+        execution_backend=execution_backend,
+        responses_base_url=responses_base_url,
+        model=str(manifest.get("model", "")),
+        dataset_cache_root=run_root.parent / "benchmarks",
+        prepare_artifact_path=results_root / "prepare" / "prepare.json",
+    )
+    samples = [sample]
+
+    suite_dir.mkdir(parents=True, exist_ok=True)
 
     (suite_dir / "samples.jsonl").write_text(
         "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples)
@@ -3175,6 +3442,12 @@ def write_ruler_responses_run(
     failures = [sample for sample in samples if not sample["passed"]]
     (suite_dir / "failures.jsonl").write_text(
         "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in failures)
+    )
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="ruler",
+        tasks_total=len(samples),
     )
 
     tasks_total = len(samples)
@@ -3201,6 +3474,7 @@ def write_ruler_responses_run(
         "score": tasks_passed / tasks_total,
     }
     metrics.update(_suite_condition_fields(suite, execution_backend))
+    _begin_evalrun_grading(result_dir, "ruler")
     (suite_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
@@ -3219,6 +3493,7 @@ def write_ruler_responses_run(
         "suites": [metrics],
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = [
@@ -3237,6 +3512,14 @@ def write_ruler_responses_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=suite_dir,
+        suite_id="ruler",
+        tasks_graded=tasks_total,
+        status=summary["status"],
+    )
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -3949,28 +4232,26 @@ def _responses_output_text(response: dict[str, Any]) -> str:
     raise BenchmarkVerifierError("Responses endpoint returned no output text")
 
 
-def write_bwrap_codegen_smoke_run(
+def _materialize_bwrap_codegen_evalrun(
     *,
     results_root: Path,
     run_root: Path,
     run_id: str,
     suite_ids: list[str],
     manifest: dict[str, Any],
-    task_results: list[dict[str, Any]],
-) -> Path:
-    selected = select_suites(manifest, suite_ids)
-    selected_ids = {suite["id"] for suite in selected}
-    for suite in selected:
-        validate_suite_fields(suite)
-        if suite["execution_backend"] != "bwrap_rootfs":
-            raise BenchmarkVerifierError(
-                f"suite {suite['id']} requires backend {suite['execution_backend']}"
-            )
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     result_dir = results_root / run_id
     result_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
 
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode="smoke",
+        manifest=manifest,
+        suite_ids=suite_ids,
+    )
     (result_dir / "environment.json").write_text(
         json.dumps(
             {
@@ -4022,6 +4303,34 @@ def write_bwrap_codegen_smoke_run(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
+    return result_dir, run_record, cleanup
+
+
+def write_bwrap_codegen_smoke_run(
+    *,
+    results_root: Path,
+    run_root: Path,
+    run_id: str,
+    suite_ids: list[str],
+    manifest: dict[str, Any],
+    task_results: list[dict[str, Any]],
+) -> Path:
+    selected = select_suites(manifest, suite_ids)
+    selected_ids = {suite["id"] for suite in selected}
+    for suite in selected:
+        validate_suite_fields(suite)
+        if suite["execution_backend"] != "bwrap_rootfs":
+            raise BenchmarkVerifierError(
+                f"suite {suite['id']} requires backend {suite['execution_backend']}"
+            )
+    result_dir, run_record, cleanup = _materialize_bwrap_codegen_evalrun(
+        results_root=results_root,
+        run_root=run_root,
+        run_id=run_id,
+        suite_ids=suite_ids,
+        manifest=manifest,
+    )
     summaries = []
     suite_records = []
     for suite_id in suite_ids:
@@ -4030,6 +4339,7 @@ def write_bwrap_codegen_smoke_run(
             raise BenchmarkVerifierError(f"missing bwrap task result for suite: {suite_id}")
         suite_dir = result_dir / suite_id
         suite_dir.mkdir(parents=True, exist_ok=True)
+        _begin_evalrun_suite(result_dir, suite_id)
         sample_lines = []
         failure_lines = []
         suite = _suite_by_id(selected, suite_id)
@@ -4090,6 +4400,12 @@ def write_bwrap_codegen_smoke_run(
         (suite_dir / "failures.jsonl").write_text(
             ("\n".join(failure_lines) + "\n") if failure_lines else ""
         )
+        _complete_evalrun_trial_generation(
+            result_dir=result_dir,
+            suite_dir=suite_dir,
+            suite_id=suite_id,
+            tasks_total=len(suite_results),
+        )
         passed_count = sum(1 for result in suite_results if result.get("passed"))
         model_failures = sum(
             1
@@ -4115,8 +4431,16 @@ def write_bwrap_codegen_smoke_run(
             "score": passed_count / len(suite_results),
         }
         metrics.update(_suite_condition_fields(suite, "bwrap_rootfs"))
+        _begin_evalrun_grading(result_dir, suite_id)
         (suite_dir / "metrics.json").write_text(
             json.dumps(metrics, indent=2, sort_keys=True) + "\n"
+        )
+        _complete_evalrun_suite(
+            result_dir=result_dir,
+            suite_dir=suite_dir,
+            suite_id=suite_id,
+            tasks_graded=metrics["tasks_total"],
+            status=_benchmark_status([metrics]),
         )
         summaries.append(metrics)
         suite_records.append(
@@ -4141,6 +4465,7 @@ def write_bwrap_codegen_smoke_run(
         "suites": summaries,
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record["status"] = "completed"
     run_record["suites"] = suite_records
@@ -4151,6 +4476,7 @@ def write_bwrap_codegen_smoke_run(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=summary["status"])
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -4214,7 +4540,184 @@ def _benchmark_status(summaries: list[dict[str, Any]]) -> str:
 
 
 def _json_sha256(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return campaign_manifest_sha256(payload)
+
+
+def _begin_evalrun_state(
+    *,
+    result_dir: Path,
+    run_id: str,
+    mode: str,
+    manifest: dict[str, Any],
+    suite_ids: list[str],
+) -> bool:
+    manifest_sha256 = _json_sha256(manifest)
+    if _result_dir_has_artifacts(result_dir):
+        try:
+            resume_eval_run_state(
+                result_dir=result_dir,
+                manifest_sha256=manifest_sha256,
+                run_id=run_id,
+                mode=mode,
+                suite_ids=suite_ids,
+            )
+        except EvalRunStateError as error:
+            raise BenchmarkVerifierError(str(error)) from error
+        return True
+    begin_campaign_materialization(
+        result_dir=result_dir,
+        run_id=run_id,
+        manifest_sha256=manifest_sha256,
+        mode=mode,
+        suite_ids=suite_ids,
+    )
+    return False
+
+
+def _result_dir_has_artifacts(result_dir: Path) -> bool:
+    if not result_dir.exists():
+        return False
+    return any(path.is_file() for path in result_dir.rglob("*"))
+
+
+def _complete_evalrun_materialization(result_dir: Path) -> None:
+    complete_campaign_materialization(
+        result_dir=result_dir,
+        artifacts=["benchmark-manifest.json", "environment.json", "run.json"],
+    )
+
+
+def _begin_evalrun_suite(result_dir: Path, suite_id: str) -> None:
+    begin_suite_preparation(result_dir=result_dir, suite_id=suite_id)
+    complete_suite_preparation(
+        result_dir=result_dir,
+        suite_id=suite_id,
+        artifacts=[],
+    )
+    begin_trial_generation(
+        result_dir=result_dir,
+        suite_id=suite_id,
+        trials_total=0,
+    )
+
+
+def _complete_evalrun_trial_generation(
+    *,
+    result_dir: Path,
+    suite_dir: Path,
+    suite_id: str,
+    tasks_total: int,
+    samples_artifacts: list[str] | None = None,
+) -> None:
+    if samples_artifacts is None:
+        samples_artifacts = [
+            str((suite_dir / "samples.jsonl").relative_to(result_dir)),
+            str((suite_dir / "failures.jsonl").relative_to(result_dir)),
+        ]
+    complete_trial_generation(
+        result_dir=result_dir,
+        suite_id=suite_id,
+        artifacts=samples_artifacts,
+        trials_total=tasks_total,
+    )
+
+
+def _begin_evalrun_grading(result_dir: Path, suite_id: str) -> None:
+    begin_grading(result_dir=result_dir, suite_id=suite_id)
+
+
+def _complete_evalrun_suite(
+    *,
+    result_dir: Path,
+    suite_dir: Path,
+    suite_id: str,
+    tasks_graded: int,
+    status: str,
+    metrics_artifacts: list[str] | None = None,
+    summary_artifacts: list[str] | None = None,
+) -> None:
+    if metrics_artifacts is None:
+        metrics_artifacts = [str((suite_dir / "metrics.json").relative_to(result_dir))]
+    if summary_artifacts is None:
+        summary_artifacts = metrics_artifacts
+    complete_grading(
+        result_dir=result_dir,
+        suite_id=suite_id,
+        artifacts=metrics_artifacts,
+        trials_graded=tasks_graded,
+    )
+    begin_suite_summary(result_dir=result_dir, suite_id=suite_id)
+    complete_suite_summary(
+        result_dir=result_dir,
+        suite_id=suite_id,
+        artifacts=summary_artifacts,
+        status=status,
+    )
+
+
+def _begin_evalrun_campaign_summary(result_dir: Path) -> None:
+    begin_campaign_summary(result_dir=result_dir)
+
+
+def _complete_evalrun_campaign_summary(
+    *,
+    result_dir: Path,
+    status: str,
+    artifacts: list[str] | None = None,
+) -> None:
+    if artifacts is None:
+        artifacts = ["summary.json", "run.json"]
+    complete_campaign_summary(
+        result_dir=result_dir,
+        artifacts=artifacts,
+        status=status,
+    )
+
+
+def _harbor_evalrun_manifest(
+    *,
+    manifest: dict[str, Any] | None,
+    suite_id: str,
+    smoke_config: dict[str, Any],
+) -> dict[str, Any]:
+    if manifest is not None:
+        return manifest
+    return {
+        "schema_version": 1,
+        "suites": [
+            {
+                "id": suite_id,
+                "execution_backend": "harbor_local_docker",
+                "smoke_config_sha256": _json_sha256(smoke_config),
+            }
+        ],
+    }
+
+
+def _resume_harbor_evalrun_state(
+    *,
+    result_dir: Path,
+    run_id: str,
+    suite_id: str,
+    smoke_config: dict[str, Any],
+) -> None:
+    manifest = _read_json_object(result_dir / "benchmark-manifest.json")
+    if not manifest:
+        manifest = _harbor_evalrun_manifest(
+            manifest=None,
+            suite_id=suite_id,
+            smoke_config=smoke_config,
+        )
+    try:
+        resume_eval_run_state(
+            result_dir=result_dir,
+            manifest_sha256=_json_sha256(manifest),
+            run_id=run_id,
+            mode="smoke",
+            suite_ids=[suite_id],
+        )
+    except EvalRunStateError as error:
+        raise BenchmarkVerifierError(str(error)) from error
 
 
 def write_run_lock(
@@ -5343,6 +5846,18 @@ def write_harbor_environment_failure(
     harbor_dir = result_dir / "harbor"
     harbor_dir.mkdir(parents=True, exist_ok=True)
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state_manifest = _harbor_evalrun_manifest(
+        manifest=manifest,
+        suite_id=suite_id,
+        smoke_config=smoke_config or {},
+    )
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode="smoke",
+        manifest=state_manifest,
+        suite_ids=[suite_id],
+    )
     smoke_config_artifact = (
         write_harbor_smoke_config_artifact(harbor_dir, smoke_config)
         if smoke_config is not None
@@ -5393,15 +5908,16 @@ def write_harbor_environment_failure(
         selected = select_suites(manifest, [suite_id])
         for suite in selected:
             validate_suite_fields(suite)
-        (result_dir / "benchmark-manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        )
+    (result_dir / "benchmark-manifest.json").write_text(
+        json.dumps(state_manifest, indent=2, sort_keys=True) + "\n"
+    )
     run_record = {
         "schema_version": 1,
         "run_id": run_id,
         "mode": "smoke",
         "status": "environment_setup_failed",
         "created_at": created_at,
+        "manifest_sha256": _json_sha256(state_manifest),
         "suite": suite_id,
         "execution_backend": "harbor_local_docker",
         "responses_base_url": responses_base_url,
@@ -5470,6 +5986,16 @@ def write_harbor_environment_failure(
     (result_dir / "environment.json").write_text(
         json.dumps(environment_record, indent=2, sort_keys=True) + "\n"
     )
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, suite_id)
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=harbor_dir,
+        suite_id=suite_id,
+        tasks_total=1,
+        samples_artifacts=["harbor/trials.jsonl"],
+    )
+    _begin_evalrun_grading(result_dir, suite_id)
     summary = {
         "schema_version": 1,
         "run_id": run_id,
@@ -5489,7 +6015,21 @@ def write_harbor_environment_failure(
     if environment_diagnostics is not None:
         summary["environment_diagnostics"] = environment_diagnostics
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=harbor_dir,
+        suite_id=suite_id,
+        tasks_graded=1,
+        status="environment_setup_failed",
+        metrics_artifacts=["summary.json"],
+        summary_artifacts=["summary.json"],
+    )
+    _complete_evalrun_campaign_summary(
+        result_dir=result_dir,
+        status="environment_setup_failed",
+    )
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -5511,6 +6051,18 @@ def write_harbor_run_state(
     result_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state_manifest = _harbor_evalrun_manifest(
+        manifest=manifest,
+        suite_id=suite_id,
+        smoke_config=smoke_config,
+    )
+    _begin_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        mode="smoke",
+        manifest=state_manifest,
+        suite_ids=[suite_id],
+    )
     agent_responses_base_url = harbor_agent_responses_base_url(
         responses_base_url=responses_base_url,
         local_host_route=local_host_route,
@@ -5521,6 +6073,7 @@ def write_harbor_run_state(
         "mode": "smoke",
         "status": "running",
         "created_at": created_at,
+        "manifest_sha256": _json_sha256(state_manifest),
         "suite": suite_id,
         "execution_backend": "harbor_local_docker",
         "responses_base_url": responses_base_url,
@@ -5572,9 +6125,9 @@ def write_harbor_run_state(
         selected = select_suites(manifest, [suite_id])
         for suite in selected:
             validate_suite_fields(suite)
-        (result_dir / "benchmark-manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        )
+    (result_dir / "benchmark-manifest.json").write_text(
+        json.dumps(state_manifest, indent=2, sort_keys=True) + "\n"
+    )
     (run_root / f"benchmark-{run_id}.json").write_text(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
@@ -5589,6 +6142,8 @@ def write_harbor_run_state(
         created_at=created_at,
         result_dir=result_dir,
     )
+    _complete_evalrun_materialization(result_dir)
+    _begin_evalrun_suite(result_dir, suite_id)
 
 
 def finalize_harbor_run_state(
@@ -5642,11 +6197,17 @@ def write_harbor_success_summary(
     artifacts_dir = harbor_dir / "artifacts"
     harbor_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    smoke_config_artifact = write_harbor_smoke_config_artifact(harbor_dir, smoke_config)
     agent_responses_base_url = harbor_agent_responses_base_url(
         responses_base_url=responses_base_url,
         local_host_route=local_host_route,
     )
+    _resume_harbor_evalrun_state(
+        result_dir=result_dir,
+        run_id=run_id,
+        suite_id=suite_id,
+        smoke_config=smoke_config,
+    )
+    smoke_config_artifact = write_harbor_smoke_config_artifact(harbor_dir, smoke_config)
 
     trials_path = harbor_dir / "trials.jsonl"
     _write_harbor_trials_artifact(
@@ -5662,6 +6223,14 @@ def write_harbor_success_summary(
     trials = _read_jsonl_objects(trials_path)
     validate_harbor_trials(trials)
     tasks_total = len(trials)
+    _complete_evalrun_trial_generation(
+        result_dir=result_dir,
+        suite_dir=harbor_dir,
+        suite_id=suite_id,
+        tasks_total=tasks_total,
+        samples_artifacts=["harbor/trials.jsonl"],
+    )
+    _begin_evalrun_grading(result_dir, suite_id)
     tasks_passed = sum(1 for trial in trials if trial.get("state") == "passed")
     infrastructure_failures = sum(
         1 for trial in trials if trial.get("state") in FAILURE_STATES
@@ -5697,6 +6266,7 @@ def write_harbor_success_summary(
         "environment_provider": environment_provider,
     }
     summary_path = result_dir / "summary.json"
+    _begin_evalrun_campaign_summary(result_dir)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     run_record = _read_json_object(result_dir / "run.json")
     run_record.update(
@@ -5720,6 +6290,16 @@ def write_harbor_success_summary(
         json.dumps(run_record, indent=2, sort_keys=True) + "\n"
     )
     finalize_run_lock(run_root=run_root, run_id=run_id, status="completed")
+    _complete_evalrun_suite(
+        result_dir=result_dir,
+        suite_dir=harbor_dir,
+        suite_id=suite_id,
+        tasks_graded=tasks_total,
+        status=status,
+        metrics_artifacts=["summary.json"],
+        summary_artifacts=["summary.json"],
+    )
+    _complete_evalrun_campaign_summary(result_dir=result_dir, status=status)
     write_archive_manifest(result_dir=result_dir, summary=summary)
     return summary_path
 
@@ -6286,6 +6866,13 @@ def _cmd_harbor_smoke(args: argparse.Namespace, suite_id: str) -> int:
 
 
 def _cmd_bwrap_codegen_smoke(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
+    _materialize_bwrap_codegen_evalrun(
+        results_root=args.results_root,
+        run_root=args.run_root,
+        run_id=args.run_id,
+        suite_ids=args.suite,
+        manifest=manifest,
+    )
     task_results = []
     for index, suite_id in enumerate(args.suite, start=1):
         task_id = f"{suite_id}-{index:03d}"
