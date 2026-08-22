@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,48 @@ class _JsonModelsResponse:
 
     def read(self) -> bytes:
         return b'{"data": [{"id": "zai-org/GLM-5.2"}]}'
+
+
+class _JsonResponsesResponse:
+    def __enter__(self) -> "_JsonResponsesResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+    def read(self) -> bytes:
+        return b'{"id": "resp-test", "output_text": "OK", "usage": {}}'
+
+
+def test_post_responses_request_uses_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_urlopen(
+        request: urllib.request.Request,
+        *,
+        timeout: float,
+    ) -> _JsonResponsesResponse:
+        observed["url"] = request.full_url
+        observed["timeout"] = timeout
+        return _JsonResponsesResponse()
+
+    monkeypatch.setattr(glm52_benchmark_verifier.urllib.request, "urlopen", fake_urlopen)
+
+    response = glm52_benchmark_verifier._post_responses_request(
+        responses_base_url="http://127.0.0.1:18081/v1",
+        model="zai-org/GLM-5.2",
+        prompt="Say OK.",
+        decoding_profile={"temperature": 0, "top_p": 1, "max_output_tokens": 1},
+        timeout_seconds=180.0,
+    )
+
+    assert observed == {
+        "url": "http://127.0.0.1:18081/v1/responses",
+        "timeout": 180.0,
+    }
+    assert response["output_text"] == "OK"
 
 
 def _patch_healthy_responses_models_endpoint(
@@ -1496,7 +1539,8 @@ def test_humaneval_single_suite_real_adapter_uses_responses_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     completion_text = "def add(a, b):\n    return a + b\n"
-    fake_responses_server.set_output_text(completion_text)
+    fenced_completion = f"Here is the Python function:\n\n```python\n{completion_text}```"
+    fake_responses_server.set_output_text(fenced_completion)
     manifest_path = tmp_path / "benchmark-manifest.yaml"
     _write_humaneval_manifest(manifest_path)
     run_id = f"humaneval-real-{mode}"
@@ -1550,6 +1594,8 @@ def test_humaneval_single_suite_real_adapter_uses_responses_endpoint(
             "bwrap_rootfs",
             "--responses-base-url",
             fake_responses_server.url,
+            "--responses-timeout-seconds",
+            "180",
             "--run-id",
             run_id,
             "--results-root",
@@ -1580,14 +1626,16 @@ def test_humaneval_single_suite_real_adapter_uses_responses_endpoint(
     ]
     assert (
         fake_responses_server.requests[0]["payload"]["input"]
-        == "Write a Python function named add that returns the sum of two numbers."
+        == "Write a Python function named add that returns the sum of two numbers.\n\n"
+        "Return only valid Python code. Do not include Markdown fences or prose."
     )
     sample = json.loads((suite_dir / "samples.jsonl").read_text())
     assert sample["case_id"] == "HumanEval/0"
     assert sample["prompt"] == (
-        "Write a Python function named add that returns the sum of two numbers."
+        "Write a Python function named add that returns the sum of two numbers.\n\n"
+        "Return only valid Python code. Do not include Markdown fences or prose."
     )
-    assert sample["raw_response"] == completion_text
+    assert sample["raw_response"] == fenced_completion
     assert sample["completion_text"] == completion_text
     assert sample["generated_code"] == completion_text
     assert sample["passed"] is True
@@ -1670,6 +1718,8 @@ def test_humaneval_real_adapter_classifies_responses_failure(
             "bwrap_rootfs",
             "--responses-base-url",
             fake_responses_server.url,
+            "--responses-timeout-seconds",
+            "180",
             "--run-id",
             run_id,
             "--results-root",
@@ -1715,7 +1765,8 @@ def test_mbpp_single_suite_real_adapter_uses_responses_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     completion_text = "def remove_Occ(s, ch):\n    return s.replace(ch, '', 1)\n"
-    fake_responses_server.set_output_text(completion_text)
+    fenced_completion = f"```python\n{completion_text}```"
+    fake_responses_server.set_output_text(fenced_completion)
     manifest_path = tmp_path / "benchmark-manifest.yaml"
     _write_mbpp_manifest(manifest_path)
     run_id = f"mbpp-real-{mode}"
@@ -1799,14 +1850,16 @@ def test_mbpp_single_suite_real_adapter_uses_responses_endpoint(
     ]
     assert (
         fake_responses_server.requests[0]["payload"]["input"]
-        == "Write a Python function named remove_Occ that removes the first occurrence of a character from a string."
+        == "Write a Python function named remove_Occ that removes the first occurrence of a character from a string.\n\n"
+        "Return only valid Python code. Do not include Markdown fences or prose."
     )
     sample = json.loads((suite_dir / "samples.jsonl").read_text())
     assert sample["case_id"] == "MBPP/0"
     assert sample["prompt"] == (
-        "Write a Python function named remove_Occ that removes the first occurrence of a character from a string."
+        "Write a Python function named remove_Occ that removes the first occurrence of a character from a string.\n\n"
+        "Return only valid Python code. Do not include Markdown fences or prose."
     )
-    assert sample["raw_response"] == completion_text
+    assert sample["raw_response"] == fenced_completion
     assert sample["completion_text"] == completion_text
     assert sample["generated_code"] == completion_text
     assert sample["passed"] is True
@@ -1974,12 +2027,16 @@ def test_gsm8k_single_suite_real_adapter_uses_responses_endpoint(
         "/v1/responses"
     ]
     assert fake_responses_server.requests[0]["payload"]["input"] == (
-        "What is 40 plus 2?"
+        "What is 40 plus 2?\n\n"
+        "End your response with a final line exactly in this format: #### <answer>."
     )
     sample = json.loads((suite_dir / "samples.jsonl").read_text())
     assert sample["case_id"] == "gsm8k/gsm8k-local-0001"
     assert sample["dataset_sample_id"] == "gsm8k-local-0001"
-    assert sample["prompt"] == "What is 40 plus 2?"
+    assert sample["prompt"] == (
+        "What is 40 plus 2?\n\n"
+        "End your response with a final line exactly in this format: #### <answer>."
+    )
     assert sample["raw_response"].endswith("#### 42")
     assert sample["expected_answer"] == "42"
     assert sample["extracted_answer"] == "42"
@@ -2235,12 +2292,16 @@ def test_aime_single_suite_real_adapter_uses_responses_endpoint(
         "/v1/responses"
     ]
     assert fake_responses_server.requests[0]["payload"]["input"] == (
-        "Find the integer answer to this local AIME problem."
+        "Find the integer answer to this local AIME problem.\n\n"
+        "End your response with the final integer answer and no other trailing numbers."
     )
     sample = json.loads((suite_dir / "samples.jsonl").read_text())
     assert sample["case_id"] == "aime/aime-local-0001"
     assert sample["dataset_sample_id"] == "aime-local-0001"
-    assert sample["prompt"] == "Find the integer answer to this local AIME problem."
+    assert sample["prompt"] == (
+        "Find the integer answer to this local AIME problem.\n\n"
+        "End your response with the final integer answer and no other trailing numbers."
+    )
     assert sample["raw_response"] == "The final integer answer is 42."
     assert sample["expected_answer"] == "42"
     assert sample["extracted_answer"] == "42"
@@ -6187,9 +6248,11 @@ def test_terminal_bench_smoke_invokes_real_harbor_run_config(
             {
                 "import_path": "scripts.glm52_harbor_agent:GLM52HarborAgent",
                 "model_name": "zai-org/GLM-5.2",
+                "override_timeout_sec": 1800,
                 "kwargs": {
                     "responses_base_url": "http://host.docker.internal:18081/v1",
                     "local_host_route": "host.docker.internal",
+                    "responses_timeout_seconds": 1800,
                     "stream": True,
                 },
             }
@@ -6319,9 +6382,11 @@ def test_swe_bench_smoke_invokes_real_harbor_run_config(
             {
                 "import_path": "scripts.glm52_harbor_agent:GLM52HarborAgent",
                 "model_name": "zai-org/GLM-5.2",
+                "override_timeout_sec": 1800,
                 "kwargs": {
                     "responses_base_url": "http://host.docker.internal:18081/v1",
                     "local_host_route": "host.docker.internal",
+                    "responses_timeout_seconds": 1800,
                     "stream": True,
                 },
             }
@@ -7525,6 +7590,8 @@ def test_needle_smoke_real_adapter_uses_responses_endpoint(
             "bwrap_rootfs",
             "--responses-base-url",
             fake_responses_server.url,
+            "--responses-timeout-seconds",
+            "180",
             "--run-id",
             run_id,
             "--results-root",
@@ -7562,6 +7629,7 @@ def test_needle_smoke_real_adapter_uses_responses_endpoint(
     assert {sample["endpoint"] for sample in samples} == {fake_responses_server.url}
     assert all(sample["endpoint"] != "fixture" for sample in samples)
     for sample in samples:
+        assert sample["responses_timeout_seconds"] == 180.0
         assert sample["profile"] == "long-context-smoke"
         assert sample["dataset_revision"] == "fixture-needle-smoke-v1"
         assert sample["harness_revision"] == "monarch-glm52-fixture-v1"
@@ -7589,8 +7657,13 @@ def test_needle_smoke_real_adapter_uses_responses_endpoint(
     assert metrics["infrastructure_failures"] == 0
     summary = json.loads((result_dir / "summary.json").read_text())
     assert summary["status"] == "pass"
+    assert summary["responses_timeout_seconds"] == 180.0
     assert summary["suites"][0]["model_failures"] == 0
     assert summary["suites"][0]["infrastructure_failures"] == 0
+    environment = json.loads((result_dir / "environment.json").read_text())
+    assert environment["responses_timeout_seconds"] == 180.0
+    run_record = json.loads((result_dir / "run.json").read_text())
+    assert run_record["responses_timeout_seconds"] == 180.0
     archive_manifest = json.loads((result_dir / "archive-manifest.json").read_text())
     assert archive_manifest["summary_status"] == "pass"
     assert set(archive_manifest["contract_artifacts"]) >= {
@@ -8252,6 +8325,113 @@ def test_prepare_command_materializes_local_cache_sources(
         / "needle-smoke"
         / "oracle.txt"
     ).resolve().read_text() == "local oracle\n"
+
+
+def test_prepare_command_materializes_ruler_smoke_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_responses_server: object,
+) -> None:
+    source_root = tmp_path / "sources"
+    dataset_source = source_root / "ruler-dataset"
+    harness_source = source_root / "ruler-harness"
+    dataset_source.mkdir(parents=True)
+    harness_source.mkdir(parents=True)
+    (dataset_source / "scripts" / "data" / "synthetic").mkdir(parents=True)
+    (dataset_source / "scripts" / "synthetic.yaml").write_text("niah_single_1: {}\n")
+    (harness_source / "README.md").write_text("local harness\n")
+    manifest_path = tmp_path / "benchmark-manifest.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "suites:",
+                "  - id: ruler",
+                "    profile: long-context",
+                "    dataset_revision: ruler@rev",
+                "    harness_revision: lm-evaluation-harness@rev",
+                "    prompt_template: ruler-v1",
+                "    execution_backend: bwrap_rootfs",
+                "    decoding_profile:",
+                "      temperature: 0",
+                "      top_p: 1",
+                "      max_output_tokens: 1024",
+                "      glm_thinking: disabled",
+                "    metric: exact_match",
+                "    dataset_source:",
+                "      type: local_path",
+                f"      path: {dataset_source}",
+                "    harness_source:",
+                "      type: local_path",
+                f"      path: {harness_source}",
+                "",
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        glm52_benchmark_verifier,
+        "check_local_tool",
+        lambda name: {"name": name, "status": "missing"},
+    )
+
+    args = build_parser().parse_args(
+        [
+            "prepare",
+            "--manifest",
+            str(manifest_path),
+            "--suite",
+            "ruler",
+            "--run-id",
+            "prepare-ruler-smoke-sample",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-root",
+            str(tmp_path / "run"),
+            "--skip-endpoints",
+        ]
+    )
+
+    assert args.func(args) == 0
+
+    samples_path = tmp_path / "benchmarks" / "datasets" / "ruler" / "samples.jsonl"
+    sample = json.loads(samples_path.read_text())
+    assert sample["id"] == "ruler-smoke-niah-single-1"
+    assert "deployment cleanup token" in sample["input"]
+    assert sample["outputs"] == ["ORCHID-7194"]
+    assert sample["source"] == "monarch-ruler-smoke-fixture"
+    prepare = json.loads(
+        (
+            tmp_path / "results" / "prepare-ruler-smoke-sample" / "prepare.json"
+        ).read_text()
+    )
+    ruler_record = next(
+        record
+        for record in prepare["cache_preflight"]
+        if record["suite"] == "ruler"
+    )
+    assert ruler_record["status"] == "available"
+    assert ruler_record["smoke_sample"] == str(samples_path)
+
+    smoke_args = build_parser().parse_args(
+        [
+            "smoke",
+            "--manifest",
+            str(manifest_path),
+            "--suite",
+            "ruler",
+            "--execution-backend",
+            "bwrap_rootfs",
+            "--responses-base-url",
+            fake_responses_server.url,
+            "--run-id",
+            "ruler-smoke-after-prepare",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-root",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert smoke_args.func(smoke_args) == 0
 
 
 def test_prepare_command_filters_selected_suites_before_image_preflight(
@@ -8957,8 +9137,9 @@ def test_write_prepare_artifact_records_cache_and_image_preflight_results(
     ]
 
 
-def test_build_prepare_cache_and_image_preflight_from_manifest() -> None:
+def test_build_prepare_cache_and_image_preflight_from_manifest(tmp_path: Path) -> None:
     image = "ghcr.io/harbor-framework/terminal-bench-2@sha256:" + ("f" * 64)
+    cache_root = tmp_path / "benchmarks"
     manifest = {
         "suites": [
             {
@@ -8981,24 +9162,24 @@ def test_build_prepare_cache_and_image_preflight_from_manifest() -> None:
         {"name": "harbor", "status": "missing"},
     ]
 
-    assert build_cache_preflight(manifest) == [
+    assert build_cache_preflight(manifest, cache_root=cache_root) == [
         {
             "suite": "humaneval",
             "dataset_revision": "openai/humaneval@rev",
-            "dataset_cache": ".scratch/glm52-local-serving/benchmarks/datasets/humaneval",
+            "dataset_cache": str(cache_root / "datasets" / "humaneval"),
             "dataset_cache_exists": False,
             "harness_revision": "evalplus@rev",
-            "harness_cache": ".scratch/glm52-local-serving/benchmarks/harnesses/humaneval",
+            "harness_cache": str(cache_root / "harnesses" / "humaneval"),
             "harness_cache_exists": False,
             "status": "planned",
         },
         {
             "suite": "terminal-bench-2",
             "dataset_revision": "terminal-bench-2@rev",
-            "dataset_cache": ".scratch/glm52-local-serving/benchmarks/datasets/terminal-bench-2",
+            "dataset_cache": str(cache_root / "datasets" / "terminal-bench-2"),
             "dataset_cache_exists": False,
             "harness_revision": "harbor@rev",
-            "harness_cache": ".scratch/glm52-local-serving/benchmarks/harnesses/terminal-bench-2",
+            "harness_cache": str(cache_root / "harnesses" / "terminal-bench-2"),
             "harness_cache_exists": False,
             "status": "planned",
         },

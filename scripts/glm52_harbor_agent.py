@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ class GLM52HarborAgent:
     responses_base_url: str
     model: str = "zai-org/GLM-5.2"
     local_host_route: str = "host.docker.internal"
+    responses_timeout_seconds: int = 120
     stream: bool = True
     extra_env: dict[str, str]
     logs_dir: Path | None = None
@@ -53,6 +55,7 @@ class GLM52HarborAgent:
         model: str | None = None,
         model_name: str | None = None,
         local_host_route: str = "host.docker.internal",
+        responses_timeout_seconds: int = 120,
         stream: bool = True,
         logs_dir: Path | str | None = None,
         **_kwargs: Any,
@@ -67,6 +70,7 @@ class GLM52HarborAgent:
         object.__setattr__(self, "responses_base_url", responses_base_url)
         object.__setattr__(self, "model", selected_model)
         object.__setattr__(self, "local_host_route", local_host_route)
+        object.__setattr__(self, "responses_timeout_seconds", responses_timeout_seconds)
         object.__setattr__(self, "stream", stream)
         object.__setattr__(self, "extra_env", {})
         object.__setattr__(self, "logs_dir", None if logs_dir is None else Path(logs_dir))
@@ -102,6 +106,8 @@ class GLM52HarborAgent:
                 for item in response.get("output", [])
                 if item.get("type") == "function_call"
             ]
+            inline_function_calls = _inline_function_calls_from_response(response)
+            function_calls.extend(inline_function_calls)
             if not function_calls:
                 _populate_context_from_response(context, response)
                 return
@@ -118,11 +124,14 @@ class GLM52HarborAgent:
             response_id = response.get("id")
             if not isinstance(response_id, str) or not response_id:
                 raise HarborAgentError("response with function_call requires id")
+            request_input = outputs
+            if inline_function_calls:
+                request_input = [*inline_function_calls, *outputs]
             response = await _post_responses_request(
                 self,
                 {
                     "model": self.model,
-                    "input": outputs,
+                    "input": request_input,
                     "previous_response_id": response_id,
                     "tools": [_harbor_tool_to_responses_tool(tool) for tool in tools],
                     "tool_choice": "auto",
@@ -188,7 +197,7 @@ class GLM52HarborAgent:
 
 def _harbor_agent_info_types() -> tuple[type[Any], type[Any]]:
     try:
-        from harbor.models.trial.result import AgentInfo, ModelInfo
+        from harbor.models.trial.result import AgentInfo, ModelInfo  # type: ignore[import-not-found]
     except ImportError:
         return _FallbackAgentInfo, _FallbackModelInfo
     return AgentInfo, ModelInfo
@@ -265,6 +274,51 @@ def responses_function_call_to_harbor_action(item: dict[str, Any]) -> dict[str, 
         "call_id": call_id,
         "arguments": decoded_arguments,
     }
+
+
+def _inline_function_calls_from_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+    text = _extract_final_message(response)
+    if not text:
+        return []
+    calls = []
+    for index, match in enumerate(
+        re.finditer(r"<tool_call>(.*?)</tool_call>", text, flags=re.DOTALL),
+        start=1,
+    ):
+        body = match.group(1).strip()
+        name_match = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)", body)
+        if name_match is None:
+            raise HarborAgentError("inline tool_call requires tool name")
+        arguments: dict[str, Any] = {}
+        for arg_match in re.finditer(
+            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+            body,
+            flags=re.DOTALL,
+        ):
+            key = arg_match.group(1).strip()
+            value = arg_match.group(2)
+            if not key:
+                raise HarborAgentError("inline tool_call arg_key must be non-empty")
+            arguments[key] = _inline_argument_value(key, value)
+        if not arguments:
+            raise HarborAgentError("inline tool_call requires at least one argument")
+        calls.append(
+            {
+                "type": "function_call",
+                "call_id": f"inline_call_{index}",
+                "name": name_match.group(1),
+                "arguments": json.dumps(arguments, sort_keys=True),
+            }
+        )
+    return calls
+
+
+def _inline_argument_value(key: str, value: str) -> Any:
+    if key == "timeout_sec":
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return value
 
 
 async def _execute_function_call(item: dict[str, Any], *, environment: Any) -> dict[str, Any]:
@@ -378,11 +432,104 @@ def _post_responses_request_sync(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
-    with urllib_request.urlopen(req, timeout=120) as response:
-        decoded = json.loads(response.read().decode("utf-8"))
+    with urllib_request.urlopen(req, timeout=agent.responses_timeout_seconds) as response:
+        raw = response.read().decode("utf-8")
+        content_type = response.headers.get("Content-Type", "")
+    if "text/event-stream" in content_type or raw.lstrip().startswith("data:"):
+        decoded = _responses_object_from_sse(raw)
+    else:
+        decoded = json.loads(raw)
     if not isinstance(decoded, dict):
         raise HarborAgentError("responses endpoint returned a non-object payload")
     return decoded
+
+
+def _responses_object_from_sse(raw: str) -> dict[str, Any]:
+    events = _responses_sse_events(raw)
+    completed: dict[str, Any] | None = None
+    for event in events:
+        event_type = event.get("type")
+        if event_type == "error":
+            raise HarborAgentError(f"responses stream error: {_responses_error_message(event.get('error'))}")
+        if event_type == "response.completed":
+            response = event.get("response")
+            if isinstance(response, dict):
+                completed = response
+    if completed is None:
+        completed = _responses_object_from_done_stream(events)
+    if completed is None:
+        raise HarborAgentError("responses stream ended without response.completed")
+    return completed
+
+
+def _responses_object_from_done_stream(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not events or events[-1].get("type") != "done":
+        return None
+    response_id: str | None = None
+    model: str | None = None
+    output_by_index: dict[int, dict[str, Any]] = {}
+    for event in events:
+        response = event.get("response")
+        if isinstance(response, dict):
+            if isinstance(response.get("id"), str):
+                response_id = response["id"]
+            if isinstance(response.get("model"), str):
+                model = response["model"]
+        if event.get("type") != "response.output_item.done":
+            continue
+        output_index = event.get("output_index")
+        item = event.get("item")
+        if isinstance(output_index, int) and isinstance(item, dict):
+            output_by_index[output_index] = item
+    if not output_by_index:
+        return None
+    return {
+        "id": response_id or "resp_stream",
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model or "unknown",
+        "status": "completed",
+        "output": [
+            item
+            for _, item in sorted(output_by_index.items(), key=lambda pair: pair[0])
+        ],
+    }
+
+
+def _responses_sse_events(raw: str) -> list[dict[str, Any]]:
+    events = []
+    data_lines: list[str] = []
+    for line in raw.splitlines():
+        if line == "":
+            if data_lines:
+                events.append(_decode_responses_sse_data("\n".join(data_lines)))
+                data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line.removeprefix("data:").lstrip())
+    if data_lines:
+        events.append(_decode_responses_sse_data("\n".join(data_lines)))
+    return events
+
+
+def _decode_responses_sse_data(data: str) -> dict[str, Any]:
+    if data == "[DONE]":
+        return {"type": "done"}
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError as error:
+        raise HarborAgentError(f"invalid responses stream event: {error}") from error
+    if not isinstance(event, dict):
+        raise HarborAgentError("responses stream event must be an object")
+    return event
+
+
+def _responses_error_message(error: Any) -> str:
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str):
+            return message
+    return str(error)
 
 
 def write_trial_artifact(

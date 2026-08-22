@@ -25,6 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 from typing import Literal
+from typing import TypeGuard
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -63,6 +64,7 @@ DEFAULT_HARBOR_SWEBENCH_SMOKE_CONFIG = Path(
 DEFAULT_HARBOR_SWEBENCH_LOCK = Path(
     ".scratch/glm52-local-serving/harbor/datasets/swe-bench-verified.lock.yaml"
 )
+DEFAULT_RESPONSES_TIMEOUT_SECONDS = 30.0
 HARBOR_AGENT_VERSION = "glm52-harbor-agent-v1"
 HARBOR_TERMINAL_BENCH_REPO_REVISION = (
     "9dd349f28b969268aef419e910e1998149b612a5"
@@ -254,6 +256,8 @@ def _validate_terminal_bench_harbor_smoke_config(config: dict[str, Any]) -> None
         required_top_level=required_top_level,
     )
     execution = config.get("execution")
+    if not isinstance(execution, dict):
+        raise BenchmarkVerifierError("Harbor smoke config execution must be an object")
     expected_execution = {
         "harness": "harbor",
         "dataset": HARBOR_TERMINAL_BENCH_DATASET,
@@ -279,6 +283,8 @@ def _validate_terminal_bench_harbor_smoke_config(config: dict[str, Any]) -> None
         )
 
     subset = config.get("subset")
+    if not isinstance(subset, dict):
+        raise BenchmarkVerifierError("Harbor smoke config subset must be an object")
     smoke_tasks = subset.get("smoke_tasks")
     if (
         not isinstance(smoke_tasks, list)
@@ -417,6 +423,7 @@ def write_harbor_job_config(
         responses_base_url=responses_base_url,
         local_host_route=local_host_route,
     )
+    timeout_seconds = _harbor_agent_timeout_seconds(smoke_config)
     job_config = {
         "job_name": run_id,
         "jobs_dir": str(harbor_output_dir),
@@ -431,9 +438,11 @@ def write_harbor_job_config(
             {
                 "import_path": "scripts.glm52_harbor_agent:GLM52HarborAgent",
                 "model_name": "zai-org/GLM-5.2",
+                "override_timeout_sec": timeout_seconds,
                 "kwargs": {
                     "responses_base_url": agent_responses_base_url,
                     "local_host_route": local_host_route,
+                    "responses_timeout_seconds": timeout_seconds,
                     "stream": bool(smoke_config.get("stream")),
                 },
             }
@@ -443,6 +452,24 @@ def write_harbor_job_config(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(job_config, sort_keys=False))
     return path
+
+
+def _harbor_agent_timeout_seconds(smoke_config: dict[str, Any]) -> int:
+    execution = smoke_config.get("execution")
+    if not isinstance(execution, dict):
+        raise BenchmarkVerifierError("Harbor smoke config execution must be an object")
+    suite_id = smoke_config.get("suite")
+    field = (
+        "timeout_seconds_per_instance"
+        if suite_id == "swe-bench-verified"
+        else "timeout_seconds_per_task"
+    )
+    timeout_seconds = execution.get(field)
+    if not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
+        raise BenchmarkVerifierError(
+            f"Harbor smoke config execution.{field} must be a positive integer"
+        )
+    return timeout_seconds
 
 
 def _build_terminal_bench_harbor_dataset_config(
@@ -777,7 +804,7 @@ def published_score_by_suite(published_scores: dict[str, Any]) -> dict[str, dict
             raise BenchmarkVerifierError(
                 "each published score must be an object with string suite"
             )
-        suite_id = score.get("suite")
+        suite_id = score["suite"]
         if suite_id in score_by_suite:
             raise BenchmarkVerifierError(f"duplicate published score for suite: {suite_id}")
         score_by_suite[suite_id] = score
@@ -1253,20 +1280,23 @@ def build_cache_preflight(
         harness_cache = cache_root / "harnesses" / suite_id
         dataset_cache_exists = dataset_cache.exists()
         harness_cache_exists = harness_cache.exists()
-        records.append(
-            {
-                "suite": suite_id,
-                "dataset_revision": suite.get("dataset_revision"),
-                "dataset_cache": str(dataset_cache),
-                "dataset_cache_exists": dataset_cache_exists,
-                "harness_revision": suite.get("harness_revision"),
-                "harness_cache": str(harness_cache),
-                "harness_cache_exists": harness_cache_exists,
-                "status": "available"
-                if dataset_cache_exists and harness_cache_exists
-                else "planned",
-            }
-        )
+        record = {
+            "suite": suite_id,
+            "dataset_revision": suite.get("dataset_revision"),
+            "dataset_cache": str(dataset_cache),
+            "dataset_cache_exists": dataset_cache_exists,
+            "harness_revision": suite.get("harness_revision"),
+            "harness_cache": str(harness_cache),
+            "harness_cache_exists": harness_cache_exists,
+            "status": "available"
+            if dataset_cache_exists and harness_cache_exists
+            else "planned",
+        }
+        if suite_id == "ruler" and dataset_cache_exists:
+            smoke_sample = _ruler_smoke_sample_path(dataset_cache)
+            if smoke_sample is not None:
+                record["smoke_sample"] = str(smoke_sample)
+        records.append(record)
     return sorted(records, key=lambda record: record["suite"])
 
 
@@ -1290,6 +1320,8 @@ def materialize_prepare_caches(
             destination=cache_root / "harnesses" / suite_id,
             source_name="harness_source",
         )
+        if suite_id == "ruler":
+            _ensure_ruler_smoke_sample(cache_root / "datasets" / suite_id)
     records = build_cache_preflight(manifest, cache_root=cache_root)
     for record in records:
         suite = _manifest_suite_by_id(manifest, record["suite"])
@@ -1304,6 +1336,56 @@ def materialize_prepare_caches(
             source=suite.get("harness_source"),
         )
     return records
+
+
+def _ruler_smoke_sample_path(dataset_cache: Path) -> Path | None:
+    sample = _read_first_ruler_jsonl_sample(dataset_cache)
+    if sample is None:
+        return None
+    if dataset_cache.is_file():
+        return dataset_cache
+    preferred = dataset_cache / "samples.jsonl"
+    if preferred.is_file():
+        return preferred
+    for candidate in (
+        dataset_cache / "test.jsonl",
+        dataset_cache / "validation.jsonl",
+        dataset_cache / "problems.jsonl",
+    ):
+        if candidate.is_file():
+            return candidate
+    for candidate in sorted(dataset_cache.glob("*.jsonl")):
+        return candidate
+    return None
+
+
+def _ensure_ruler_smoke_sample(dataset_cache: Path) -> None:
+    if not dataset_cache.exists():
+        return
+    if _read_first_ruler_jsonl_sample(dataset_cache) is not None:
+        return
+    source_markers = [
+        dataset_cache / "scripts" / "synthetic.yaml",
+        dataset_cache / "scripts" / "data" / "synthetic" / "niah.py",
+    ]
+    if not any(marker.exists() for marker in source_markers):
+        raise BenchmarkVerifierError(
+            "RULER dataset cache does not contain a usable sample or generator"
+        )
+    samples_path = dataset_cache / "samples.jsonl"
+    sample = {
+        "id": "ruler-smoke-niah-single-1",
+        "input": (
+            "Read the context and answer the question exactly.\n\n"
+            "Context:\n"
+            "Operational note: the deployment cleanup token is ORCHID-7194.\n\n"
+            "Question:\n"
+            "What is the deployment cleanup token?"
+        ),
+        "outputs": ["ORCHID-7194"],
+        "source": "monarch-ruler-smoke-fixture",
+    }
+    samples_path.write_text(json.dumps(sample, sort_keys=True) + "\n")
 
 
 def _manifest_suite_by_id(manifest: dict[str, Any], suite_id: str) -> dict[str, Any]:
@@ -2355,6 +2437,7 @@ def write_needle_smoke_responses_run(
     manifest: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     mode: Literal["smoke", "calibration"] = "smoke",
 ) -> Path:
     if mode not in {"smoke", "calibration"}:
@@ -2391,6 +2474,7 @@ def write_needle_smoke_responses_run(
                 "mode": mode,
                 "execution_backend": execution_backend,
                 "responses_base_url": responses_base_url,
+                "responses_timeout_seconds": responses_timeout_seconds,
             },
             indent=2,
             sort_keys=True,
@@ -2408,6 +2492,7 @@ def write_needle_smoke_responses_run(
         "created_at": created_at,
         "manifest_sha256": _json_sha256(manifest),
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "suites": [],
     }
     cleanup_record = {
@@ -2444,6 +2529,7 @@ def write_needle_smoke_responses_run(
         suite=suite,
         execution_backend=execution_backend,
         responses_base_url=responses_base_url,
+        responses_timeout_seconds=responses_timeout_seconds,
         model=str(manifest.get("model", "")),
     )
     (suite_dir / "samples.jsonl").write_text(
@@ -2503,6 +2589,7 @@ def write_needle_smoke_responses_run(
         "status": _benchmark_status([metrics]),
         "execution_backend": execution_backend,
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "conformance": {
             "claim": "none",
             "comparable_to_published": False,
@@ -2542,6 +2629,7 @@ def write_gsm8k_responses_run(
     manifest: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     mode: Literal["smoke", "calibration"] = "smoke",
 ) -> Path:
     if mode not in {"smoke", "calibration"}:
@@ -2578,6 +2666,7 @@ def write_gsm8k_responses_run(
                 "mode": mode,
                 "execution_backend": execution_backend,
                 "responses_base_url": responses_base_url,
+                "responses_timeout_seconds": responses_timeout_seconds,
             },
             indent=2,
             sort_keys=True,
@@ -2595,6 +2684,7 @@ def write_gsm8k_responses_run(
         "created_at": created_at,
         "manifest_sha256": _json_sha256(manifest),
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "suites": [],
     }
     cleanup_record = {
@@ -2631,6 +2721,7 @@ def write_gsm8k_responses_run(
         suite=suite,
         execution_backend=execution_backend,
         responses_base_url=responses_base_url,
+        responses_timeout_seconds=responses_timeout_seconds,
         model=str(manifest.get("model", "")),
         dataset_cache_root=run_root.parent / "benchmarks",
         prepare_artifact_path=results_root / "prepare" / "prepare.json",
@@ -2693,6 +2784,7 @@ def write_gsm8k_responses_run(
         "status": _benchmark_status([metrics]),
         "execution_backend": execution_backend,
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "conformance": {
             "claim": "none",
             "comparable_to_published": False,
@@ -2732,6 +2824,7 @@ def write_aime_responses_run(
     manifest: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     mode: Literal["smoke", "calibration"] = "smoke",
 ) -> Path:
     if mode not in {"smoke", "calibration"}:
@@ -2768,6 +2861,7 @@ def write_aime_responses_run(
                 "mode": mode,
                 "execution_backend": execution_backend,
                 "responses_base_url": responses_base_url,
+                "responses_timeout_seconds": responses_timeout_seconds,
             },
             indent=2,
             sort_keys=True,
@@ -2785,6 +2879,7 @@ def write_aime_responses_run(
         "created_at": created_at,
         "manifest_sha256": _json_sha256(manifest),
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "suites": [],
     }
     cleanup_record = {
@@ -2821,6 +2916,7 @@ def write_aime_responses_run(
         suite=suite,
         execution_backend=execution_backend,
         responses_base_url=responses_base_url,
+        responses_timeout_seconds=responses_timeout_seconds,
         model=str(manifest.get("model", "")),
         dataset_cache_root=run_root.parent / "benchmarks",
         prepare_artifact_path=results_root / "prepare" / "prepare.json",
@@ -2883,6 +2979,7 @@ def write_aime_responses_run(
         "status": _benchmark_status([metrics]),
         "execution_backend": execution_backend,
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "conformance": {
             "claim": "none",
             "comparable_to_published": False,
@@ -2922,6 +3019,7 @@ def write_humaneval_responses_run(
     manifest: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     mode: Literal["smoke", "calibration"] = "smoke",
 ) -> Path:
     if mode not in {"smoke", "calibration"}:
@@ -2958,6 +3056,7 @@ def write_humaneval_responses_run(
                 "mode": mode,
                 "execution_backend": execution_backend,
                 "responses_base_url": responses_base_url,
+                "responses_timeout_seconds": responses_timeout_seconds,
             },
             indent=2,
             sort_keys=True,
@@ -2975,6 +3074,7 @@ def write_humaneval_responses_run(
         "created_at": created_at,
         "manifest_sha256": _json_sha256(manifest),
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "suites": [],
     }
     cleanup_record = {
@@ -3011,6 +3111,7 @@ def write_humaneval_responses_run(
         suite=suite,
         execution_backend=execution_backend,
         responses_base_url=responses_base_url,
+        responses_timeout_seconds=responses_timeout_seconds,
         model=str(manifest.get("model", "")),
         run_root=run_root,
         result_dir=result_dir,
@@ -3081,6 +3182,7 @@ def write_humaneval_responses_run(
         "status": _benchmark_status([metrics]),
         "execution_backend": execution_backend,
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "conformance": {
             "claim": "none",
             "comparable_to_published": False,
@@ -3131,6 +3233,7 @@ def write_mbpp_responses_run(
     manifest: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     mode: Literal["smoke", "calibration"] = "smoke",
 ) -> Path:
     if mode not in {"smoke", "calibration"}:
@@ -3167,6 +3270,7 @@ def write_mbpp_responses_run(
                 "mode": mode,
                 "execution_backend": execution_backend,
                 "responses_base_url": responses_base_url,
+                "responses_timeout_seconds": responses_timeout_seconds,
             },
             indent=2,
             sort_keys=True,
@@ -3184,6 +3288,7 @@ def write_mbpp_responses_run(
         "created_at": created_at,
         "manifest_sha256": _json_sha256(manifest),
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "suites": [],
     }
     cleanup_record = {
@@ -3220,6 +3325,7 @@ def write_mbpp_responses_run(
         suite=suite,
         execution_backend=execution_backend,
         responses_base_url=responses_base_url,
+        responses_timeout_seconds=responses_timeout_seconds,
         model=str(manifest.get("model", "")),
         run_root=run_root,
         result_dir=result_dir,
@@ -3290,6 +3396,7 @@ def write_mbpp_responses_run(
         "status": _benchmark_status([metrics]),
         "execution_backend": execution_backend,
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "conformance": {
             "claim": "none",
             "comparable_to_published": False,
@@ -3340,6 +3447,7 @@ def write_ruler_responses_run(
     manifest: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     mode: Literal["smoke", "calibration"] = "smoke",
 ) -> Path:
     if mode not in {"smoke", "calibration"}:
@@ -3375,6 +3483,7 @@ def write_ruler_responses_run(
                 "mode": mode,
                 "execution_backend": execution_backend,
                 "responses_base_url": responses_base_url,
+                "responses_timeout_seconds": responses_timeout_seconds,
             },
             indent=2,
             sort_keys=True,
@@ -3392,6 +3501,7 @@ def write_ruler_responses_run(
         "created_at": created_at,
         "manifest_sha256": _json_sha256(manifest),
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "suites": [],
     }
     cleanup_record = {
@@ -3428,6 +3538,7 @@ def write_ruler_responses_run(
         suite=suite,
         execution_backend=execution_backend,
         responses_base_url=responses_base_url,
+        responses_timeout_seconds=responses_timeout_seconds,
         model=str(manifest.get("model", "")),
         dataset_cache_root=run_root.parent / "benchmarks",
         prepare_artifact_path=results_root / "prepare" / "prepare.json",
@@ -3486,6 +3597,7 @@ def write_ruler_responses_run(
         "status": _benchmark_status([metrics]),
         "execution_backend": execution_backend,
         "responses_base_url": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "conformance": {
             "claim": "none",
             "comparable_to_published": False,
@@ -3530,6 +3642,7 @@ def _needle_smoke_responses_samples(
     suite: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float,
     model: str,
 ) -> list[dict[str, Any]]:
     needle_key = "deployment_cleanup_token"
@@ -3545,6 +3658,7 @@ def _needle_smoke_responses_samples(
                 model=model,
                 prompt=prompt,
                 decoding_profile=suite["decoding_profile"],
+                timeout_seconds=responses_timeout_seconds,
             )
             latency_seconds = time.monotonic() - started_at
             raw_response = _responses_output_text(response)
@@ -3586,6 +3700,7 @@ def _needle_smoke_responses_samples(
             "latency_seconds": latency_seconds,
             "usage": usage if isinstance(usage, dict) else {},
             "endpoint": responses_base_url,
+            "responses_timeout_seconds": responses_timeout_seconds,
             "decoding": suite["decoding_profile"],
             "decoding_profile": suite["decoding_profile"],
             "dataset_revision": suite["dataset_revision"],
@@ -3606,6 +3721,7 @@ def _gsm8k_responses_sample(
     suite: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float,
     model: str,
     dataset_cache_root: Path | None,
     prepare_artifact_path: Path | None,
@@ -3626,6 +3742,7 @@ def _gsm8k_responses_sample(
         raise BenchmarkVerifierError("GSM8K dataset sample missing question")
     if not isinstance(answer, str) or not answer.strip():
         raise BenchmarkVerifierError("GSM8K dataset sample missing answer")
+    prompt = _gsm8k_prompt(question)
     expected_answer = extract_static_final_answer("gsm8k", answer)
     started_at = time.monotonic()
     request_error = None
@@ -3633,8 +3750,9 @@ def _gsm8k_responses_sample(
         response = _post_responses_request(
             responses_base_url=responses_base_url,
             model=model,
-            prompt=question,
+            prompt=prompt,
             decoding_profile=suite["decoding_profile"],
+            timeout_seconds=responses_timeout_seconds,
         )
         latency_seconds = time.monotonic() - started_at
         raw_response = _responses_output_text(response)
@@ -3665,8 +3783,8 @@ def _gsm8k_responses_sample(
         "case_id": f"gsm8k/{sample_id}",
         "dataset_sample_id": sample_id,
         "profile": suite["profile"],
-        "prompt_sha256": hashlib.sha256(question.encode()).hexdigest(),
-        "prompt": question,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "prompt": prompt,
         "prompt_template": suite["prompt_template"],
         "prompt_template_sha256": hashlib.sha256(
             suite["prompt_template"].encode()
@@ -3688,6 +3806,7 @@ def _gsm8k_responses_sample(
         "latency_seconds": latency_seconds,
         "usage": usage if isinstance(usage, dict) else {},
         "endpoint": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "decoding": suite["decoding_profile"],
         "decoding_profile": suite["decoding_profile"],
         "dataset_revision": suite["dataset_revision"],
@@ -3707,6 +3826,7 @@ def _aime_responses_sample(
     suite: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float,
     model: str,
     dataset_cache_root: Path | None,
     prepare_artifact_path: Path | None,
@@ -3727,6 +3847,7 @@ def _aime_responses_sample(
         raise BenchmarkVerifierError("AIME dataset sample missing prompt")
     if not isinstance(answer, str) and not isinstance(answer, int):
         raise BenchmarkVerifierError("AIME dataset sample missing answer")
+    prompt = _aime_prompt(prompt)
     expected_answer = extract_static_final_answer("aime", str(answer))
     started_at = time.monotonic()
     request_error = None
@@ -3736,6 +3857,7 @@ def _aime_responses_sample(
             model=model,
             prompt=prompt,
             decoding_profile=suite["decoding_profile"],
+            timeout_seconds=responses_timeout_seconds,
         )
         latency_seconds = time.monotonic() - started_at
         raw_response = _responses_output_text(response)
@@ -3789,6 +3911,7 @@ def _aime_responses_sample(
         "latency_seconds": latency_seconds,
         "usage": usage if isinstance(usage, dict) else {},
         "endpoint": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "decoding": suite["decoding_profile"],
         "decoding_profile": suite["decoding_profile"],
         "dataset_revision": suite["dataset_revision"],
@@ -3808,12 +3931,15 @@ def _humaneval_responses_sample(
     suite: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float,
     model: str,
     run_root: Path,
     result_dir: Path,
 ) -> dict[str, Any]:
     case_id = "HumanEval/0"
-    prompt = "Write a Python function named add that returns the sum of two numbers."
+    prompt = _python_code_prompt(
+        "Write a Python function named add that returns the sum of two numbers."
+    )
     started_at = time.monotonic()
     request_error = None
     contract_artifacts = {}
@@ -3827,18 +3953,20 @@ def _humaneval_responses_sample(
             model=model,
             prompt=prompt,
             decoding_profile=suite["decoding_profile"],
+            timeout_seconds=responses_timeout_seconds,
         )
         latency_seconds = time.monotonic() - started_at
         raw_response = _responses_output_text(response)
         usage = response.get("usage", {})
-        if raw_response.strip():
+        completion_text = _extract_python_completion_text(raw_response)
+        if completion_text.strip():
             task_result = _run_bwrap_codegen_fixture_score(
                 run_root=run_root,
                 run_id=run_id,
                 task_id="humaneval-001",
                 suite_id="humaneval",
                 case_id=case_id,
-                completion_text=raw_response,
+                completion_text=completion_text,
             )
             task_root = Path(str(task_result["task_root"]))
             artifact_path = task_result.get("artifact_path")
@@ -3853,7 +3981,7 @@ def _humaneval_responses_sample(
                 )
             passed = bool(task_result.get("passed"))
             state = _task_result_state(task_result)
-            generated_code = str(artifact.get("generated_code", raw_response))
+            generated_code = str(artifact.get("generated_code", completion_text))
             stdout = str(task_result.get("stdout", ""))
             stderr = str(task_result.get("stderr", ""))
             scoring = str(artifact.get("scoring", "fixture_harness"))
@@ -3882,7 +4010,7 @@ def _humaneval_responses_sample(
         ).hexdigest(),
         "raw_response": raw_response,
         "response": raw_response,
-        "completion_text": raw_response,
+        "completion_text": _extract_python_completion_text(raw_response),
         "passed": passed,
         "score": 1.0 if scoring == "fixture_harness" and passed else 0.0 if scoring == "fixture_harness" else None,
         "state": state,
@@ -3892,6 +4020,7 @@ def _humaneval_responses_sample(
         "latency_seconds": latency_seconds,
         "usage": usage if isinstance(usage, dict) else {},
         "endpoint": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "decoding": suite["decoding_profile"],
         "decoding_profile": suite["decoding_profile"],
         "dataset_revision": suite["dataset_revision"],
@@ -3917,12 +4046,15 @@ def _mbpp_responses_sample(
     suite: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float,
     model: str,
     run_root: Path,
     result_dir: Path,
 ) -> dict[str, Any]:
     case_id = "MBPP/0"
-    prompt = "Write a Python function named remove_Occ that removes the first occurrence of a character from a string."
+    prompt = _python_code_prompt(
+        "Write a Python function named remove_Occ that removes the first occurrence of a character from a string."
+    )
     started_at = time.monotonic()
     request_error = None
     contract_artifacts = {}
@@ -3936,18 +4068,20 @@ def _mbpp_responses_sample(
             model=model,
             prompt=prompt,
             decoding_profile=suite["decoding_profile"],
+            timeout_seconds=responses_timeout_seconds,
         )
         latency_seconds = time.monotonic() - started_at
         raw_response = _responses_output_text(response)
         usage = response.get("usage", {})
-        if raw_response.strip():
+        completion_text = _extract_python_completion_text(raw_response)
+        if completion_text.strip():
             task_result = _run_bwrap_codegen_fixture_score(
                 run_root=run_root,
                 run_id=run_id,
                 task_id="mbpp-001",
                 suite_id="mbpp",
                 case_id=case_id,
-                completion_text=raw_response,
+                completion_text=completion_text,
             )
             task_root = Path(str(task_result["task_root"]))
             artifact_path = task_result.get("artifact_path")
@@ -3962,7 +4096,7 @@ def _mbpp_responses_sample(
                 )
             passed = bool(task_result.get("passed"))
             state = _task_result_state(task_result)
-            generated_code = str(artifact.get("generated_code", raw_response))
+            generated_code = str(artifact.get("generated_code", completion_text))
             stdout = str(task_result.get("stdout", ""))
             stderr = str(task_result.get("stderr", ""))
             scoring = str(artifact.get("scoring", "fixture_harness"))
@@ -3991,7 +4125,7 @@ def _mbpp_responses_sample(
         ).hexdigest(),
         "raw_response": raw_response,
         "response": raw_response,
-        "completion_text": raw_response,
+        "completion_text": _extract_python_completion_text(raw_response),
         "passed": passed,
         "score": 1.0 if scoring == "fixture_harness" and passed else 0.0 if scoring == "fixture_harness" else None,
         "state": state,
@@ -4001,6 +4135,7 @@ def _mbpp_responses_sample(
         "latency_seconds": latency_seconds,
         "usage": usage if isinstance(usage, dict) else {},
         "endpoint": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "decoding": suite["decoding_profile"],
         "decoding_profile": suite["decoding_profile"],
         "dataset_revision": suite["dataset_revision"],
@@ -4079,6 +4214,7 @@ def _ruler_responses_sample(
     suite: dict[str, Any],
     execution_backend: str,
     responses_base_url: str,
+    responses_timeout_seconds: float,
     model: str,
     dataset_cache_root: Path | None,
     prepare_artifact_path: Path | None,
@@ -4107,6 +4243,7 @@ def _ruler_responses_sample(
             model=model,
             prompt=prompt,
             decoding_profile=suite["decoding_profile"],
+            timeout_seconds=responses_timeout_seconds,
         )
         latency_seconds = time.monotonic() - started_at
         raw_response = _responses_output_text(response)
@@ -4152,6 +4289,7 @@ def _ruler_responses_sample(
         "latency_seconds": latency_seconds,
         "usage": usage if isinstance(usage, dict) else {},
         "endpoint": responses_base_url,
+        "responses_timeout_seconds": responses_timeout_seconds,
         "decoding": suite["decoding_profile"],
         "decoding_profile": suite["decoding_profile"],
         "dataset_revision": suite["dataset_revision"],
@@ -4177,6 +4315,7 @@ def _post_responses_request(
     model: str,
     prompt: str,
     decoding_profile: dict[str, Any],
+    timeout_seconds: float = DEFAULT_RESPONSES_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -4192,7 +4331,7 @@ def _post_responses_request(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30.0) as response:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
         detail = error.read().decode(errors="replace")
@@ -4230,6 +4369,34 @@ def _responses_output_text(response: dict[str, Any]) -> str:
         if parts:
             return "".join(parts)
     raise BenchmarkVerifierError("Responses endpoint returned no output text")
+
+
+def _gsm8k_prompt(question: str) -> str:
+    return (
+        question.strip()
+        + "\n\nEnd your response with a final line exactly in this format: #### <answer>."
+    )
+
+
+def _aime_prompt(prompt: str) -> str:
+    return (
+        prompt.strip()
+        + "\n\nEnd your response with the final integer answer and no other trailing numbers."
+    )
+
+
+def _python_code_prompt(instruction: str) -> str:
+    return (
+        instruction.strip()
+        + "\n\nReturn only valid Python code. Do not include Markdown fences or prose."
+    )
+
+
+def _extract_python_completion_text(raw_response: str) -> str:
+    match = re.search(r"```(?:python)?\s*\n(?P<code>.*?)```", raw_response, re.DOTALL | re.IGNORECASE)
+    if match is None:
+        return raw_response
+    return match.group("code")
 
 
 def _materialize_bwrap_codegen_evalrun(
@@ -4938,6 +5105,8 @@ def _normalize_harbor_trial_record(
             local_host_route=local_host_route,
         ),
     )
+    if agent_responses_base_url is None:
+        raise BenchmarkVerifierError("Harbor trial record missing Responses endpoint")
     normalized["endpoint"] = _first_non_empty_string(
         normalized.get("endpoint"),
         agent_info.get("endpoint"),
@@ -5121,7 +5290,7 @@ def _swe_bench_smoke_instances(
     return []
 
 
-def _is_string_list(value: Any) -> bool:
+def _is_string_list(value: Any) -> TypeGuard[list[str]]:
     return isinstance(value, list) and all(
         isinstance(item, str) and item for item in value
     )
@@ -5769,6 +5938,13 @@ def _ruler_expected_answer(sample: dict[str, Any]) -> str | None:
             return value.strip()
         if isinstance(value, int | float) and not isinstance(value, bool):
             return str(value)
+    outputs = sample.get("outputs")
+    if isinstance(outputs, list):
+        for value in outputs:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                return str(value)
     return None
 
 
@@ -6340,6 +6516,13 @@ def run_bwrap_sandbox_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Verify local GLM-5.2 benchmark execution contracts."
@@ -6371,6 +6554,11 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--published-scores", type=Path)
     smoke.add_argument("--local-container-runtime", choices=["docker", "podman"], default="docker")
     smoke.add_argument("--responses-base-url", default=os.environ.get("GLM52_RESPONSES_BASE_URL", "http://localhost:8080/v1"))
+    smoke.add_argument(
+        "--responses-timeout-seconds",
+        type=_positive_float,
+        default=DEFAULT_RESPONSES_TIMEOUT_SECONDS,
+    )
     smoke.add_argument("--local-host-route", default="host.docker.internal")
     smoke.add_argument("--harbor-smoke-config", type=Path)
     smoke.add_argument(
@@ -6394,6 +6582,11 @@ def build_parser() -> argparse.ArgumentParser:
     calibration.add_argument(
         "--responses-base-url",
         default=os.environ.get("GLM52_RESPONSES_BASE_URL", "http://localhost:8080/v1"),
+    )
+    calibration.add_argument(
+        "--responses-timeout-seconds",
+        type=_positive_float,
+        default=DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     )
     calibration.add_argument(
         "--execution-backend",
@@ -6510,6 +6703,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 manifest=manifest,
                 execution_backend=execution_backend,
                 responses_base_url=args.responses_base_url,
+                responses_timeout_seconds=args.responses_timeout_seconds,
                 mode="smoke",
             )
             summary = _read_json_object(summary_path)
@@ -6533,6 +6727,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 manifest=manifest,
                 execution_backend=execution_backend,
                 responses_base_url=args.responses_base_url,
+                responses_timeout_seconds=args.responses_timeout_seconds,
                 mode="smoke",
             )
             summary = _read_json_object(summary_path)
@@ -6556,6 +6751,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 manifest=manifest,
                 execution_backend=execution_backend,
                 responses_base_url=args.responses_base_url,
+                responses_timeout_seconds=args.responses_timeout_seconds,
                 mode="smoke",
             )
             summary = _read_json_object(summary_path)
@@ -6579,6 +6775,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 manifest=manifest,
                 execution_backend=execution_backend,
                 responses_base_url=args.responses_base_url,
+                responses_timeout_seconds=args.responses_timeout_seconds,
                 mode="smoke",
             )
             summary = _read_json_object(summary_path)
@@ -6602,6 +6799,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 manifest=manifest,
                 execution_backend=execution_backend,
                 responses_base_url=args.responses_base_url,
+                responses_timeout_seconds=args.responses_timeout_seconds,
                 mode="smoke",
             )
             summary = _read_json_object(summary_path)
@@ -6627,6 +6825,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 manifest=manifest,
                 execution_backend=execution_backend,
                 responses_base_url=args.responses_base_url,
+                responses_timeout_seconds=args.responses_timeout_seconds,
                 mode="smoke",
             )
             summary = _read_json_object(summary_path)
@@ -7021,6 +7220,7 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
             manifest=manifest,
             execution_backend=args.execution_backend,
             responses_base_url=args.responses_base_url,
+            responses_timeout_seconds=args.responses_timeout_seconds,
             mode="calibration",
         )
         summary = _read_json_object(summary_path)
@@ -7044,6 +7244,7 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
             manifest=manifest,
             execution_backend=args.execution_backend,
             responses_base_url=args.responses_base_url,
+            responses_timeout_seconds=args.responses_timeout_seconds,
             mode="calibration",
         )
         summary = _read_json_object(summary_path)
@@ -7067,6 +7268,7 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
             manifest=manifest,
             execution_backend=args.execution_backend,
             responses_base_url=args.responses_base_url,
+            responses_timeout_seconds=args.responses_timeout_seconds,
             mode="calibration",
         )
         summary = _read_json_object(summary_path)
@@ -7090,6 +7292,7 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
             manifest=manifest,
             execution_backend=args.execution_backend,
             responses_base_url=args.responses_base_url,
+            responses_timeout_seconds=args.responses_timeout_seconds,
             mode="calibration",
         )
         summary = _read_json_object(summary_path)
@@ -7113,6 +7316,7 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
             manifest=manifest,
             execution_backend=args.execution_backend,
             responses_base_url=args.responses_base_url,
+            responses_timeout_seconds=args.responses_timeout_seconds,
             mode="calibration",
         )
         summary = _read_json_object(summary_path)
@@ -7136,6 +7340,7 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
             manifest=manifest,
             execution_backend=args.execution_backend,
             responses_base_url=args.responses_base_url,
+            responses_timeout_seconds=args.responses_timeout_seconds,
             mode="calibration",
         )
         summary = _read_json_object(summary_path)

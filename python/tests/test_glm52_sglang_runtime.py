@@ -22,6 +22,7 @@ import yaml
 
 
 HELPER_PATH = Path(__file__).resolve().parents[2] / "scripts" / "glm52_sglang_runtime.py"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("glm52_sglang_runtime", HELPER_PATH)
 assert spec is not None
 assert spec.loader is not None
@@ -58,6 +59,23 @@ validate_sglang_help = glm52_sglang_runtime.validate_sglang_help
 should_teardown_after_failure = glm52_sglang_runtime.should_teardown_after_failure
 validate_model_snapshot = glm52_sglang_runtime.validate_model_snapshot
 write_materialized_config = glm52_sglang_runtime.write_materialized_config
+
+
+def test_glm52_sglang_runtime_script_help_runs_without_pythonpath() -> None:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(HELPER_PATH), "--help"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
 
 
 def write_spec(path: Path, text: str) -> Path:

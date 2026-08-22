@@ -20,6 +20,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from typing import Any
+from typing import cast
 
 
 DEFAULT_MODEL = "zai-org/GLM-5.2"
@@ -377,7 +378,8 @@ def responses_usage(usage: Any) -> dict[str, Any] | None:
 
 
 def chat_tool_call_to_response_item(raw_call: dict[str, Any], index: int) -> dict[str, Any]:
-    function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
+    raw_function = raw_call.get("function")
+    function = raw_function if isinstance(raw_function, dict) else {}
     call_id = str(raw_call.get("id") or item_id("call"))
     arguments = str(function.get("arguments") or "{}")
     validate_function_call_arguments(arguments)
@@ -498,18 +500,21 @@ def chat_choice_message(chat_response: dict[str, Any]) -> dict[str, Any]:
 
 def parse_sse_data_events(lines: Any) -> Any:
     current: list[str] = []
-    for raw_line in lines:
-        line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
-        if not line:
-            if current:
-                data = "\n".join(current)
-                current = []
-                if data == "[DONE]":
-                    return
-                yield json.loads(data)
-            continue
-        if line.startswith("data:"):
-            current.append(line.removeprefix("data:").strip())
+    try:
+        for raw_line in lines:
+            line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+            if not line:
+                if current:
+                    data = "\n".join(current)
+                    current = []
+                    if data == "[DONE]":
+                        return
+                    yield json.loads(data)
+                continue
+            if line.startswith("data:"):
+                current.append(line.removeprefix("data:").strip())
+    except TimeoutError as error:
+        raise AdapterError("downstream Chat Completions stream timed out") from error
     if current:
         data = "\n".join(current)
         if data != "[DONE]":
@@ -565,7 +570,8 @@ def chat_stream_to_responses_events(
             if not isinstance(raw_call, dict):
                 continue
             index = int(raw_call.get("index") or 0)
-            function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
+            raw_function = raw_call.get("function")
+            function = raw_function if isinstance(raw_function, dict) else {}
             call = tool_calls.setdefault(
                 index,
                 {
@@ -693,6 +699,10 @@ def response_output_to_chat_assistant(output: Any) -> dict[str, Any]:
 class ResponsesAdapterHandler(BaseHTTPRequestHandler):
     server_version = "glm52-responses-adapter/1"
 
+    @property
+    def adapter_server(self) -> "ResponsesAdapterServer":
+        return cast("ResponsesAdapterServer", self.server)
+
     def do_GET(self) -> None:
         if self.path.rstrip("/") == "/v1/models":
             self.write_json(
@@ -701,7 +711,7 @@ class ResponsesAdapterHandler(BaseHTTPRequestHandler):
                     "object": "list",
                     "data": [
                         {
-                            "id": self.server.config.model,
+                            "id": self.adapter_server.config.model,
                             "object": "model",
                             "created": 0,
                             "owned_by": "glm52-responses-adapter",
@@ -722,7 +732,11 @@ class ResponsesAdapterHandler(BaseHTTPRequestHandler):
             if bool(payload.get("stream", False)):
                 self.write_stream(payload)
             else:
-                result = run_nonstream_response(self.server.config, self.server.store, payload)
+                result = run_nonstream_response(
+                    self.adapter_server.config,
+                    self.adapter_server.store,
+                    payload,
+                )
                 self.write_json(HTTPStatus.OK, result.response)
         except AdapterError as error:
             self.write_json(error.status, error_payload(str(error)))
@@ -756,7 +770,11 @@ class ResponsesAdapterHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
-            for event in stream_response_events(self.server.config, self.server.store, payload):
+            for event in stream_response_events(
+                self.adapter_server.config,
+                self.adapter_server.store,
+                payload,
+            ):
                 self.wfile.write(sse_payload(event))
                 self.wfile.flush()
             self.wfile.write(sse_done())
@@ -767,8 +785,8 @@ class ResponsesAdapterHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"{self.address_string()} - {fmt % args}", file=sys.stderr)
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
 
 class ResponsesAdapterServer(ThreadingHTTPServer):

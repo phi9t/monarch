@@ -102,6 +102,7 @@ components:
     model_name_ref: component://sglang_backend/served_model_name
     logs_root: run://logs/responses-adapter
     startup_timeout_seconds: 120
+    timeout_seconds: 1800
 probes:
   sglang:
     models_required: true
@@ -1100,6 +1101,8 @@ def test_responses_adapter_argv_uses_materialized_dynamo_url(tmp_path: Path) -> 
 
     assert "--chat-base-url" in argv
     assert config.components["dynamo_frontend"]["openai_base_url"] in argv
+    assert "--timeout-seconds" in argv
+    assert argv[argv.index("--timeout-seconds") + 1] == "1800"
     assert "8080" not in argv
     assert "http://127.0.0.1:8000/v1" not in argv
 

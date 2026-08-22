@@ -28,6 +28,21 @@ responses_function_call_to_harbor_action = (
 write_trial_artifact = glm52_harbor_agent.write_trial_artifact
 
 
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes, content_type: str = "application/json") -> None:
+        self.body = body
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.body
+
+
 def test_agent_builds_responses_request_with_codex_profile() -> None:
     agent = GLM52HarborAgent(
         responses_base_url="http://host.docker.internal:8080/v1",
@@ -291,6 +306,192 @@ def test_agent_run_executes_terminal_tool_and_records_final_context(
     assert context.metadata["final_response_id"] == "resp_2"
     assert context.metadata["final_message"] == "finished"
     assert context.metadata["usage"] == {"input_tokens": 31, "output_tokens": 7}
+
+
+def test_agent_run_executes_glm_inline_terminal_tool_calls(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    agent = GLM52HarborAgent(
+        logs_dir=tmp_path,
+        model_name="zai-org/GLM-5.2",
+        responses_base_url="http://127.0.0.1:18081/v1",
+        local_host_route="127.0.0.1",
+        stream=True,
+    )
+    responses = [
+        {
+            "id": "resp_1",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                "I will inspect the workspace."
+                                "<tool_call>terminal_run"
+                                "<arg_key>command</arg_key>"
+                                "<arg_value>pwd</arg_value>"
+                                "<arg_key>timeout_sec</arg_key>"
+                                "<arg_value>5</arg_value>"
+                                "</tool_call>"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "id": "resp_2",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "finished"},
+                    ],
+                }
+            ],
+        },
+    ]
+    sent_requests = []
+
+    async def fake_post(agent, request):
+        sent_requests.append(request)
+        return responses[len(sent_requests) - 1]
+
+    monkeypatch.setattr(
+        glm52_harbor_agent,
+        "_post_responses_request",
+        fake_post,
+        raising=False,
+    )
+
+    class FakeEnvironment:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def exec(
+            self,
+            command,
+            cwd=None,
+            env=None,
+            timeout_sec=None,
+            user=None,
+        ):
+            self.calls.append(
+                {
+                    "command": command,
+                    "cwd": cwd,
+                    "env": env,
+                    "timeout_sec": timeout_sec,
+                    "user": user,
+                }
+            )
+            return SimpleNamespace(stdout="/workspace", stderr="", return_code=0)
+
+    environment = FakeEnvironment()
+    context = SimpleNamespace(metadata={})
+
+    asyncio.run(
+        agent.run(
+            instruction="Use the terminal once.",
+            environment=environment,
+            context=context,
+        )
+    )
+
+    assert environment.calls == [
+        {
+            "command": "pwd",
+            "cwd": None,
+            "env": None,
+            "timeout_sec": 5,
+            "user": None,
+        }
+    ]
+    assert sent_requests[1]["previous_response_id"] == "resp_1"
+    assert sent_requests[1]["input"][0]["type"] == "function_call"
+    assert sent_requests[1]["input"][1]["type"] == "function_call_output"
+    assert context.metadata["final_response_id"] == "resp_2"
+
+
+def test_post_responses_request_accepts_streaming_sse(monkeypatch) -> None:
+    agent = GLM52HarborAgent(
+        model_name="zai-org/GLM-5.2",
+        responses_base_url="http://127.0.0.1:18081/v1",
+        responses_timeout_seconds=1800,
+        stream=True,
+    )
+    body = b"".join(
+        [
+            b'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
+            b'data: {"type":"response.output_item.done","output_index":0,'
+            b'"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}\n\n',
+            b'data: {"type":"response.completed","response":{"id":"resp_1","output":['
+            b'{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}'
+            b'],"usage":{"input_tokens":3,"output_tokens":1}}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 1800
+        return _FakeHTTPResponse(body, content_type="text/event-stream")
+
+    monkeypatch.setattr(glm52_harbor_agent.urllib_request, "urlopen", fake_urlopen)
+
+    response = glm52_harbor_agent._post_responses_request_sync(
+        agent,
+        {"model": "zai-org/GLM-5.2", "stream": True},
+    )
+
+    assert response["id"] == "resp_1"
+    assert response["output"][0]["content"][0]["text"] == "done"
+    assert response["usage"] == {"input_tokens": 3, "output_tokens": 1}
+
+
+def test_post_responses_request_reconstructs_done_stream_without_completed(
+    monkeypatch,
+) -> None:
+    agent = GLM52HarborAgent(
+        model_name="zai-org/GLM-5.2",
+        responses_base_url="http://127.0.0.1:18081/v1",
+        responses_timeout_seconds=1800,
+        stream=True,
+    )
+    body = b"".join(
+        [
+            b'data: {"type":"response.created","response":{"id":"resp_1","model":"glm-5.2"}}\n\n',
+            b'data: {"type":"response.output_item.done","output_index":0,"item":'
+            b'{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 1800
+        return _FakeHTTPResponse(body, content_type="text/event-stream")
+
+    monkeypatch.setattr(glm52_harbor_agent.urllib_request, "urlopen", fake_urlopen)
+
+    response = glm52_harbor_agent._post_responses_request_sync(
+        agent,
+        {"model": "zai-org/GLM-5.2", "stream": True},
+    )
+
+    assert response["id"] == "resp_1"
+    assert response["model"] == "glm-5.2"
+    assert response["status"] == "completed"
+    assert response["output"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}],
+        }
+    ]
 
 
 def test_agent_returns_harbor_trial_agent_info(tmp_path: Path) -> None:

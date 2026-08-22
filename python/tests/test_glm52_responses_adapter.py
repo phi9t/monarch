@@ -6,6 +6,7 @@
 
 import importlib.util
 import json
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -481,6 +482,30 @@ def test_function_call_output_continuation_converts_to_chat_tool_message() -> No
             "content": "{\"path\": \"README.md\", \"contents\": \"Monarch\"}",
         },
     ]
+
+
+def test_parse_sse_data_events_reports_upstream_read_timeout() -> None:
+    def timed_out_lines():
+        yield b'data: {"id":"chatcmpl_1","choices":[{"delta":{"content":"partial"}}]}\n'
+        raise TimeoutError("timed out")
+
+    with pytest.raises(
+        glm52_responses_adapter.AdapterError,
+        match="downstream Chat Completions stream timed out",
+    ):
+        list(glm52_responses_adapter.parse_sse_data_events(timed_out_lines()))
+
+
+def test_parse_sse_data_events_reports_upstream_socket_timeout() -> None:
+    def timed_out_lines():
+        yield b'data: {"id":"chatcmpl_1","choices":[{"delta":{"content":"partial"}}]}\n'
+        raise socket.timeout("timed out")
+
+    with pytest.raises(
+        glm52_responses_adapter.AdapterError,
+        match="downstream Chat Completions stream timed out",
+    ):
+        list(glm52_responses_adapter.parse_sse_data_events(timed_out_lines()))
 
 
 def test_build_parser_reads_documented_adapter_environment(

@@ -58,6 +58,7 @@ components:
     model_name_ref: component://sglang_backend/served_model_name
     logs_root: run://logs/responses-adapter
     startup_timeout_seconds: 120
+    timeout_seconds: 1800
 probes:
   sglang:
     models_required: true

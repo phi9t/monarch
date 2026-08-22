@@ -25,6 +25,10 @@ from urllib.parse import urlparse
 import urllib.request
 import uuid
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import yaml
 
 from ginkgo.insula.bwrap_plan import build_bwrap_argv
@@ -38,7 +42,6 @@ from ginkgo.insula.schema import InsulaConfigError
 from ginkgo.insula.schema import InsulaEnvironmentSpec
 from ginkgo.insula.schema import InsulaInvocationSpec
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 SGLANG_VENV_SANDBOX_PATH = "/cache/glm52/venvs/sglang"
 SGLANG_VENV_PYTHON = f"{SGLANG_VENV_SANDBOX_PATH}/bin/python"
 SGLANG_HF_HOME_SANDBOX_PATH = "/cache/glm52/hf-home"
@@ -2782,12 +2785,13 @@ def repeat_runtime(
                     stable_seconds=gpu_free_stable_seconds,
                 )
             except Exception as wait_error:
-                cycle_summary["gpu_wait"] = {
+                gpu_wait_summary: dict[str, Any] = {
                     "status": "failed",
                     "error": str(wait_error),
                 }
                 if isinstance(wait_error, GpuOccupancyError):
-                    cycle_summary["gpu_wait"]["blocked_gpus"] = wait_error.blocked_gpus
+                    gpu_wait_summary["blocked_gpus"] = wait_error.blocked_gpus
+                cycle_summary["gpu_wait"] = gpu_wait_summary
                 summaries.append(cycle_summary)
                 _write_repeat_summary(
                     loop_summary_path,
@@ -2804,12 +2808,13 @@ def repeat_runtime(
             )
             cycle_summary["launch"] = launch_runtime(config, local_environment=local_environment)
         except Exception as launch_error:
-            cycle_summary["launch"] = {
+            launch_summary: dict[str, Any] = {
                 "status": "failed",
                 "error": str(launch_error),
             }
             if isinstance(launch_error, GpuOccupancyError):
-                cycle_summary["launch"]["blocked_gpus"] = launch_error.blocked_gpus
+                launch_summary["blocked_gpus"] = launch_error.blocked_gpus
+            cycle_summary["launch"] = launch_summary
             cycle_summary["teardown"] = _repeat_launch_failure_teardown(config, local_environment)
             summaries.append(cycle_summary)
             _write_repeat_summary(

@@ -260,11 +260,13 @@ def materialize_inference_config(
             "openai_base_url": responses_url,
             "upstream_url": dynamo_url,
             "served_model_name": model_name,
+            "timeout_seconds": declared.components["responses_adapter"]["timeout_seconds"],
             "argv": _responses_adapter_argv(
                 host=declared.ports.bind_host,
                 port=ports["responses_adapter"],
                 upstream_url=dynamo_url,
                 model_name=model_name,
+                timeout_seconds=declared.components["responses_adapter"]["timeout_seconds"],
             ),
             "process_record": f"{run_dir}/components/responses-adapter/process.json",
         },
@@ -1055,7 +1057,16 @@ def _parse_components(value: Any) -> dict[str, Any]:
     responses = _require_mapping(mapping["responses_adapter"], "components.responses_adapter")
     _reject_unknown(
         responses,
-        {"enabled", "execution_domain", "bind_host", "upstream_ref", "model_name_ref", "logs_root", "startup_timeout_seconds"},
+        {
+            "enabled",
+            "execution_domain",
+            "bind_host",
+            "upstream_ref",
+            "model_name_ref",
+            "logs_root",
+            "startup_timeout_seconds",
+            "timeout_seconds",
+        },
         "components.responses_adapter",
     )
     _require_enabled(responses, "components.responses_adapter")
@@ -1063,6 +1074,9 @@ def _parse_components(value: Any) -> dict[str, Any]:
     _component_ref(_required_str(responses, "upstream_ref", "components.responses_adapter"), "components.responses_adapter.upstream_ref")
     _component_ref(_required_str(responses, "model_name_ref", "components.responses_adapter"), "components.responses_adapter.model_name_ref")
     _logical_ref(_required_str(responses, "logs_root", "components.responses_adapter"), "components.responses_adapter.logs_root")
+    timeout_seconds = _required_int(responses, "timeout_seconds", "components.responses_adapter")
+    if timeout_seconds <= 0:
+        raise InferenceConfigError("components.responses_adapter.timeout_seconds must be positive")
     return mapping
 
 
@@ -1213,7 +1227,7 @@ def _dynamo_worker_argv(component: dict[str, Any], *, python: str, model_name: s
     ]
 
 
-def _responses_adapter_argv(*, host: str, port: int, upstream_url: str, model_name: str) -> list[str]:
+def _responses_adapter_argv(*, host: str, port: int, upstream_url: str, model_name: str, timeout_seconds: int) -> list[str]:
     return [
         "python",
         "scripts/glm52_responses_adapter.py",
@@ -1225,6 +1239,8 @@ def _responses_adapter_argv(*, host: str, port: int, upstream_url: str, model_na
         model_name,
         "--chat-base-url",
         upstream_url,
+        "--timeout-seconds",
+        str(timeout_seconds),
     ]
 
 
