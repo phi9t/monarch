@@ -61,6 +61,7 @@ build_parser = glm52_benchmark_verifier.build_parser
 load_yaml_object = glm52_benchmark_verifier.load_yaml_object
 select_suites = glm52_benchmark_verifier.select_suites
 validate_suite_fields = glm52_benchmark_verifier.validate_suite_fields
+write_harbor_job_config = glm52_benchmark_verifier.write_harbor_job_config
 
 
 REQUIRED_FIXTURE_SUITE_IDS = [
@@ -579,6 +580,9 @@ def test_write_bwrap_smoke_summary_records_contract_artifacts(tmp_path: Path) ->
                     f"    execution_backend: {'harbor_local_docker' if suite_id == 'terminal-bench-2' else 'bwrap_rootfs'}\n"
                     "    decoding_profile:\n"
                     "      temperature: 0.2\n"
+                    "      top_p: 0.95\n"
+                    "      max_output_tokens: 4096\n"
+                    "      glm_thinking: disabled\n"
                     "    metric: exact_match"
                     for suite_id in REQUIRED_FIXTURE_SUITE_IDS
                 ],
@@ -5449,6 +5453,9 @@ def test_terminal_bench_smoke_classifies_bad_responses_models_endpoint_before_ha
                     f"    execution_backend: {'harbor_local_docker' if suite_id == 'terminal-bench-2' else 'bwrap_rootfs'}\n"
                     "    decoding_profile:\n"
                     "      temperature: 0.2\n"
+                    "      top_p: 0.95\n"
+                    "      max_output_tokens: 4096\n"
+                    "      glm_thinking: disabled\n"
                     "    metric: exact_match"
                     for suite_id in REQUIRED_FIXTURE_SUITE_IDS
                 ],
@@ -6212,6 +6219,9 @@ def test_terminal_bench_smoke_invokes_real_harbor_run_config(
                     f"    execution_backend: {'harbor_local_docker' if suite_id == 'terminal-bench-2' else 'bwrap_rootfs'}\n"
                     "    decoding_profile:\n"
                     "      temperature: 0.2\n"
+                    "      top_p: 0.95\n"
+                    "      max_output_tokens: 4096\n"
+                    "      glm_thinking: disabled\n"
                     "    metric: exact_match"
                     for suite_id in REQUIRED_FIXTURE_SUITE_IDS
                 ],
@@ -6254,6 +6264,12 @@ def test_terminal_bench_smoke_invokes_real_harbor_run_config(
                     "local_host_route": "host.docker.internal",
                     "responses_timeout_seconds": 1800,
                     "stream": True,
+                    "decoding_profile": {
+                        "temperature": 0.2,
+                        "top_p": 0.95,
+                        "max_output_tokens": 4096,
+                        "glm_thinking": "disabled",
+                    },
                 },
             }
         ]
@@ -6345,6 +6361,9 @@ def test_swe_bench_smoke_invokes_real_harbor_run_config(
                     f"    execution_backend: {'harbor_local_docker' if suite_id == 'swe-bench-verified' else 'bwrap_rootfs'}\n"
                     "    decoding_profile:\n"
                     "      temperature: 0.2\n"
+                    "      top_p: 0.95\n"
+                    "      max_output_tokens: 4096\n"
+                    "      glm_thinking: disabled\n"
                     "    metric: exact_match"
                     for suite_id in REQUIRED_FIXTURE_SUITE_IDS
                 ],
@@ -6378,6 +6397,7 @@ def test_swe_bench_smoke_invokes_real_harbor_run_config(
         assert job_config["environment"]["extra_allowed_hosts"] == [
             "host.docker.internal"
         ]
+        output_dir = Path(job_config["jobs_dir"])
         assert job_config["agents"] == [
             {
                 "import_path": "scripts.glm52_harbor_agent:GLM52HarborAgent",
@@ -6388,37 +6408,38 @@ def test_swe_bench_smoke_invokes_real_harbor_run_config(
                     "local_host_route": "host.docker.internal",
                     "responses_timeout_seconds": 1800,
                     "stream": True,
+                    "decoding_profile": {
+                        "temperature": 0.2,
+                        "top_p": 0.95,
+                        "max_output_tokens": 4096,
+                        "glm_thinking": "disabled",
+                    },
                 },
             }
         ]
-        assert job_config["datasets"] == [
+        assert job_config["datasets"] == []
+        assert job_config["tasks"] == [
             {
-                "name": "swe-bench-verified",
-                "adapter": "swebench_verified",
-                "dataset_source": {
-                    "type": "huggingface_or_swebench",
-                    "dataset": "SWE-bench/SWE-bench_Verified",
-                    "repo_type": "dataset",
-                    "revision": SWEBENCH_VERIFIED_HF_DATASET_REVISION,
-                },
-                "harness_source": {
-                    "type": "git",
-                    "url": "https://github.com/SWE-bench/SWE-bench.git",
-                    "revision": SWEBENCH_HARNESS_REVISION,
-                },
-                "instance_ids": [SWEBENCH_SMOKE_INSTANCE],
-                "instance_images": [
-                    {
-                        "instance_id": SWEBENCH_SMOKE_INSTANCE,
-                        "row_image": SWEBENCH_SMOKE_ROW_IMAGE,
-                        "image_digest": SWEBENCH_SMOKE_IMAGE_DIGEST,
-                    }
-                ],
+                "path": str(
+                    output_dir
+                    / "swe-bench-verified-tasks"
+                    / SWEBENCH_SMOKE_INSTANCE
+                )
             }
         ]
-        output_dir = (
-            tmp_path / "results" / "swebench-harbor-real-cli" / "harbor-raw"
+        task_root = (
+            output_dir / "swe-bench-verified-tasks" / SWEBENCH_SMOKE_INSTANCE
         )
+        task_toml = task_root / "task.toml"
+        assert task_toml.is_file()
+        task_config = task_toml.read_text()
+        assert f'name = "swebench/{SWEBENCH_SMOKE_INSTANCE}"' in task_config
+        assert f'docker_image = "{SWEBENCH_SMOKE_IMAGE_DIGEST}"' in task_config
+        assert f'dataset_revision = "{SWEBENCH_VERIFIED_HF_DATASET_REVISION}"' in task_config
+        assert f'harness_revision = "{SWEBENCH_HARNESS_REVISION}"' in task_config
+        assert (task_root / "instruction.md").is_file()
+        assert (task_root / "environment").is_dir()
+        assert (task_root / "tests" / "test.sh").is_file()
         (output_dir / "artifacts").mkdir(parents=True)
         (output_dir / "trials.jsonl").write_text(
             json.dumps(
@@ -6474,6 +6495,63 @@ def test_swe_bench_smoke_invokes_real_harbor_run_config(
     )
 
     assert args.func(args) == 0
+
+
+def test_swe_bench_harbor_job_config_uses_local_task_not_registry_dataset(
+    tmp_path: Path,
+) -> None:
+    config = load_harbor_smoke_config(
+        REPO_ROOT
+        / ".scratch/glm52-local-serving/harbor/configs/swe-bench-verified-smoke.yaml"
+    )
+    output_dir = tmp_path / "harbor-raw"
+
+    config_path = write_harbor_job_config(
+        path=output_dir / "job-config.yaml",
+        run_id="swebench-local-task",
+        harbor_output_dir=output_dir,
+        smoke_config=config,
+        decoding_profile={
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "max_output_tokens": 4096,
+            "glm_thinking": "disabled",
+        },
+        responses_base_url="http://127.0.0.1:18081/v1",
+        local_host_route="host.docker.internal",
+        local_container_runtime="docker",
+    )
+
+    job_config = load_yaml_object(config_path)
+    assert job_config["datasets"] == []
+    assert job_config["tasks"] == [
+        {
+            "path": str(
+                output_dir / "swe-bench-verified-tasks" / SWEBENCH_SMOKE_INSTANCE
+            )
+        }
+    ]
+    task_dir = output_dir / "swe-bench-verified-tasks" / SWEBENCH_SMOKE_INSTANCE
+    assert task_dir.is_dir()
+    assert (task_dir / "instruction.md").read_text().startswith(
+        "Resolve SWE-bench Verified instance astropy__astropy-12907"
+    )
+    assert (task_dir / "environment").is_dir()
+    assert (task_dir / "tests" / "test.sh").read_text() == (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "exit 0\n"
+    )
+    task_toml = (task_dir / "task.toml").read_text()
+    assert f'name = "swebench/{SWEBENCH_SMOKE_INSTANCE}"' in task_toml
+    assert f'docker_image = "{SWEBENCH_SMOKE_IMAGE_DIGEST}"' in task_toml
+    assert "disable = true" in task_toml
+
+    try:
+        from harbor.models.job.config import JobConfig
+    except ImportError:
+        return
+    JobConfig.model_validate(job_config)
 
 
 def test_swe_bench_smoke_refuses_harbor_launch_inside_rootfs(

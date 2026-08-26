@@ -418,6 +418,71 @@ def test_agent_run_executes_glm_inline_terminal_tool_calls(
     assert context.metadata["final_response_id"] == "resp_2"
 
 
+def test_agent_run_records_inflight_request_when_cancelled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    agent = GLM52HarborAgent(
+        logs_dir=tmp_path,
+        model_name="zai-org/GLM-5.2",
+        responses_base_url="http://127.0.0.1:18081/v1",
+        responses_timeout_seconds=1800,
+        stream=True,
+        decoding_profile={
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "max_output_tokens": 4096,
+            "glm_thinking": "disabled",
+        },
+    )
+    started = asyncio.Event()
+
+    async def fake_post(agent, request):
+        started.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(
+        glm52_harbor_agent,
+        "_post_responses_request",
+        fake_post,
+        raising=False,
+    )
+
+    async def run_and_cancel():
+        context = SimpleNamespace(metadata={})
+        task = asyncio.create_task(
+            agent.run(
+                instruction="Use the terminal once.",
+                environment=object(),
+                context=context,
+            )
+        )
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return context
+
+    context = asyncio.run(run_and_cancel())
+
+    in_flight = context.metadata["inflight_responses_request"]
+    assert in_flight["stage"] == "initial_request"
+    assert in_flight["endpoint"] == "http://127.0.0.1:18081/v1/responses"
+    assert in_flight["timeout_seconds"] == 1800
+    assert in_flight["stream"] is True
+    assert in_flight["input_items"] == 1
+    assert in_flight["tools"] == ["terminal_run"]
+    assert in_flight["decoding_profile"] == {
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "max_output_tokens": 4096,
+        "glm_thinking": "disabled",
+    }
+    assert in_flight["elapsed_seconds"] >= 0
+
+
 def test_post_responses_request_accepts_streaming_sse(monkeypatch) -> None:
     agent = GLM52HarborAgent(
         model_name="zai-org/GLM-5.2",

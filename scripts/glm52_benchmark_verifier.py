@@ -406,15 +406,21 @@ def write_harbor_job_config(
     run_id: str,
     harbor_output_dir: Path,
     smoke_config: dict[str, Any],
+    decoding_profile: dict[str, Any],
     responses_base_url: str,
     local_host_route: str,
     local_container_runtime: str,
 ) -> Path:
     suite_id = smoke_config.get("suite")
     if suite_id == "swe-bench-verified":
-        dataset_config = _build_swe_bench_harbor_dataset_config(smoke_config)
+        dataset_configs: list[dict[str, Any]] = []
+        task_configs = _build_swe_bench_harbor_tasks(
+            smoke_config=smoke_config,
+            harbor_output_dir=harbor_output_dir,
+        )
     elif suite_id == "terminal-bench-2":
-        dataset_config = _build_terminal_bench_harbor_dataset_config(smoke_config)
+        dataset_configs = [_build_terminal_bench_harbor_dataset_config(smoke_config)]
+        task_configs = []
     else:
         raise BenchmarkVerifierError(
             "Harbor smoke config must target terminal-bench-2 or swe-bench-verified"
@@ -444,10 +450,12 @@ def write_harbor_job_config(
                     "local_host_route": local_host_route,
                     "responses_timeout_seconds": timeout_seconds,
                     "stream": bool(smoke_config.get("stream")),
+                    "decoding_profile": dict(decoding_profile),
                 },
             }
         ],
-        "datasets": [dataset_config],
+        "datasets": dataset_configs,
+        "tasks": task_configs,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(job_config, sort_keys=False))
@@ -519,9 +527,11 @@ def _build_terminal_bench_harbor_dataset_config(
     }
 
 
-def _build_swe_bench_harbor_dataset_config(
+def _build_swe_bench_harbor_tasks(
+    *,
     smoke_config: dict[str, Any],
-) -> dict[str, Any]:
+    harbor_output_dir: Path,
+) -> list[dict[str, Any]]:
     subset = smoke_config.get("subset")
     if not isinstance(subset, dict):
         raise BenchmarkVerifierError("Harbor smoke config subset must be an object")
@@ -557,21 +567,77 @@ def _build_swe_bench_harbor_dataset_config(
         raise BenchmarkVerifierError(
             "SWE-bench Harbor smoke config requires pass image metadata"
         )
-    return {
-        "name": "swe-bench-verified",
-        "adapter": dataset_adapter,
-        "dataset_source": dataset_source,
-        "harness_source": harness_source,
-        "instance_ids": smoke_instances,
-        "instance_images": [
-            {
-                "instance_id": record["instance_id"],
-                "row_image": record["row_image"],
-                "image_digest": record["image_digest"],
-            }
-            for record in image_records
-        ],
-    }
+    records_by_instance = {record["instance_id"]: record for record in image_records}
+    task_root = harbor_output_dir / "swe-bench-verified-tasks"
+    tasks = []
+    for instance_id in smoke_instances:
+        record = records_by_instance[instance_id]
+        instance_task_root = task_root / instance_id
+        _write_swe_bench_harbor_task(
+            task_root=instance_task_root,
+            instance_id=instance_id,
+            dataset_revision=dataset_source["revision"],
+            harness_revision=harness_source["revision"],
+            dataset_adapter=dataset_adapter,
+            row_image=record["row_image"],
+            image_digest=record["image_digest"],
+        )
+        tasks.append({"path": str(instance_task_root)})
+    return tasks
+
+
+def _write_swe_bench_harbor_task(
+    *,
+    task_root: Path,
+    instance_id: str,
+    dataset_revision: str,
+    harness_revision: str,
+    dataset_adapter: str,
+    row_image: str,
+    image_digest: str,
+) -> None:
+    task_root.mkdir(parents=True, exist_ok=True)
+    (task_root / "environment").mkdir(exist_ok=True)
+    tests_dir = task_root / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (task_root / "instruction.md").write_text(
+        f"Resolve SWE-bench Verified instance {instance_id}.\n\n"
+        "Work in the checked-out repository provided by the task image. "
+        "Produce the minimal source change that fixes the instance, and leave "
+        "the final patch in the workspace for collection.\n"
+    )
+    test_script = tests_dir / "test.sh"
+    test_script.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n")
+    test_script.chmod(0o755)
+    (task_root / "task.toml").write_text(
+        "\n".join(
+            [
+                "schema_version = \"1.4\"",
+                "",
+                "[task]",
+                f"name = \"swebench/{instance_id}\"",
+                "description = \"Local smoke wrapper for one pinned SWE-bench Verified instance\"",
+                "",
+                "[metadata]",
+                "suite = \"swe-bench-verified\"",
+                f"instance_id = \"{instance_id}\"",
+                f"dataset_adapter = \"{dataset_adapter}\"",
+                f"dataset_revision = \"{dataset_revision}\"",
+                f"harness_revision = \"{harness_revision}\"",
+                f"row_image = \"{row_image}\"",
+                f"image_digest = \"{image_digest}\"",
+                "conformance_claim = \"none\"",
+                "comparable_to_published = false",
+                "",
+                "[environment]",
+                f"docker_image = \"{image_digest}\"",
+                "",
+                "[verifier]",
+                "disable = true",
+                "",
+            ]
+        )
+    )
 
 
 def select_suites(manifest: dict[str, Any], suite_ids: list[str]) -> list[dict[str, Any]]:
@@ -6900,6 +6966,16 @@ def _cmd_harbor_smoke(args: argparse.Namespace, suite_id: str) -> int:
             f"Harbor smoke config suite must match requested suite: {suite_id}"
         )
     manifest = load_yaml_object(args.manifest) if args.manifest is not None else None
+    selected_suite = select_suites(manifest, [suite_id])[0] if manifest is not None else None
+    decoding_profile = (
+        selected_suite["decoding_profile"]
+        if selected_suite is not None
+        else smoke_config.get("decoding_profile", {})
+    )
+    if not isinstance(decoding_profile, dict):
+        raise BenchmarkVerifierError(
+            f"suite {suite_id} decoding_profile must be an object"
+        )
     harbor_executable = shutil.which("harbor")
     runtime_executable = shutil.which(args.local_container_runtime)
     environment_diagnostics = build_harbor_environment_diagnostics(
@@ -6981,6 +7057,7 @@ def _cmd_harbor_smoke(args: argparse.Namespace, suite_id: str) -> int:
         run_id=args.run_id,
         harbor_output_dir=harbor_output_dir,
         smoke_config=smoke_config,
+        decoding_profile=decoding_profile,
         responses_base_url=args.responses_base_url,
         local_host_route=args.local_host_route,
         local_container_runtime=args.local_container_runtime,

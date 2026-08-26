@@ -541,6 +541,31 @@ Each ticket is `ready-for-agent` and carries blocker links, behavioral test
 requirements, exclusions, and verification evidence. Work blockers-first. Do
 not treat this ordered list as an implementation ticket by itself.
 
+## Execution-Phase Scope
+
+The current run-execution phase is specified in
+`run-experiment-sequence-spec.md`. It starts from the fortified GLM52 serving
+baseline and drives three known benchmark blockers before any larger run:
+
+- Terminal-Bench 2 reaches Harbor and GLM52 streaming but times out in the
+  model/tool loop after 1800 seconds.
+- AIME times out through local Responses serving with no scorable response.
+- SWE-bench Verified fails before trial execution because Harbor cannot resolve
+  dataset `swe-bench-verified`.
+
+The execution-phase ticket order is:
+
+1. `issues/19-terminal-bench-loop-diagnosis.md`
+2. `issues/20-aime-serving-timeout-diagnosis.md`
+3. `issues/21-swebench-harbor-dataset-resolution.md`
+4. `issues/22-host-orchestration-preflight.md`
+5. `issues/23-representative-pilot-runbook.md`
+6. `issues/24-scale-up-authorization-gates.md`
+
+Tickets 19 through 22 may proceed independently. Ticket 23 may run only after
+the blocker tickets are resolved or explicitly deferred with evidence. Ticket
+24 defines the authorization boundary for larger benchmark loads.
+
 ## Verification Strategy
 
 Implementation tickets must be test-first. Initial checks should include:

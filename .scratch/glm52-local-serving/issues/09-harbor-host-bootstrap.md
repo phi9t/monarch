@@ -141,5 +141,55 @@ Current next actions:
   codify use of the scratch Harbor venv.
 - Diagnose the Terminal-Bench model/tool-loop nontermination from the stored
   Harbor trajectory before increasing the timeout again.
-- Replace or adapt the SWE-bench Harbor dataset config so Harbor uses a real
-  resolvable dataset/task source for the pinned smoke instance.
+- Start the local Responses adapter before rerunning SWE-bench Verified; the
+  Harbor dataset ambiguity has been removed.
+
+### 2026-08-23 SWE-bench local-task update
+
+The SWE-bench Verified Harbor smoke no longer emits the bare
+`name: swe-bench-verified` dataset that Harbor resolves against its default
+registry. The generated Harbor job now uses `datasets: []` and explicit local
+`tasks` rooted under `harbor-raw/swe-bench-verified-tasks/`, with each task
+recording the pinned dataset revision, SWE-bench harness revision, smoke
+instance, official row image, and digest-pinned image in `task.toml`.
+
+Run `benchmark-e2e-swe-bench-verified-dataset-20260823T175003Z` used the
+scratch Harbor CLI and stopped before Harbor execution because the Responses
+adapter was not listening:
+
+```text
+Responses /models preflight failed for http://127.0.0.1:18081/v1/models:
+<urlopen error [Errno 111] Connection refused>
+```
+
+This confirms the current blocker is serving availability, not Harbor dataset
+registry resolution.
+
+### 2026-08-23 host preflight update
+
+Harbor bootstrap is no longer the immediate host blocker when using the pinned
+scratch venv path:
+
+```sh
+PATH=.scratch/glm52-local-serving/tmp/harbor-venv/bin:$PATH harbor --help
+```
+
+The verifier direct host path also imports correctly from the repo root with
+`PYTHONPATH=$PWD`.
+
+Run `benchmark-e2e-terminal-bench-2-loop-diagnosis-20260823T172406Z` stopped
+before Harbor execution because the Responses adapter was not listening:
+
+```text
+Responses /models preflight failed for http://127.0.0.1:18081/v1/models:
+<urlopen error [Errno 111] Connection refused>
+```
+
+The generated summary is
+`glm52-benchmark-results/benchmark-e2e-terminal-bench-2-loop-diagnosis-20260823T172406Z/summary.json`.
+Docker and Harbor were detected as available in the host-control environment.
+
+Do not start the GLM52 SGLang serving stack until the 8-GPU allocation is free:
+the current local serving config uses `cuda_visible_devices: \"0,1,2,3,4,5,6,7\"`
+and `tensor_parallel_size: 8`, while GPU 0 was occupied by a user-owned
+`torchtitan.train` process during this check.

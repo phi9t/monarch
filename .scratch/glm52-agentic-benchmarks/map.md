@@ -52,11 +52,19 @@ infrastructure-failure accounting.
 - Implementation tickets 07 through 18 are created as the `ready-for-agent`
   queue. Work them blockers-first and keep each implementation slice in a fresh
   context.
+- Execution-phase tickets 19 through 24 are created for the current
+  blockers-first benchmark run sequence. They start from the fortified GLM52
+  serving baseline and do not reopen the v1 platform architecture.
 
 ## Remaining Fog
 
-- Which large-suite runs require explicit user authorization because of cost,
-  runtime, or GPU occupancy?
+- The exact Terminal-Bench 2 timeout cause is unknown until its stored Harbor
+  trajectory and live one-task smoke are minimized.
+- The exact AIME timeout cause is unknown until the same prompt is compared
+  across the Responses adapter, Chat Completions endpoint, and native SGLang
+  generation path.
+- The correct SWE-bench Verified Harbor dataset representation is unknown until
+  Harbor 0.21.0 registry, local dataset, and package dataset modes are checked.
 - Which stateful-tool suite, MCP Atlas or tau-bench, should be the first v1
   pilot after endpoint and sandbox contracts exist?
 
@@ -74,6 +82,19 @@ infrastructure-failure accounting.
 - `issues/16-stateful-tool-pilot-selection.md`
 - `issues/17-gdpval-proxy-local-pilot.md`
 - `issues/18-future-cluster-control-plane-adr.md`
+
+## Execution-Phase Queue
+
+- `run-experiment-sequence-spec.md`
+- `issues/19-terminal-bench-loop-diagnosis.md`
+- `issues/20-aime-serving-timeout-diagnosis.md`
+- `issues/21-swebench-harbor-dataset-resolution.md`
+- `issues/22-host-orchestration-preflight.md`
+- `issues/23-representative-pilot-runbook.md`
+- `issues/24-scale-up-authorization-gates.md`
+
+Tickets 19, 20, 21, and 22 are independent blocker tickets. Ticket 23 is
+blocked by their outcomes. Ticket 24 is blocked by ticket 23.
 
 ## Desired End State
 

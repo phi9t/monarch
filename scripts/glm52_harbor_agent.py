@@ -45,6 +45,7 @@ class GLM52HarborAgent:
     local_host_route: str = "host.docker.internal"
     responses_timeout_seconds: int = 120
     stream: bool = True
+    decoding_profile: dict[str, Any]
     extra_env: dict[str, str]
     logs_dir: Path | None = None
 
@@ -57,6 +58,7 @@ class GLM52HarborAgent:
         local_host_route: str = "host.docker.internal",
         responses_timeout_seconds: int = 120,
         stream: bool = True,
+        decoding_profile: dict[str, Any] | None = None,
         logs_dir: Path | str | None = None,
         **_kwargs: Any,
     ) -> None:
@@ -72,6 +74,11 @@ class GLM52HarborAgent:
         object.__setattr__(self, "local_host_route", local_host_route)
         object.__setattr__(self, "responses_timeout_seconds", responses_timeout_seconds)
         object.__setattr__(self, "stream", stream)
+        object.__setattr__(
+            self,
+            "decoding_profile",
+            {} if decoding_profile is None else dict(decoding_profile),
+        )
         object.__setattr__(self, "extra_env", {})
         object.__setattr__(self, "logs_dir", None if logs_dir is None else Path(logs_dir))
 
@@ -91,9 +98,11 @@ class GLM52HarborAgent:
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
         tools = [_terminal_tool()]
-        response = await _post_responses_request(
+        response = await _post_responses_request_with_context(
             self,
-            self.build_responses_request(
+            context,
+            stage="initial_request",
+            request=self.build_responses_request(
                 task_instruction=instruction,
                 observation="No prior observation.",
                 tools=tools,
@@ -127,17 +136,21 @@ class GLM52HarborAgent:
             request_input = outputs
             if inline_function_calls:
                 request_input = [*inline_function_calls, *outputs]
-            response = await _post_responses_request(
+            response = await _post_responses_request_with_context(
                 self,
-                {
-                    "model": self.model,
-                    "input": request_input,
-                    "previous_response_id": response_id,
-                    "tools": [_harbor_tool_to_responses_tool(tool) for tool in tools],
-                    "tool_choice": "auto",
-                    "stream": self.stream,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
+                context,
+                stage="tool_result",
+                request=self._with_decoding_profile(
+                    {
+                        "model": self.model,
+                        "input": request_input,
+                        "previous_response_id": response_id,
+                        "tools": [_harbor_tool_to_responses_tool(tool) for tool in tools],
+                        "tool_choice": "auto",
+                        "stream": self.stream,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
+                ),
             )
 
         raise HarborAgentError("responses tool loop exceeded maximum iterations")
@@ -192,6 +205,24 @@ class GLM52HarborAgent:
         }
         if previous_response_id is not None:
             request["previous_response_id"] = previous_response_id
+        return self._with_decoding_profile(request)
+
+    def _with_decoding_profile(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not self.decoding_profile:
+            return request
+        for source, target in (
+            ("temperature", "temperature"),
+            ("top_p", "top_p"),
+            ("max_output_tokens", "max_output_tokens"),
+        ):
+            value = self.decoding_profile.get(source)
+            if value is not None:
+                request[target] = value
+        glm_thinking = self.decoding_profile.get("glm_thinking")
+        if glm_thinking is not None:
+            chat_template_kwargs = dict(request.get("chat_template_kwargs") or {})
+            chat_template_kwargs["enable_thinking"] = glm_thinking == "enabled"
+            request["chat_template_kwargs"] = chat_template_kwargs
         return request
 
 
@@ -412,6 +443,67 @@ def _extract_final_message(response: dict[str, Any]) -> str | None:
     if not texts:
         return None
     return "\n".join(texts)
+
+
+async def _post_responses_request_with_context(
+    agent: GLM52HarborAgent,
+    context: Any,
+    *,
+    stage: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = getattr(context, "metadata", None)
+    if metadata is None:
+        metadata = {}
+        context.metadata = metadata
+    in_flight = _responses_request_summary(
+        agent=agent,
+        stage=stage,
+        request=request,
+    )
+    metadata["inflight_responses_request"] = in_flight
+    start = time.monotonic()
+    try:
+        response = await _post_responses_request(agent, request)
+    finally:
+        in_flight["elapsed_seconds"] = time.monotonic() - start
+    return response
+
+
+def _responses_request_summary(
+    *,
+    agent: GLM52HarborAgent,
+    stage: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "endpoint": agent.responses_base_url.rstrip("/") + "/responses",
+        "timeout_seconds": agent.responses_timeout_seconds,
+        "stream": bool(request.get("stream")),
+        "input_items": _request_input_item_count(request.get("input")),
+        "tools": _request_tool_names(request.get("tools")),
+        "decoding_profile": dict(agent.decoding_profile),
+        "elapsed_seconds": 0.0,
+    }
+
+
+def _request_input_item_count(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    if value is None:
+        return 0
+    return 1
+
+
+def _request_tool_names(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            names.append(item["name"])
+    return names
 
 
 async def _post_responses_request(
