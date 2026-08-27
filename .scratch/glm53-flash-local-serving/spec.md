@@ -24,6 +24,14 @@ is called Codex-ready, but it is not a blocker for the first SGLang
 compatibility tracer bullet. This setting is for local compatibility and
 benchmark evidence, not a production cluster deployment.
 
+The SGLang+Dynamo bringup is not complete after startup and short transcript
+lossiness checks. Before a Dynamo-forwarded profile is treated as durable for
+coding-agent or benchmark work, it must also survive a long-running live
+inference pilot through the full Responses -> Dynamo -> SGLang path. GSM8K is
+the first concrete pilot because it is already represented in the GLM-5.2
+benchmark platform, exercises multi-step reasoning under forced thinking, and
+can run as bounded samples before any published-score conformance claim.
+
 Durable implementation artifacts should be promoted into Ginkgo, because Ginkgo
 now owns the portable serving contract. This `.scratch/glm53-flash-local-serving/`
 tree owns planning, issue tracking, design notes, and mutable workstream state.
@@ -81,7 +89,8 @@ target, not an ambient external endpoint handoff. A parent runner allocates
 ports, resolves logical paths, writes a materialized config, starts components
 in order, probes every serving surface, records Contract Artifacts, and tears
 the run down. A later profile inserts local Dynamo between the adapter and
-SGLang and must pass the lossiness gate before the Dynamo topology is promoted.
+SGLang and must pass both the lossiness gate and the long-running inference
+pilot before the Dynamo topology is promoted.
 
 ## Non-Goals
 
@@ -319,8 +328,8 @@ Execution domains:
 | repo Python | `scripts/run` | schema validation, unit tests, verifier helper code | run inside the Monarch rootfs |
 | SGLang payload | bwrap rootfs | `/cache/glm53-flash/venvs/sglang/bin/python -m sglang.launch_server` | launched from materialized sandbox config |
 | parent lifecycle | host control | port allocation, PID records, cleanup, Docker/Harbor, orphan scans | not nested inside bwrap when host resources are required |
-| Dynamo frontend | host control | local Dynamo process against materialized SGLang URL | no fallback to ambient endpoints |
-| Responses adapter | host control | local Responses service against materialized Dynamo URL | no fallback to direct Chat for Codex evidence |
+| Dynamo frontend | host control | local Dynamo process against materialized SGLang URL | profile-gated; no fallback to ambient endpoints |
+| Responses adapter | host control | local Responses service against materialized SGLang URL, or against materialized Dynamo URL for Dynamo profiles | no fallback to direct Chat for Codex evidence |
 | model-authored code | task bwrap or official containers | code benchmark tasks, Terminal-Bench-style tasks | isolated from repo writes except declared task work dirs |
 
 The declared SGLang config should keep GLM-5.2's fail-fast and port discipline:
@@ -460,6 +469,10 @@ Suggested first profiles:
 - `sglang-dynamo-lossiness`: compare direct SGLang Chat transcripts with
   Dynamo-forwarded transcripts for reasoning, content, tool calls, and stream
   chunks before declaring the Dynamo topology Codex-ready.
+- `sglang-dynamo-gsm8k-pilot`: run a bounded GSM8K-style static-eval pilot
+  through Responses -> Dynamo -> SGLang after the lossiness gate passes. This
+  is a long-running inference soak and progress/resume proof, not a
+  published-score conformance run.
 
 ## Configuration and Materialization
 
@@ -485,6 +498,9 @@ Materialized GLM-5.3-Flash configs must record:
   `lmsysorg/sglang:glm-5.3-flash` recipe image or an equivalent venv is used;
 - reasoning parser, tool-call parser, thinking settings, and sampling defaults;
 - multimodal processor availability;
+- long-running inference profile settings: suite id, dataset revision, harness
+  revision, prompt template hash, sample cap, wall-clock timeout, per-sample
+  timeout, progress checkpoint interval, resume policy, and scoring mode;
 - process records, log paths, run root, result root, cache root, and temp root.
 
 Schema migration requirements:
@@ -546,6 +562,10 @@ Required failure classes:
   availability, or backend response validation fails.
 - `benchmark_contract_failed`: a benchmark attempts fixture/static evidence,
   bypasses Responses, omits condition metadata, or runs before serving passes.
+- `long_running_inference_failed`: a long-running profile stops making
+  progress, exceeds its declared timeout, cannot resume from a matching
+  manifest, loses usage or latency records, or cannot distinguish model
+  failures from infrastructure failures.
 
 ## Verifier Ladder
 
@@ -567,8 +587,10 @@ Required gate order:
 9. GLM-5.3-Flash SGLang live.
 10. Responses live against SGLang.
 11. Dynamo live and lossiness proof for the Dynamo profile.
-12. Repeatability.
-13. Benchmark readiness.
+12. Responses live against Dynamo for the SGLang+Dynamo profile.
+13. Long-running inference pilot for the SGLang+Dynamo profile.
+14. Repeatability.
+15. Benchmark readiness.
 
 Required stages:
 
@@ -601,7 +623,13 @@ Required stages:
     events without leaking raw Chat-only fields.
 12. Responses tool loop: require tool calls, tool outputs, and
     `previous_response_id` continuation.
-13. Teardown: require process-group ownership, closed allocated ports, and an
+13. Long-running inference pilot for the Dynamo profile: after lossiness and
+    Responses checks pass, run bounded GSM8K-style reasoning samples through the
+    run-owned Responses endpoint whose upstream is Dynamo. Require periodic
+    progress checkpoints, per-sample usage and latency records, declared
+    wall-clock and per-sample timeouts, resumable run state, and a summary that
+    separates model answer failures from infrastructure failures.
+14. Teardown: require process-group ownership, closed allocated ports, and an
     orphan scan.
 
 Required Contract Artifacts:
@@ -615,6 +643,7 @@ Required Contract Artifacts:
 - `dynamo-models.json`
 - `dynamo-chat.json`
 - `dynamo-lossiness.json`
+- `dynamo-long-reasoning-pilot.json`
 - `responses-models.json`
 - `responses-nonstream.json`
 - `responses-stream.json`
@@ -627,9 +656,9 @@ The verifier exits zero only when every required stage for the selected profile
 passes and `archive-manifest.json` hashes every Contract Artifact for the run.
 The first `sglang-basic-agent` profile requires text, reasoning, streaming,
 tool, and `previous_response_id` coverage through Responses against SGLang. The
-`sglang-dynamo-lossiness` and multimodal profiles add their own required stages.
-Partial evidence is useful for diagnosis but does not make the selected profile
-complete.
+`sglang-dynamo-lossiness`, `sglang-dynamo-gsm8k-pilot`, and multimodal profiles
+add their own required stages. Partial evidence is useful for diagnosis but
+does not make the selected profile complete.
 
 The artifact schema is versioned independently from the GLM-5.2 verifier. If
 implementation reuses current GLM-5.2 names such as `chat-health.json`,
@@ -655,6 +684,12 @@ Minimum artifact fields:
   content block shape, processor status, response verdict;
 - Dynamo lossiness artifact: direct SGLang transcript digest, Dynamo transcript
   digest, compared fields, lossiness verdict, and any dropped-field evidence;
+- long-running inference artifact: suite id, dataset revision, harness
+  revision, prompt template hash, sample ids, sample cap, started and completed
+  sample counts, run-state path and digest, checkpoint interval, resume verdict,
+  wall-clock timeout, per-sample timeout, per-sample latency and usage records,
+  partial-output paths, scoring mode, and model-vs-infrastructure failure
+  classification;
 - teardown artifact: process ids, signal sequence, open-port scan, orphan scan;
 - archive manifest: relative artifact paths, SHA256 digests, and artifact roles.
 
@@ -692,6 +727,31 @@ The first benchmark profile should reuse the GLM-5.2 harness boundaries:
   settings, and timeout;
 - optional published-score conformance only after matching source conditions are
   recorded.
+
+Long-running inference bringup is its own required profile between short serving
+verification and broader benchmark work. The first profile is
+`sglang-dynamo-gsm8k-pilot`:
+
+- use the pinned GLM-5.2 GSM8K-style static-eval contract as the starting
+  shape: suite id `gsm8k`, dataset revision
+  `openai/gsm8k@740312add88f781978c0658806c59bc2815b9866`, harness revision
+  `lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b`, prompt
+  template `gsm8k-v1`, family `static_eval`, adapter `static_eval`, execution
+  backend `bwrap_rootfs`, and metric `exact_match`;
+- run through the run-owned Responses endpoint with Dynamo as the adapter
+  upstream, never through direct SGLang or Dynamo Chat URLs;
+- start with bounded pilot sample counts before full-suite attempts and record
+  the exact selected sample ids;
+- checkpoint after each completed sample, and skip completed samples only when
+  the run-state manifest matches model id, materialized config digest, endpoint
+  digest, dataset revision, harness revision, prompt template hash, sampling
+  settings, thinking settings, output-token budget, and timeout settings;
+- record progress heartbeats, wall-clock timeout, per-sample timeout, partial
+  output paths, per-sample latency, token usage, HTTP status, finish reason, and
+  failure class;
+- treat exact-match scoring as pilot telemetry during bringup. Do not compare
+  against published GLM-5.3-Flash scores until the conformance mode records
+  matching source conditions, tolerances, and complete local evidence.
 
 Benchmark modes:
 
@@ -732,6 +792,9 @@ Benchmark execution must enforce these gates:
 
 - every benchmark run references a passing serving `summary.json` and the exact
   `materialized-inference.yaml` digest;
+- every SGLang+Dynamo benchmark or coding-agent profile references both a
+  passing `dynamo-lossiness.json` and a passing
+  `dynamo-long-reasoning-pilot.json` for the same materialized config digest;
 - exact-suite smoke may use a fake Responses endpoint only in unit tests, never
   as live evidence;
 - live smoke must record `endpoint` as the run-owned Responses URL, not
@@ -788,6 +851,9 @@ Deferred file profile requirements:
 - Ticket 04 proves whether Dynamo preserves the GLM reasoning and tool-call
   response fields without loss. Until that proof passes, the first compatibility
   path routes the Responses adapter directly to SGLang.
+- Ticket 04 also proves whether the SGLang+Dynamo path can sustain a bounded
+  long-running GSM8K-style reasoning pilot with resumable progress before any
+  Dynamo-forwarded coding-agent or benchmark profile is promoted.
 - Ticket 01 keeps the first implementation model-scoped under `glm53_flash_*`.
   A later cleanup may decide whether to lift model-specific constants into a
   shared schema runtime after GLM-5.3-Flash is live.
@@ -811,6 +877,10 @@ Deferred file profile requirements:
 - Teardown closes every allocated port and records process cleanup.
 - Benchmark execution is blocked until the serving verifier has a passing run
   for the same materialized config.
+- SGLang+Dynamo coding-agent and benchmark profiles are blocked until the same
+  materialized config has a passing long-running GSM8K-style pilot with
+  resumable run state, progress artifacts, usage, latency, and timeout
+  evidence.
 
 ## Suggested Tickets
 
