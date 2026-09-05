@@ -55,3 +55,26 @@ _Avoid_: Failure handling, retry logic
 A full-suite Python failure caused by shared cross-test state that passes when
 the same pytest node is rerun in isolation inside the same Hermetic Rootfs.
 _Avoid_: Flake, known failure
+
+**Workload Plane**:
+A thin, workload-specific library over the shared coordination core that owns one
+class of work — training, serving, or data analysis — supplying only its actor
+topology, health signal, and reallocation-policy callback.
+_Avoid_: Control plane, service, subsystem
+
+**Placement**:
+The single decision that maps a workload's requested actors onto host, proc, and
+actor meshes, shared by all Workload Planes; training gang-schedules a worker
+group, serving sizes replica pools, analysis places partitions.
+_Avoid_: Scheduling, allocation, binpacking
+
+**Reallocation Policy**:
+The callback a Workload Plane registers in place of the default fail-fast
+`unhandled_fault_hook`, deciding what a `MeshFailure` does — resume from
+checkpoint, replace a replica, or re-execute a stage — instead of exiting.
+_Avoid_: Retry, fault handler, recovery hook
+
+**Control Store**:
+The durable record of workload specs and current placement that lets a
+control-actor restart re-attach to running work rather than restart it from zero.
+_Avoid_: Database, state cache, metadata store

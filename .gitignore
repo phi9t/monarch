@@ -65,6 +65,7 @@ scripts/**/__pycache__/
 .venv-rootfs/
 .venv-rootfs/**
 control-plane-results/
+substrate-results/
 glm52-serving-results/
 glm52-benchmark-results/
 ginkgo/local-env/qwen3-sglang.yaml
