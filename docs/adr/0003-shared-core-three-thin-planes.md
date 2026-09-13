@@ -33,3 +33,18 @@ plane. What must stay shared: Insula as the sole bwrap owner, `scripts/run` as
 the sole execution gateway, the supervision tree, the telemetry substrate, and
 the no-fallback / fail-loud invariant. What is legitimately plane-specific: the
 health signal, the reallocation-policy callback, and the thin per-plane API.
+
+The first concrete serving interface was approved on 2026-09-08. A caller
+configures one Ginkgo Workload Plane through
+`JobTrait.enable_workload(...).state()`. A shared reconciliation implementation
+owns typed durable generations, Placement, exact supervision routing,
+replacement, and strict reattachment; Ginkgo owns serving topology, health,
+and its Reallocation Policy. Reattachment requires matching allocation,
+declaration, and deterministic actor/ProcessRecord ownership evidence. It never
+silently launches a duplicate. See
+`.scratch/monarch-unified-control-plane/spec/01-ginkgo-serving-workload-plane.md`.
+That first slice proves attachment of a fresh observer handle to the same live
+controller and JobTrait allocation. The controller remains the sole writer and
+failure-route owner. A fresh OS process cannot presently reconnect a
+`LocalJob`, and writer handoff or reconstitution of a fatally lost owner actor
+is a later step toward the broader control-actor restart objective above.

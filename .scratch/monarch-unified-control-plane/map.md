@@ -56,17 +56,26 @@ Related existing efforts (do not duplicate): `.scratch/glm53-flash-local-serving
   plus a durable control store. Favors "shared core + three thin planes".
   → `research/comparable-control-planes.md`, `issues/06-research-comparable-planes.md`
 
+- Serving proof (02, resolved): Ginkgo becomes a singular Job-owned Workload
+  Plane configured through `JobTrait.enable_workload(...).state()`. The first
+  Local Run is CPU-only and proves typed durable state, same-allocation observer
+  attachment, structured supervision routing, one-replica
+  replacement, and owned teardown while preserving Ginkgo's CLI and Contract
+  Artifacts. CUDA dense is the next ordered proof. →
+  `spec/01-ginkgo-serving-workload-plane.md`,
+  `issues/02-actor-control-evidence-gap.md`
+
 ## Not yet specified
 
 <!-- in-scope fog, graduates as the frontier advances -->
 
-- Shared substrate (Placement + Reallocation Policy + Control Store): **spec
-  drafted** at `spec/00-shared-substrate.md` with a single-host tracer bullet.
-  Still fog: whether the tracer bullet is approved to build (needs GPU run
-  authorization), and the concrete `Decision` enum wiring in Rust supervision.
-- Unified control-plane API shape: resolved in principle by 01 (three thin
-  plane APIs over the shared core, not one merged API); per-plane API shapes
-  still fog (hang on 02/03/04/05).
+- Shared substrate (Placement + Reallocation Policy + Control Store): the GPU
+  tracer in `spec/00-shared-substrate.md` is built and verified. Tickets 07-11
+  now own its correction from a detached proof into the CPU-local, Job-owned
+  serving path, including structured Rust-to-Python supervision identity.
+- Unified control-plane API shape: the serving shape is specified by 02 as a
+  Workload Plane behind `JobTrait.enable_workload(...).state()`; training and
+  data-analysis shapes still hang on 04/05.
 - Scheduler / placement across meshes: single-host degenerate form specced;
   multi-host gang scheduling, GPU pool allocation, multi-tenant isolation still
   fog.
@@ -76,8 +85,8 @@ Related existing efforts (do not duplicate): `.scratch/glm53-flash-local-serving
   (ticket 03) or proceed model-scoped as its current spec proposes.
 - Telemetry-as-analytics: promoting `monarch_record_batch` + DataFusion from
   internal telemetry to a user-facing dataset/dataframe API. (Hangs on 05.)
-- Multi-host / multi-GPU actor-control proof beyond the single-host 8-GPU
-  verifier and the CPU/Qwen3 actor smoke.
+- Multi-host / multi-GPU Workload Plane proof beyond the CPU-local serving
+  ladder and the single-host 8-GPU Capacity Verifier.
 - Observability seam: training curves (loss/throughput/MFU) vs the current
   actor/message health dashboard.
 

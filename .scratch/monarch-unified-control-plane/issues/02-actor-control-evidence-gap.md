@@ -1,7 +1,7 @@
 # Close the actor-control-plane evidence gap
 
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 01
 Parent: ../map.md
 
@@ -32,3 +32,20 @@ Decide:
 
 Decision, not execution: name the proof and its ordering; do not run GPUs here.
 Any GPU run is separately human-approved (see production-release-readiness spec).
+
+## Answer
+
+Decision (user-approved 2026-09-08): the first serving proof is a CPU-local
+Ginkgo Workload Plane configured through `JobTrait.enable_workload(...).state()`.
+It replaces the parallel Ginkgo coordinator/actor lifecycle and joins
+Placement, Control Store, and supervision-driven replacement in one runtime
+path. The proof starts a healthy workload, persists its typed record, attaches
+a fresh observer to the live controller inside the unchanged allocation,
+replaces one failed replica through structured failure identity, and verifies
+owned teardown plus
+the existing Ginkgo Contract Artifacts. It models non-GPU processes directly
+without claiming CPU-core reservation and requires no GPU; CUDA dense remains
+the next ordered proof.
+
+The approved interface and acceptance ladder are specified in
+`../spec/01-ginkgo-serving-workload-plane.md`.
