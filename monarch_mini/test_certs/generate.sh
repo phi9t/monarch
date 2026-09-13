@@ -8,6 +8,10 @@
 set -eu
 
 cert_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# Generating test certificates runs openssl and writes into the source tree, so
+# require a controlled domain before any mutation.
+repo_root=$(CDPATH='' cd -- "$cert_dir/../.." && pwd)
+"$repo_root/scripts/rootfs/execution_contract.sh" require-controlled
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 umask 077

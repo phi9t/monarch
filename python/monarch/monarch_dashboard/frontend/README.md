@@ -1,9 +1,14 @@
 # Frontend Dependency Locks
 
-This frontend currently supports two locked dependency install paths:
+This frontend has two locked dependency install paths, one per execution domain:
 
-- npm-based package builds use `package-lock.json` and install with `npm ci`.
-- Buck/Yarn-based builds use `yarn.lock` and install with Yarn.
+- **Local rootfs (OSS):** the deterministic frontend build inside the bwrap
+  rootfs installs with `npm ci` from `package-lock.json`. This is the path
+  `scripts/run uv pip install -e .` drives when it builds the frontend as
+  package data.
+- **Buck (Meta-internal):** Buck builds install with Yarn from `yarn.lock`. This
+  lockfile is owned by the Buck build; do not edit it in an OSS checkout.
 
-Keep both lockfiles in sync when changing `package.json`. Do not delete either
+Keep both lockfiles in sync when changing `package.json`, and verify they resolve
+the same versions with the parity check in `README.fb`. Do not delete either
 lockfile until every supported build path uses the same package manager.

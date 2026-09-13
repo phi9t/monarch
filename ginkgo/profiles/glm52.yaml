@@ -1,0 +1,22 @@
+schema_version: 1
+profile: glm52
+description: Run the full GLM-5.2 SGLang -> Dynamo -> Responses lifecycle and produce GLM completion evidence only after all live gates pass.
+requires_gpu: true
+launches_serving_process: true
+evidence_class: glm52-completion
+declared_sglang_config: repo://ginkgo/configs/sglang-glm52.yaml
+declared_inference_config: repo://ginkgo/configs/inference-glm52.yaml
+required_budget:
+  gpu_count: 8
+  timeout_seconds: 3600
+required_actions:
+  - host_capability_survey
+  - rootfs_projection_check
+  - dependency_contract_verification
+  - optimized_kernel_verification
+  - glm52_model_cache_preparation
+  - materialized_command_validation
+  - sglang_launch_probe_teardown
+  - dynamo_launch_probe_teardown
+  - responses_launch_probe_teardown
+  - repeatability_check

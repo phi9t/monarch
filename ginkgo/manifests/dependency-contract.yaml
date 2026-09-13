@@ -1,0 +1,41 @@
+schema_version: 1
+venvs:
+  sglang:
+    sandbox_path: /cache/glm52/venvs/sglang
+    installer: uv
+    required_imports:
+      - torch
+      - transformers
+      - huggingface_hub
+      - sglang
+    required_tools:
+      - python
+      - uv
+    packages:
+      - sglang[all]
+  dynamo:
+    sandbox_path: /cache/glm52/venvs/dynamo
+    installer: uv
+    required_imports:
+      - dynamo
+      - sglang
+      - blake3
+    required_tools:
+      - python
+      - uv
+    packages:
+      - ai-dynamo==1.4.0
+      - ai-dynamo-runtime==1.4.0
+      - sglang==0.5.17
+      - blake3
+rootfs_tools:
+  required:
+    - bash
+    - bwrap
+    - python3
+    - uv
+    - nvidia-smi
+verification:
+  fail_on_host_site_packages: true
+  fail_on_missing_import: true
+  fail_on_missing_help_flag: true

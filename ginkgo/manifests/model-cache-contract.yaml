@@ -1,0 +1,34 @@
+schema_version: 1
+cache:
+  hf_home: /cache/glm52/hf-home
+  sglang_cache: /cache/glm52/sglang
+models:
+  qwen3_dense_smoke:
+    repo_id: Qwen/Qwen3-0.6B
+    profile: serving-smoke-dense
+    required_files:
+      - config.json
+      - tokenizer.json
+      - tokenizer_config.json
+    requires_safetensors_index: false
+  qwen3_moe_smoke:
+    repo_id: Qwen/Qwen3-30B-A3B
+    profile: serving-smoke-moe
+    required_files:
+      - config.json
+      - tokenizer.json
+      - tokenizer_config.json
+    requires_safetensors_index: true
+  glm52:
+    repo_id: zai-org/GLM-5.2
+    profile: glm52
+    required_files:
+      - config.json
+      - tokenizer.json
+      - tokenizer_config.json
+      - model.safetensors.index.json
+    requires_safetensors_index: true
+verification:
+  reject_partial_snapshots: true
+  reject_missing_shards: true
+  reject_unsafe_shard_paths: true

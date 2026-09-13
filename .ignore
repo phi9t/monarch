@@ -1,0 +1,4 @@
+# Generated rootfs exports and managed caches are not source. Keep host-side
+# ripgrep inventories bounded even when the rootfs has already been built.
+scripts/rootfs/rootfs/**
+scripts/rootfs/cache/**

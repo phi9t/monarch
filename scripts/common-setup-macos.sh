@@ -9,6 +9,11 @@
 
 set -ex
 
+# This CI setup runs its real work only on native Darwin. Refuse elsewhere
+# before Homebrew, pip, or cargo installs.
+_common_setup_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+"$_common_setup_repo_root/scripts/rootfs/execution_contract.sh" require-darwin
+
 install_macos_base_dependencies() {
     export HOMEBREW_NO_AUTO_UPDATE=1
     brew install protobuf

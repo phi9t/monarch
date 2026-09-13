@@ -1,0 +1,147 @@
+schema_version: 1
+model: zai-org/GLM-5.2
+scores:
+  - suite: needle-smoke
+    model: zai-org/GLM-5.2
+    profile: long-context-smoke
+    metric: exact_match
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: needle-smoke-v1
+    dataset_revision: fixture-needle-smoke-v1
+    harness_revision: monarch-glm52-fixture-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 256
+      glm_thinking: disabled
+    comparable: false
+    note: Needle smoke is a local fixture profile and is not comparable to a primary-source published GLM-5.2 score.
+  - suite: humaneval
+    model: zai-org/GLM-5.2
+    profile: coding-benchmark
+    metric: pass@1
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: humaneval-v1
+    dataset_revision: openai/openai_humaneval@7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544
+    harness_revision: evalplus@26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 2048
+      glm_thinking: disabled
+    comparable: false
+    note: Primary-source GLM-5.2 HumanEval score is not pinned yet.
+  - suite: mbpp
+    model: zai-org/GLM-5.2
+    profile: coding-benchmark
+    metric: pass@1
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: mbpp-v1
+    dataset_revision: google-research-datasets/mbpp@4bb6404fdc6cacfda99d4ac4205087b89d32030c
+    harness_revision: evalplus@26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 2048
+      glm_thinking: disabled
+    comparable: false
+    note: Primary-source GLM-5.2 MBPP score is not pinned yet.
+  - suite: terminal-bench-2
+    model: zai-org/GLM-5.2
+    profile: terminal-agent
+    metric: task_success
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: terminal-bench-2-v1
+    dataset_revision: terminal-bench-2@d28711d0da2675d0bb1d56de45ae5df6082438a3
+    harness_revision: harbor@9dd349f28b969268aef419e910e1998149b612a5
+    execution_backend: harbor_local_docker
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 4096
+      glm_thinking: disabled
+    comparable: false
+    note: Primary-source Terminal-Bench 2 GLM-5.2 score is not pinned yet.
+  - suite: swe-bench-verified
+    model: zai-org/GLM-5.2
+    profile: terminal-agent
+    metric: resolved_instances
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: swe-bench-verified-v1
+    dataset_revision: SWE-bench/SWE-bench_Verified@78f471bf655a3137b2e8a75af1501690ec009ec3
+    harness_revision: swebench@4e6126978a16bdfebc6538db8f28cacc2c8b77dc
+    execution_backend: harbor_local_docker
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 4096
+      glm_thinking: disabled
+    comparable: false
+    note: Primary-source SWE-bench Verified GLM-5.2 score and official image pins are not pinned yet.
+  - suite: ruler
+    model: zai-org/GLM-5.2
+    profile: long-context
+    metric: exact_match
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: ruler-v1
+    dataset_revision: ruler@c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a
+    harness_revision: lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 1024
+      glm_thinking: disabled
+    comparable: false
+    note: Primary-source GLM-5.2 RULER score is not pinned yet.
+  - suite: gsm8k
+    model: zai-org/GLM-5.2
+    profile: math-reasoning-thinking-disabled
+    metric: exact_match
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: gsm8k-v1
+    dataset_revision: openai/gsm8k@740312add88f781978c0658806c59bc2815b9866
+    harness_revision: lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 2048
+      glm_thinking: disabled
+    comparable: false
+    note: Primary-source thinking-disabled GLM-5.2 GSM8K score is not pinned yet.
+  - suite: aime
+    model: zai-org/GLM-5.2
+    profile: math-reasoning-thinking-enabled
+    metric: exact_match
+    source_url: TODO-primary-source
+    score: TODO
+    tolerance: TODO
+    prompt_template: aime-v1
+    dataset_revision: Maxwell-Jia/AIME_2024@8d88b2876a82a080e2f172cc9b25d0d9d2cb4792
+    harness_revision: lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 4096
+      glm_thinking: enabled
+    comparable: false
+    note: Primary-source thinking-enabled GLM-5.2 AIME score is not pinned yet.

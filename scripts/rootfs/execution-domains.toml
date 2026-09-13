@@ -1,0 +1,127 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Reviewed execution-domain inventory. Every executable entrypoint in this
+# repository belongs to exactly one domain. scripts/rootfs/audit_entrypoints.py
+# discovers all entrypoints and requires exactly one matching rule per entry,
+# and no dead (zero-match) rule.
+#
+# Domains:
+#   host-bootstrap          run on the host to enter or build the rootfs
+#   rootfs-development      real dev/build/test work; must run inside the rootfs
+#   controlled-test-fixture native test fixtures invoked by a controlled harness
+#   github-linux            GitHub Linux CI setup and wrappers
+#   darwin                  native macOS CI setup
+#   controlled-ci           GitHub Actions workflow definitions
+#   meta-internal           Buck/fbcode-only tooling, never run in OSS locally
+#   remote-orchestration    drive remote/MAST/cluster jobs from a launcher host
+#   local-inference         host-controlled local SGLang/Ginkgo/GLM serving and
+#                           verifier orchestration that enters Insula/rootfs as
+#                           needed
+
+[domains.host-bootstrap]
+patterns = [
+    "scripts/run",
+    "scripts/rootfs/build_rootfs.sh",
+    "scripts/rootfs/enter_rootfs.sh",
+    "scripts/rootfs/execution_contract.sh",
+    "scripts/rootfs/activate_environment.sh",
+    "scripts/rootfs/run_in_rootfs.sh",
+]
+
+[domains.rootfs-development]
+patterns = [
+    "scripts/run_local_control_plane.sh",
+    "scripts/run_local_8gpu_capacity.sh",
+    "scripts/local_8gpu_capacity.py",
+    "scripts/build_monarch_for_docs.sh",
+    "scripts/build_dashboard_frontend.py",
+    "scripts/profile_compile_obligations.sh",
+    "scripts/fetch_disabled_tests.py",
+    "scripts/rootfs/sync_test_environment.sh",
+    "scripts/rootfs/rustc-wrapper.sh",
+    "setup.py",
+    "monarch_mini/python/setup.py",
+    "monarch_mini/Makefile",
+    "docs/Makefile",
+    "python/monarch/monarch_dashboard/frontend/package.json",
+    # Cargo bin/example/bench targets: real workspace code compiled and run in
+    # the rootfs. Explicit rules cover the paths the globs below do not reach.
+    "**/src/bin/**/*.rs",
+    "**/examples/**/*.rs",
+    "**/benches/**/*.rs",
+    "hyper/src/main.rs",
+    "hyperactor/example/*.rs",
+    "monarch_conda/src/main.rs",
+    "monarch_perfetto_trace/src/main.rs",
+    "hyperactor_telemetry/tester/main.rs",
+    "hyperactor_mesh_admin_tui/bin/*.rs",
+    "ndslice/tests/*.rs",
+    # Python examples and benches build/run against the rootfs interpreter.
+    "examples/example_actors/**/*.py",
+    "examples/kubernetes/**/*.py",
+    "examples/presentation/**/*.py",
+    "examples/rdma_pingpong/**/*.py",
+    "examples/skypilot/**/*.py",
+    "python/benches/**/*.py",
+]
+
+[domains.controlled-test-fixture]
+patterns = [
+    "monarch_mini/test_certs/generate.sh",
+    "hyperactor_mesh/test/hyperactor_mesh_proxy_liveness_test.sh",
+    "hyperactor_mesh/test/*.rs",
+    "monarch_hyperactor/test/*.rs",
+    "scripts/rootfs/tests/*.py",
+    "scripts/rootfs/audit_entrypoints.py",
+]
+
+[domains.github-linux]
+patterns = [
+    "scripts/common-setup.sh",
+    "scripts/sccache-rustc-wrapper.sh",
+]
+
+[domains.darwin]
+patterns = [
+    "scripts/common-setup-macos.sh",
+]
+
+[domains.controlled-ci]
+patterns = [
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+]
+
+[domains.meta-internal]
+patterns = [
+    "whittle",
+    "hyperactor_remote/example/exit_parent.sh",
+    "hyperactor_remote/example/hard_kill_child.sh",
+    "hyperactor_remote/example/hard_kill_parent.sh",
+]
+
+[domains.remote-orchestration]
+patterns = [
+    "hyperactor_remote/example/remote_spawner.sh",
+    "hyperactor_remote/example/*.rs",
+    "examples/remotemount/*.sh",
+    "examples/remotemount/*.py",
+    "examples/torchtitan_mast/*.sh",
+    "examples/torchtitan_mast/**/*.py",
+]
+
+[domains.local-inference]
+patterns = [
+    ".scratch/glm52-local-serving/wizards/*.sh",
+    "ginkgo/scripts/*.sh",
+    "ginkgo/scripts/run_*.py",
+    "scripts/ginkgo_host_survey.py",
+    "scripts/glm52_*.py",
+    "scripts/run_glm52_*.sh",
+    "scripts/rootfs/rootfs_sandbox_config.py",
+    "scripts/rootfs/verify_rootfs.py",
+]

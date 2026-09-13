@@ -11,6 +11,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 import pytorch_sphinx_theme2
 
@@ -169,7 +170,13 @@ sitemap_excludes = [
 sitemap_url_scheme = "{link}"
 
 
-html_extra_path = ["../../target/doc"]
+# Rust API docs live under the Cargo target directory. Inside the rootfs the
+# target dir is digest-scoped via CARGO_TARGET_DIR; GitHub CI keeps the default
+# target/doc when the variable is absent.
+cargo_target_dir = Path(
+    os.environ.get("CARGO_TARGET_DIR", Path(__file__).resolve().parents[2] / "target")
+).resolve()
+html_extra_path = [str(cargo_target_dir / "doc")]
 html_static_path = ["_static"]
 
 # Configure MyST-Parser to find markdown files in the books directory

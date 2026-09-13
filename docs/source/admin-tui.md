@@ -22,7 +22,7 @@ deadlock.
 **Terminal 1** — start the example:
 
 ```bash
-python python/examples/dining_philosophers.py
+scripts/run python python/examples/dining_philosophers.py
 ```
 
 The example prints the admin server address on startup:

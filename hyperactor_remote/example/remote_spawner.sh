@@ -10,6 +10,9 @@ set -euo pipefail
 bin_name='hyperactor_remote_example_remote_spawner'
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
+# This example compiles and runs the spawner binary locally, so require a
+# controlled domain before Cargo or any spawned process runs.
+"$repo_root/scripts/rootfs/execution_contract.sh" require-controlled
 tmp="$(mktemp -d)"
 proc_pid=''
 driver_pid=''

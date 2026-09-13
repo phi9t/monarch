@@ -1,0 +1,37 @@
+schema_version: 1
+kernels:
+  triton:
+    required_for_profiles:
+      - cuda-kernel
+      - serving-smoke-moe
+      - glm52
+    capability_probe: tiny_triton_kernel
+    fallback_allowed: false
+  flash_attention:
+    required_for_profiles: []
+    optional_for_profiles:
+      - cuda-kernel
+      - serving-smoke-dense
+      - serving-smoke-moe
+      - glm52
+    capability_probe: small_attention_forward
+    fallback_allowed: false
+  flashinfer:
+    required_for_profiles:
+      - glm52
+    optional_for_profiles:
+      - cuda-kernel
+      - serving-smoke-dense
+      - serving-smoke-moe
+    capability_probe: small_decode_or_attention_forward
+    fallback_allowed: false
+  sglang_fused_kernels:
+    required_for_profiles:
+      - serving-smoke-moe
+      - glm52
+    capability_probe: sglang_kernel_capability_probe
+    fallback_allowed: false
+rules:
+  optional_means_not_required_for_profile: true
+  fail_required_kernel_import_drift: true
+  fail_required_kernel_runtime_drift: true

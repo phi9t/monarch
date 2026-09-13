@@ -10,13 +10,38 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+from pathlib import Path
 from typing import Dict, List, Optional
+
+# Guard the build backend before setuptools, Torch, CUDA, npm, or Cargo probing.
+# A standalone source checkout must build inside a controlled execution domain;
+# installed/fbsource trees have no validator and pass through untouched.
+_contract_spec = importlib.util.spec_from_file_location(
+    "monarch._rootfs_contract",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "python",
+        "monarch",
+        "_rootfs_contract.py",
+    ),
+)
+if _contract_spec is not None and _contract_spec.loader is not None:
+    _contract = importlib.util.module_from_spec(_contract_spec)
+    sys.modules[_contract_spec.name] = _contract
+    _contract_spec.loader.exec_module(_contract)
+    _CONTRACT_IDENTITY = _contract.require_checkout(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+else:
+    _contract = None
+    _CONTRACT_IDENTITY = None
 
 from setuptools import Command, setup
 from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.command.build_py import build_py
 from setuptools.extension import Extension
 from setuptools_rust import Binding, RustBin, RustExtension
+from setuptools_rust.build import build_rust as _build_rust
 
 
 # Helper functions for finding paths on installed packages
@@ -310,11 +335,68 @@ class build_ext(_build_ext):
             if os.path.exists(src) and os.path.getmtime(src) > so_mtime:
                 return super().build_extension(ext)
 
+        # Under a real rootfs recipe, also require the cached .so to be a current
+        # native artifact per the provenance manifest so a .so built under a
+        # different recipe is never silently reused. Controlled GitHub Linux and
+        # Darwin have no rootfs identity and keep the mtime-only behavior.
+        if (
+            _contract is not None
+            and _CONTRACT_IDENTITY is not None
+            and _contract._is_rootfs_identity(_CONTRACT_IDENTITY)
+        ):
+            package_dir = os.path.join(src_root, "python", os.path.dirname(ext_filename))
+            if not _contract.native_artifact_is_current(
+                Path(so_path), Path(package_dir), _CONTRACT_IDENTITY
+            ):
+                return super().build_extension(ext)
+
         # .so is up to date — copy it to the build dir instead of recompiling
         dest = self.get_ext_fullpath(ext.name)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy2(so_path, dest)
         print(f"skipping {ext.name} (up to date, copied existing .so)")
+
+
+# Custom build_rust that stamps a provenance manifest over the editable native
+# outputs and removes stale source-tree extensions from other feature sets, so a
+# .so built under a different rootfs recipe cannot be reused by a later import.
+class BuildRustWithProvenance(_build_rust):
+    def run(self):
+        super().run()
+        if (
+            not getattr(self, "inplace", False)
+            or _contract is None
+            or _CONTRACT_IDENTITY is None
+            or not _contract._is_rootfs_identity(_CONTRACT_IDENTITY)
+        ):
+            return
+
+        src_root = os.path.dirname(os.path.abspath(__file__))
+        package_dir = Path(src_root, "python", "monarch")
+
+        # Collect the native outputs of the current feature set: the Rust
+        # bindings plus any configured C/C++ extensions that land in this
+        # package. build_rust has no get_ext_filename, so borrow the resolved
+        # build_ext command, which does.
+        build_ext_cmd = self.get_finalized_command("build_ext")
+        outputs = set()
+        for so in package_dir.glob("_rust_bindings*.so"):
+            outputs.add(so.resolve())
+        for ext in getattr(self.distribution, "ext_modules", None) or []:
+            ext_filename = build_ext_cmd.get_ext_filename(ext.name)
+            so_path = Path(src_root, "python", ext_filename).resolve()
+            if so_path.parent == package_dir.resolve() and so_path.exists():
+                outputs.add(so_path)
+
+        # Remove source-tree native extensions in this package that are not
+        # current outputs, so a stale .so from another feature set cannot linger.
+        for so in package_dir.glob("*.so"):
+            if so.resolve() not in outputs:
+                so.unlink()
+
+        _contract.write_native_manifest(
+            package_dir, _CONTRACT_IDENTITY, sorted(outputs)
+        )
 
 
 # Extension Creation
@@ -449,47 +531,24 @@ class BuildFrontend(Command):
             "monarch_dashboard",
             "frontend",
         )
-        build_dir = os.path.join(frontend_dir, "build")
-        build_index = os.path.join(build_dir, "index.html")
 
-        # Skip npm if pre-built assets already exist (e.g. from CI).
-        if os.path.isfile(build_index):
-            print(">> Pre-built frontend found, skipping npm build")
-            return
-
-        if not os.path.exists(frontend_dir):
-            print(f"Frontend directory not found: {frontend_dir}")
-            return
-
-        # Use real npm, bypassing any system wrappers
-        npm_cmd = "/usr/bin/npm" if os.path.exists("/usr/bin/npm") else "npm"
+        # Load the fail-closed builder by file path so a source build cannot
+        # package stale or partial assets; failures propagate to the caller.
+        helper_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "scripts",
+            "build_dashboard_frontend.py",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_build_dashboard_frontend", helper_path
+        )
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
 
         print("Building dashboard frontend...")
-        try:
-            subprocess.check_call([npm_cmd, "ci"], cwd=frontend_dir)
-            os.makedirs(os.path.join(build_dir, "static", "css"), exist_ok=True)
-            subprocess.check_call([npm_cmd, "run", "build"], cwd=frontend_dir)
-            # esbuild puts CSS next to JS; move it to static/css/
-            js_css = os.path.join(build_dir, "static", "js", "main.css")
-            if os.path.isfile(js_css):
-                shutil.move(
-                    js_css,
-                    os.path.join(build_dir, "static", "css", "main.css"),
-                )
-            # Copy the shared index.html template into the build output.
-            shutil.copy(
-                os.path.join(frontend_dir, "public", "index.html"),
-                build_index,
-            )
-            print("Frontend build completed successfully")
-        except FileNotFoundError:
-            print("WARNING: npm not found. Skipping frontend build.")
-            print(
-                "Install Node.js to build the dashboard frontend, "
-                "or use pre-built assets."
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError("frontend build failed") from e
+        helper.build_dashboard_frontend(Path(frontend_dir))
+        print("Frontend build completed successfully")
 
 
 # Clean command
@@ -545,6 +604,7 @@ setup(
     cmdclass={
         "build_py": BuildPyWithFrontend,
         "build_ext": build_ext,
+        "build_rust": BuildRustWithProvenance,
         "clean": Clean,
         "build_frontend": BuildFrontend,
     },

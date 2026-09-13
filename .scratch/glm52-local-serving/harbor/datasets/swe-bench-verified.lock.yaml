@@ -1,0 +1,30 @@
+schema_version: 1
+suite: swe-bench-verified
+status: ready
+runnable: true
+dataset_source:
+  type: huggingface_or_swebench
+  dataset: SWE-bench/SWE-bench_Verified
+  repo_type: dataset
+  revision: 78f471bf655a3137b2e8a75af1501690ec009ec3
+harness_source:
+  type: git
+  url: https://github.com/SWE-bench/SWE-bench.git
+  revision: 4e6126978a16bdfebc6538db8f28cacc2c8b77dc
+dataset: SWE-bench/SWE-bench_Verified
+dataset_adapter: swebench_verified
+execution_backend: harbor_local_docker
+official_images:
+  status: resolved
+  provider: swebench
+  per_instance_images:
+    - instance_id: astropy__astropy-12907
+      row_image: swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest
+      image_digest: docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907@sha256:483f26c8c89a879560ed3f2e47e470343a5a0b8bf5e08d8fe3ec7eac9201df88
+smoke_instances:
+  - astropy__astropy-12907
+conformance:
+  claim: none
+  comparable_to_published: false
+  reason: smoke metadata only; no published SWE-bench Verified conformance claim
+note: Minimal SWE-bench Verified smoke lock only. It pins one materialized dataset row image and registry digest for preflight; do not treat it as a published SWE-bench Verified conformance lock.

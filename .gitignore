@@ -5,6 +5,8 @@ python/**/*.json
 python/**/*.html
 python/**/*.pkl
 python/**/__pycache__
+**/__pycache__/
+*.pyc
 python/monarch.egg-info/*
 python/torchmonarch.egg-info/*
 *.egg
@@ -47,3 +49,30 @@ disabled_tests.txt
 
 # whittle
 .whittle.json
+
+# Local teaching workspace (agent-authored lessons/reference/notes)
+.agents/teach/
+
+# Hermetic control-plane rootfs (scripts/rootfs/)
+scripts/rootfs/rootfs/
+scripts/rootfs/rootfs/**
+scripts/rootfs/.rootfs.stage.*
+scripts/rootfs/*.tar
+scripts/rootfs/cache/
+scripts/rootfs/cache/**
+scripts/rootfs/tests/__pycache__/
+scripts/**/__pycache__/
+.venv-rootfs/
+.venv-rootfs/**
+control-plane-results/
+substrate-results/
+glm52-serving-results/
+glm52-benchmark-results/
+ginkgo/local-env/qwen3-sglang.yaml
+ginkgo/local-env/.generated/
+.scratch/glm52-local-serving/cache/
+.scratch/glm52-local-serving/run/
+.scratch/glm52-local-serving/tmp/
+.scratch/glm52-local-serving/benchmarks/datasets/
+.scratch/glm52-local-serving/benchmarks/harnesses/
+.scratch/glm52-local-serving/run-logs/

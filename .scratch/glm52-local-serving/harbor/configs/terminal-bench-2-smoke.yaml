@@ -1,0 +1,26 @@
+schema_version: 1
+suite: terminal-bench-2
+profile: terminal-agent
+endpoint: responses
+stream: true
+tools: enabled
+harness_source:
+  type: git
+  url: https://github.com/harbor-framework/harbor
+  revision: 9dd349f28b969268aef419e910e1998149b612a5
+benchmark_source:
+  type: web_or_harness_release
+  url: https://www.tbench.ai/benchmarks/terminal-bench-2
+  revision: d28711d0da2675d0bb1d56de45ae5df6082438a3
+execution:
+  harness: harbor
+  dataset: terminal-bench
+  dataset_version: "2.0"
+  repo: harbor-framework/harbor@9dd349f28b969268aef419e910e1998149b612a5
+  execution_backend: harbor_local_docker
+  container: required
+  timeout_seconds_per_task: 1800
+subset:
+  smoke_tasks:
+    - adaptive-rejection-sampler
+metric: task_success

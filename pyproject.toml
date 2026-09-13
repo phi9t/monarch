@@ -133,6 +133,12 @@ kubernetes = [
 
 # Modern dependency groups for uv
 [dependency-groups]
+glm52-runtime = [
+    "ai-dynamo==1.4.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12' and python_full_version < '3.13'",
+    "ai-dynamo-runtime==1.4.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12' and python_full_version < '3.13'",
+    "blake3; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12' and python_full_version < '3.13'",
+    "sglang[all]==0.5.17; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12' and python_full_version < '3.13'",
+]
 docs = [
     "sphinx>=6.2.1",
     "pytorch-sphinx-theme2",
@@ -183,6 +189,8 @@ packages = {find = {where = ["python"]}}
 [tool.pytest.ini_options]
 markers = [
     "oss_skip: marks tests to skip in OSS CI",
+    "control_plane: marks control-plane (host/proc/actor mesh + supervision) tests",
+    "gpu: marks tests that require a local GPU",
 ]
 asyncio_mode = "auto"
 # Default timeout of 5 minutes

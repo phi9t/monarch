@@ -24,6 +24,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -35,6 +36,25 @@ from pathlib import Path
 _REPO = "meta-pytorch/monarch"
 _DISABLED_TESTS_FILE = Path("disabled_tests.txt")
 _NEXTEST_FILTER_FILE = Path(".config/nextest-filter.txt")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _require_controlled_domain() -> None:
+    """Refuse to write test-selection files outside a controlled domain.
+
+    Loads the shared contract adapter by file path so the pure fetch/write
+    helpers stay importable in unit tests without triggering the guard.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "monarch._rootfs_contract",
+        _REPO_ROOT / "python" / "monarch" / "_rootfs_contract.py",
+    )
+    if spec is None or spec.loader is None:
+        return
+    contract = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = contract
+    spec.loader.exec_module(contract)
+    contract.require_checkout(_REPO_ROOT)
 
 
 def fetch_disabled_test_names_with_status() -> tuple[list[str], bool]:
@@ -142,6 +162,7 @@ def write_nextest_filter(names: list[str], *, force: bool = False) -> None:
 
 
 def main() -> None:
+    _require_controlled_domain()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--force",

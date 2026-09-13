@@ -68,6 +68,8 @@ from monarch.tools.config.workspace import Workspace
 from scoped_state import scoped_state
 from typing_extensions import assert_type
 
+pytestmark = pytest.mark.control_plane
+
 
 class Counter(Actor):
     def __init__(self, v: int):

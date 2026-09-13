@@ -20,6 +20,8 @@ from monarch._rust_bindings.monarch_hyperactor.proc import ProcId
 from monarch._src.spmd.host_mesh import _IN_PAR, _spawn_worker_process, _worker_addr_key
 from monarch.job.spmd import StoreJob
 
+pytestmark = pytest.mark.control_plane
+
 
 def _pid_alive(pid: int) -> bool:
     try:

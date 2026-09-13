@@ -1,4 +1,8 @@
 [build]
+# Guard every rustc invocation through the shared execution contract so cargo
+# refuses to compile outside a controlled domain. RUSTC_WRAPPER (sccache in CI)
+# overrides this, and that wrapper carries its own guard.
+rustc-wrapper = "scripts/rootfs/rustc-wrapper.sh"
 rustflags = [
     "--cfg",
     "tracing_unstable",
@@ -7,6 +11,11 @@ rustflags = [
     # unexpected cfg in ordinary builds.
     "--check-cfg",
     "cfg(hyperactor_verify_auto_traits)",
+    # Declare the fbsource-only build cfg that build_utils gates its internal
+    # path resolution on (see build_utils/src/lib.rs) so OSS clippy under
+    # `-D warnings` does not reject it as an unexpected cfg.
+    "--check-cfg",
+    "cfg(fbcode_build)",
     # Mirror fbsource-common.bcfg [rust] allow_lints so `cargo clippy`
     # surfaces the same lint set as `arc rust-clippy`. Lints re-enabled
     # in monarch's PACKAGE via `-W` are intentionally omitted from this

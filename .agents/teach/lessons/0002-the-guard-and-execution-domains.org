@@ -1,0 +1,157 @@
+#+TITLE: Lesson 0002 - The guard and execution domains
+#+SUBTITLE: Why scripts/run is the only Linux-local door in
+#+OPTIONS: toc:nil num:nil
+
+* Why this lesson
+Lesson 0001 taught what makes a rootfs current. This lesson teaches what makes
+a command allowed to run at all.
+
+The rule is simple: Linux-local development, build, test, and docs commands go
+through ~scripts/run~. Some entrypoints are allowed to run on the host, but only
+because they belong to a different execution domain that is explicitly recorded
+in ~scripts/rootfs/execution-domains.toml~.
+
+The practical skill: when you add or review a new executable script, you should
+be able to decide whether it belongs in ~rootfs-development~, ~host-bootstrap~,
+or one of the explicit exemptions.
+
+* The gateway is intentional
+~scripts/run~ describes itself as the sole Linux-local gateway
+(~scripts/run:8-12~):
+
+#+begin_src text
+The sole Linux-local gateway for Monarch development, build, test, and docs
+commands. It re-execs into the hermetic bwrap rootfs, maps the caller's
+working directory to the matching checkout-relative directory inside the
+sandbox, activates the rootfs virtual environment, and runs the command with
+its arguments and exit status preserved.
+#+end_src
+
+That is a policy statement and an implementation statement. Outside the rootfs,
+~scripts/run~ maps your current checkout-relative directory and execs
+~enter_rootfs.sh~ with an in-sandbox command path
+(~scripts/run:74-85~):
+
+#+begin_src bash
+exec "$REPO_ROOT/scripts/rootfs/enter_rootfs.sh" \
+  --chdir "$checkout_rel" -- /workspace/monarch/scripts/run "$@"
+#+end_src
+
+Inside the rootfs, it validates the contract, activates the venv, and execs the
+original command (~scripts/run:38-60~). The command keeps its args and exit
+status, so the gateway is not a wrapper that changes test semantics. It is an
+environment boundary.
+
+* The guard proves more than a marker
+~MONARCH_IN_ROOTFS=1~ is not enough. The contract file says this explicitly:
+entry is proven by the marker, the checkout mount, the stamped recipe digest,
+the user namespace uid map, and controlled tool paths
+(~execution_contract.sh:100-103~, ~execution_contract.sh:196-212~).
+
+The core check is ~monarch_in_valid_rootfs~:
+
+#+begin_src bash
+[[ "${MONARCH_IN_ROOTFS:-}" == "1" ]] || return 1
+monarch_checkout_matches "$repo_root" "$MONARCH_CHECKOUT_MOUNT" || return 1
+[[ -r "$MONARCH_ROOTFS_CONTRACT_PATH" ]] || return 1
+expected="$(monarch_rootfs_recipe_sha256 "$repo_root")" || return 1
+grep -qx "MONARCH_ROOTFS_RECIPE_SHA256=$expected" "$MONARCH_ROOTFS_CONTRACT_PATH" || return 1
+[[ -r /proc/self/uid_map ]] || return 1
+monarch_uid_map_is_controlled /proc/self/uid_map || return 1
+#+end_src
+
+Requested tools are also checked. For example, ~cargo~ must resolve to
+~/opt/cargo/bin/cargo~, ~uv~ to ~/usr/local/bin/uv~, and Python is valid either
+as the rootfs system Python before activation or the rootfs venv Python after
+activation (~execution_contract.sh:171-194~).
+
+The mental model: the guard is not "did we set an env var?" It is "does this
+process have the exact mount, recipe, namespace, and toolchain shape we review?"
+
+* The diagnostic is one path
+Every failed local-development guard routes to the same message
+(~execution_contract.sh:223-235~):
+
+#+begin_src text
+error: Monarch development commands must run inside the hermetic bwrap rootfs
+run instead: scripts/run <command>
+#+end_src
+
+This is important maintenance behavior. If a new rootfs-development script has
+its own bespoke "please activate venv" or "set CC" error, it weakens the mental
+model. The right repair is usually to call the shared contract helper and let
+the shared diagnostic point back to ~scripts/run~.
+
+* Domains explain the exceptions
+Not every executable can run inside the rootfs. The scripts that build and
+enter the rootfs have to run on the host. CI, native macOS, installed wheels,
+remote workers, and Meta-internal paths are separate execution contexts.
+
+The reviewed inventory is ~scripts/rootfs/execution-domains.toml~. It names the
+domains in comments (~execution-domains.toml:12-20~), then records path patterns.
+Two domains matter most for day-to-day maintenance:
+
+- ~host-bootstrap~: host-side entry/build helpers, including ~scripts/run~,
+  ~build_rootfs.sh~, ~enter_rootfs.sh~, ~execution_contract.sh~,
+  ~activate_environment.sh~, and ~run_in_rootfs.sh~
+  (~execution-domains.toml:22-30~).
+- ~rootfs-development~: real dev/build/test/docs work that must run inside the
+  rootfs, including ~run_local_control_plane.sh~, ~run_local_8gpu_capacity.sh~,
+  ~local_8gpu_capacity.py~, docs/frontend build scripts, ~setup.py~, and
+  examples/benches (~execution-domains.toml:32-69~).
+
+The maintenance skill: when adding an executable, do not only ask "does it work
+on my machine?" Ask "which execution domain owns it, and what guard should make
+wrong-domain execution fail loudly?"
+
+* Check yourself
+Answer before reading the explanation.
+
+** Q1. A new script builds a docs artifact using uv, cargo, mdbook, and checkout Python. Which domain should it normally enter?
+- a. ~host-bootstrap~
+- b. ~rootfs-development~
+- c. ~controlled-ci~
+
+Answer: *b*. It is real dev/build work, so it belongs in ~rootfs-development~
+and should run through ~scripts/run~. Host-bootstrap is for building or entering
+the rootfs itself.
+
+** Q2. Why is ~MONARCH_IN_ROOTFS=1~ alone not enough to prove a valid rootfs?
+- a. A caller could spoof it; the guard also checks mount, stamp, uid map, and tools.
+- b. It is only set for GitHub Actions, not local runs.
+- c. It is ignored because Python deletes it during activation.
+
+Answer: *a*. The contract explicitly says the marker alone never proves entry
+(~execution_contract.sh:100-103~). ~monarch_in_valid_rootfs~ checks the fixed
+checkout mount, recipe stamp, uid map, and requested tool paths
+(~execution_contract.sh:196-212~).
+
+** Q3. A script's guard fails outside the rootfs. What should its user-facing
+repair path say?
+- a. "Set CC=/usr/bin/gcc and retry."
+- b. "Activate .venv-rootfs/bin/activate and retry."
+- c. "Run instead: scripts/run <command>."
+
+Answer: *c*. The shared diagnostic is the contract. The point is to preserve one
+entry path, not to teach users a list of host-side fixes.
+
+* Practice in the repo
+Pick one executable path you might add, such as a new verifier under ~scripts/~.
+Classify it:
+
+- Does it build, test, import Python, run cargo, or touch CUDA? Then start with
+  ~rootfs-development~.
+- Does it build/enter/validate the rootfs itself? Then consider
+  ~host-bootstrap~.
+- Is it a separate named context (CI, Darwin, remote worker, Meta-internal)?
+  Then use the existing explicit exemption vocabulary.
+
+Then check your answer against ~execution-domains.toml~ before writing the
+script.
+
+* Next
+Lesson 0003: the isolation mechanics inside ~enter_rootfs.sh~ - read-only root,
+cleared environment, venv activation, and why bare-host ~cargo~ is the wrong
+mental model.
+
+# Sources current as of this checkout.

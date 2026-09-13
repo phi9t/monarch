@@ -83,21 +83,22 @@ Monarch uses a **dual build system**:
 
 ### OSS Build (pip/uv + setuptools-rust)
 
-For external/open-source development:
+For external/open-source development. Every Linux-local command runs through
+`scripts/run`, the sole gateway into the hermetic bwrap rootfs; it re-execs into
+the sandbox, activates the rootfs venv, and preserves arguments and exit status.
+`enter_rootfs.sh` auto-builds the rootfs on first use.
 
 ```bash
 # Build with tensor_engine (CUDA/GPU support) - default
-uv sync
-uv build --wheel --no-build-isolation
+scripts/run uv sync
+scripts/run uv build --wheel --no-build-isolation
 
 # Build without tensor_engine (CPU-only)
-USE_TENSOR_ENGINE=0 uv sync
-USE_TENSOR_ENGINE=0 uv build --wheel --no-build-isolation
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv build --wheel --no-build-isolation
 
 # Development installation
-pip install -e .
-# or
-uv sync
+scripts/run uv sync
 ```
 
 **Environment Variables:**
@@ -111,7 +112,7 @@ uv sync
 **PyTorch Index Configuration:**
 The project uses PyTorch from specific indices (see `pyproject.toml`). Default is `pytorch-cu132`. To change:
 ```bash
-uv sync --extra-index-url https://download.pytorch.org/whl/cu130
+scripts/run uv sync --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
 ### Meta Internal Build (Buck2)
@@ -138,12 +139,12 @@ The `check` script provides a unified workflow for linting, typechecking, and te
 **OSS (Outside Meta):**
 ```bash
 # Full build with GPU support (requires CUDA, torch, RDMA libraries)
-uv sync
-uv build --wheel --no-build-isolation
+scripts/run uv sync
+scripts/run uv build --wheel --no-build-isolation
 
 # CPU-only build (no CUDA/RDMA required)
-USE_TENSOR_ENGINE=0 uv sync
-USE_TENSOR_ENGINE=0 pip install -e .
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv pip install -e .
 ```
 
 **Meta Internal:**
@@ -163,26 +164,26 @@ buck2 build @fbcode//mode/dev-nosan fbcode//monarch/python/monarch:monarch_lib
 **Python Tests (OSS):**
 ```bash
 # Install test dependencies
-uv sync --extra test
+scripts/run uv sync --extra test
 
 # Run all tests (skip Meta-internal only tests)
-uv run pytest python/tests/ -v -m "not oss_skip"
+scripts/run uv run pytest python/tests/ -v -m "not oss_skip"
 
 # Run specific test file
-uv run pytest python/tests/_monarch/test_actor_mesh.py -v
+scripts/run uv run pytest python/tests/_monarch/test_actor_mesh.py -v
 
 # Run tests in parallel
-uv run pytest python/tests/ -v -m "not oss_skip" -n auto
+scripts/run uv run pytest python/tests/ -v -m "not oss_skip" -n auto
 ```
 
 **Rust Tests (OSS):**
 ```bash
-# IMPORTANT: Activate Python environment first (Rust binaries link against Python)
-uv sync  # Creates and activates venv
-uv run cargo nextest run  # Run with nextest
+# The gateway activates the rootfs Python env (Rust binaries link against Python)
+scripts/run uv sync
+scripts/run uv run cargo nextest run  # Run with nextest
 
 # Or with standard cargo test
-cargo test
+scripts/run cargo test
 ```
 
 **Meta Internal:**
@@ -218,38 +219,41 @@ arc pyre check-changed-targets
 **OSS:**
 ```bash
 # Python linting (flake8 config in .flake8)
-flake8 python/
+scripts/run flake8 python/
 
 # Rust formatting
-cargo fmt
+scripts/run cargo fmt
 
 # Rust linting
-cargo clippy
+scripts/run cargo clippy
 ```
 
 ### Building Documentation
 
 ```bash
-cd docs
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Build all documentation (includes Python API docs, Rust docs, examples)
-make html
+scripts/run uv sync --frozen --inexact --group docs --extra kubernetes --no-dev --no-install-project
+scripts/run bash scripts/build_monarch_for_docs.sh
+scripts/run cargo doc --locked --workspace --no-deps
+scripts/run mdbook build docs/source/books/hyperactor-book
+scripts/run mdbook build docs/source/books/hyperactor-mesh-book
+scripts/run make -C docs html
 
 # View the results
-open build/html/index.html
+open docs/build/html/index.html
 
 # Clean build
-make clean
+scripts/run make -C docs clean
 ```
 
 The documentation system:
 - Auto-generates Python API docs from docstrings
-- Integrates Rust `cargo doc` output
-- Includes mdBook narrative documentation
+- Copies the Rust `cargo doc` output produced by the earlier `cargo doc` step
+- Includes mdBook narrative documentation built by the earlier `mdbook` steps
 - Processes examples with Sphinx Gallery
+
+`make -C docs html` runs the Sphinx Gallery pass and copies the Cargo docs from
+`$CARGO_TARGET_DIR/doc`, but it does not itself run `cargo doc` or the mdBook
+builds; run those first, as shown above.
 
 ## Architecture Notes
 
@@ -282,7 +286,7 @@ These link against libtorch and must match the C++11 ABI of the installed PyTorc
 
 ### Python Environment Requirements
 
-**Rust builds require an active Python environment** because PyO3 links against Python libraries. Always activate your conda/venv/uv environment before running `cargo` commands, or use `uv run cargo ...`.
+**Rust builds require an active Python environment** because PyO3 links against Python libraries. `scripts/run` activates the rootfs venv before running `cargo` commands, so route Rust builds through it; a bare-host `cargo` cannot find libpython.
 
 ## Testing Notes
 
@@ -302,7 +306,7 @@ Default pytest timeout is 5 minutes (configured in `pyproject.toml`).
 
 ## Common Pitfalls
 
-1. **Rust Python Linking Errors**: If you see "could not find native static library `python3.12`", activate your Python environment first
+1. **Rust Python Linking Errors**: If you see "could not find native static library `python3.12`", run through `scripts/run`, which activates the rootfs Python env
 2. **C++11 ABI Mismatches**: The build auto-detects PyTorch's ABI, but mismatches cause runtime errors
 3. **CUDA Version Mismatches**: Ensure your CUDA installation matches the PyTorch index (e.g., cu132 = CUDA 13.2)
 4. **Missing tensor_engine**: If you get import errors for RDMA/distributed tensors, rebuild with `USE_TENSOR_ENGINE=1`
@@ -312,10 +316,10 @@ Default pytest timeout is 5 minutes (configured in `pyproject.toml`).
 ### OSS Contribution Workflow
 
 1. Make changes to Rust or Python code
-2. Build: `uv sync`
-3. Test: `uv run pytest python/tests/ -v -m "not oss_skip"`
-4. Run Rust tests: `uv run cargo nextest run`
-5. Format: `cargo fmt` (Rust), ensure `.flake8` compliance (Python)
+2. Build: `scripts/run uv sync`
+3. Test: `scripts/run uv run pytest python/tests/ -v -m "not oss_skip"`
+4. Run Rust tests: `scripts/run uv run cargo nextest run`
+5. Format: `scripts/run cargo fmt` (Rust), ensure `.flake8` compliance (Python)
 
 ### Meta Internal Workflow
 
