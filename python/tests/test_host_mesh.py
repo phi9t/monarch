@@ -37,6 +37,8 @@ from monarch._src.job.process import ProcessJob
 from monarch.config import configured
 from scoped_state import scoped_state
 
+pytestmark = pytest.mark.control_plane
+
 
 @pytest.mark.timeout(60)
 def test_process_job_host_mesh() -> None:

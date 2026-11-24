@@ -41,6 +41,8 @@ from monarch.actor import (
 )
 from monarch.config import configured, parametrize_config
 
+pytestmark = pytest.mark.control_plane
+
 
 class ExceptionActor(Actor):
     def __init__(self, except_on_init=False) -> None:

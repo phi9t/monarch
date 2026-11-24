@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# This fixture runs a compiled test binary, so require a controlled domain
+# before launching it.
+_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+"$_repo_root/scripts/rootfs/execution_contract.sh" require-controlled
+
 BIN="$1"
 
 # Launch client in background; capture its PID
