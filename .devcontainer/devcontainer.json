@@ -1,0 +1,115 @@
+{
+  "name": "Monarch Development",
+
+  // Use the docker-compose files from dev/ directory
+  // For CPU-only development:
+  "dockerComposeFile": ["../dev/docker-compose.yml"],
+  // For CUDA development, uncomment the next line and comment the above:
+  // "dockerComposeFile": ["../dev/docker-compose.yml", "../dev/docker-compose.cuda.yml"],
+
+  "service": "monarch-dev",
+  "workspaceFolder": "/workspace",
+
+  // VS Code customizations
+  "customizations": {
+    "vscode": {
+      "settings": {
+        // Python settings
+        "python.defaultInterpreterPath": "/opt/conda/envs/monarch/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "python.condaPath": "/opt/conda/bin/conda",
+        "python.formatting.provider": "black",
+        "python.linting.enabled": true,
+        "python.linting.flake8Enabled": true,
+        "python.linting.flake8Args": ["--max-line-length=256"],
+
+        // Rust settings
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.procMacro.enable": true,
+        "rust-analyzer.cargo.buildScripts.enable": true,
+
+        // Editor settings
+        "editor.formatOnSave": true,
+        "editor.rulers": [100, 256],
+
+        // Language-specific settings
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter",
+          "editor.formatOnSave": true
+        },
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        },
+        "[toml]": {
+          "editor.defaultFormatter": "tamasfe.even-better-toml"
+        },
+
+        // Terminal settings
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "/bin/bash",
+            "args": ["-l"]
+          }
+        }
+      },
+
+      "extensions": [
+        // Rust development
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml",
+
+        // Python development
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.flake8",
+
+        // Git and productivity
+        "eamodio.gitlens",
+        "github.copilot",
+        "github.copilot-chat",
+
+        // General utilities
+        "streetsidesoftware.code-spell-checker",
+        "gruntfuggly.todo-tree"
+      ]
+    }
+  },
+
+  // Post-create setup script
+  "postCreateCommand": "bash .devcontainer/postCreateCommand.sh",
+
+  // Container user
+  "remoteUser": "root",
+
+  // Additional features (optional)
+  "features": {},
+
+  // Run arguments for GPU support (uncomment for CUDA)
+  // "runArgs": [
+  //   "--gpus", "all",
+  //   "--shm-size", "16g"
+  // ],
+
+  // Volume mounts for persistence
+  "mounts": [
+    "source=monarch-cargo-registry,target=/root/.cargo/registry,type=volume",
+    "source=monarch-cargo-git,target=/root/.cargo/git,type=volume",
+    "source=monarch-cargo-target,target=/workspace/target,type=volume",
+    "source=monarch-conda-pkgs,target=/opt/conda/pkgs,type=volume",
+    // Mount SSH keys for git operations (optional)
+    "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,readonly",
+    // Mount gitconfig (optional)
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind,readonly"
+  ],
+
+  // Environment variables passed to the container
+  "containerEnv": {
+    "RUST_BACKTRACE": "1"
+  }
+}

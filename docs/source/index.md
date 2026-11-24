@@ -57,11 +57,12 @@ Here are some suggested steps to get started with Monarch:
 :caption: Contents
 :hidden:
 installation
-./generated/examples/getting_started
-./generated/examples/index
-api/index
-rust-api
-actors
+    ./generated/examples/getting_started
+    ./generated/examples/index
+    technical-deep-dive
+    api/index
+    rust-api
+    actors
 ```
 
 ## License

@@ -1,0 +1,970 @@
+#+TITLE: Monarch Rust Module Deep Dive
+#+AUTHOR: Codebase Review
+#+DATE: 2026-03-14
+#+STARTUP: overview
+#+OPTIONS: toc:3 num:t H:5
+#+PROPERTY: header-args :eval never
+
+* Overview
+:PROPERTIES:
+:CUSTOM_ID: overview
+:END:
+
+Monarch is a distributed programming framework for PyTorch built on the
+*hyperactor* actor system. The Rust layer provides a single =cdylib= Python
+extension, PyO3 bindings to the actor framework, a PyTorch tensor worker actor,
+NCCL/RDMA communication, and FFI to libtorch/CUDA/NCCL.
+
+** Scale
+
+| Layer                                             | Crates | LoC     |
+|---------------------------------------------------+--------+---------|
+| Foundation (typeuri, wirevalue, ndslice, etc.)    |     12 | ~35,700 |
+| Actor Framework (hyperactor, hyperactor\_mesh)    |      2 | ~52,500 |
+| Application (monarch\_*, torch-sys, nccl-sys)     |     15 | ~47,000 |
+| Macros (hyperactor\_macros, config\_macros, etc.) |      6 | ~3,600  |
+| *Total*                                             |     *39* | *~135k*   |
+
+** Dependency Graph
+
+#+BEGIN_EXAMPLE
+monarch_extension (cdylib)
+  |-- monarch_hyperactor (pyo3 bindings)
+  |     |-- hyperactor_mesh
+  |     |     |-- hyperactor
+  |     |     |     |-- hyperactor_macros (proc-macro)
+  |     |     |     |-- hyperactor_config
+  |     |     |     |-- hyperactor_telemetry
+  |     |     |     |-- wirevalue
+  |     |     |     |     |-- typeuri
+  |     |     |     |     |-- serde_multipart
+  |     |     |     |-- algebra
+  |     |     |-- ndslice
+  |     |-- monarch_types
+  |-- monarch_tensor_worker
+  |     |-- monarch_messages
+  |     |-- torch-sys2 / torch-sys-cuda
+  |-- monarch_rdma (optional)
+  |-- nccl-sys / rdmaxcel-sys (optional)
+#+END_EXAMPLE
+
+* hyperactor — Core Actor Framework (35,400 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor
+:END:
+
+The beating heart of Monarch. Provides the complete actor lifecycle, message
+routing, supervision, and transport.
+
+- Workspace entry :: [[file:Cargo.toml][Cargo.toml]]
+- Crate root :: [[file:hyperactor/Cargo.toml][hyperactor/Cargo.toml]]
+- Lib entry :: [[file:hyperactor/src/lib.rs][hyperactor/src/lib.rs]]
+
+** Architecture
+
+#+BEGIN_EXAMPLE
+Host (frontend mux — multi-proc)
+  └── Proc (actor runtime — owns actor lifecycle)
+       ├── MailboxMuxer (routes to local actors)
+       ├── Forwarder (routes to remote procs via channels)
+       ├── Instance<A> (running actor context)
+       │    ├── Mailbox (typed ports + message delivery)
+       │    ├── InstanceCell (shared: status, handlers, introspect)
+       │    ├── Sequencer (per-session message ordering)
+       │    └── ActorLocalStorage (per-actor TLS analog)
+       └── Supervision hierarchy (parent → child events)
+#+END_EXAMPLE
+
+** actor.rs — Core Traits & Lifecycle (2,426 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-actor
+:END:
+
+- Source :: [[file:hyperactor/src/actor.rs][hyperactor/src/actor.rs]]
+
+*** =Actor= trait
+
+The core trait with lifecycle hooks.
+
+#+BEGIN_SRC rust
+trait Actor: Sized + Send + 'static {
+    async fn init(&mut self, this: &Instance<Self>) -> Result<()>;
+    async fn cleanup(&mut self, this: &Instance<Self>, err: Option<&ActorError>) -> Result<()>;
+    fn spawn(self, cx: &impl context::Actor) -> Result<ActorHandle<Self>>;
+    fn spawn_detached(self) -> Result<ActorHandle<Self>>;
+    fn spawn_server_task<F>(future: F) -> JoinHandle<F::Output>;
+    async fn handle_supervision_event(&mut self, ...);
+    async fn handle_undeliverable_message(&mut self, ...);
+    fn display_name(&self) -> Option<String>;
+}
+#+END_SRC
+
+*** =Handler<M>= trait
+
+Generic message handler. =#[derive(Handler)]= generates a handler trait with
+per-variant async methods plus client traits.
+
+#+BEGIN_SRC rust
+trait Handler<M>: Actor {
+    async fn handle(&mut self, cx: &Context<Self>, message: M) -> Result<()>;
+}
+#+END_SRC
+
+*** =RemoteSpawn= trait
+
+For remotely-spawnable actors with serializable params. Blanket impl for
+=Default= actors.
+
+#+BEGIN_SRC rust
+trait RemoteSpawn: Actor {
+    type Params: RemoteMessage;
+    async fn new(params: Self::Params, env: RemoteSpawnEnv) -> Result<Self>;
+    fn gspawn(...);
+}
+#+END_SRC
+
+*** Other Key Types
+
+| Type              | Purpose                                                          |
+|-------------------+------------------------------------------------------------------|
+| =Signal=          | Runtime control: DrainAndStop, Stop, ChildStopped, Abort         |
+| =ActorStatus=     | Full lifecycle FSM (Created → Initializing → Idle ⇄ Processing) |
+| =ActorError=      | Categorized actor failures (Generic, Supervision, Aborted)       |
+| =ActorHandle<A>=  | Local handle — =send()=, =drain_and_stop()=, =status()=, =port()= |
+| =Referable=       | Marker for types eligible for typed remote references            |
+| =Binds<A>=        | Determines port binding for a reference type                     |
+| =RemoteHandles<M>= | Marker that message M is handled by a type                      |
+
+** proc.rs — Process Abstraction (4,103 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-proc
+:END:
+
+- Source :: [[file:hyperactor/src/proc.rs][hyperactor/src/proc.rs]]
+
+Owns actor lifecycle, message routing, supervision state, and terminated-actor
+snapshots.
+
+*** Key Types
+
+| Type         | Purpose                                                                 |
+|--------------+-------------------------------------------------------------------------|
+| =Proc=         | =Arc<ProcState>= — the process abstraction                                |
+| =ProcState=    | Inner: =MailboxMuxer=, forwarder, roots, instances, terminated\_snapshots |
+| =Instance<A>=  | Running actor instance providing context API                            |
+| =InstanceCell= | Shared state (status watch, type info, supervision, children)           |
+| =Context<A>=   | Borrow of Instance used in handler calls                                |
+| =Ports<A>=     | Type-safe port collection (generated by =#[export]=)                      |
+
+*** Key Methods
+
+- =Proc::local()= — thread-local proc with =PanickingMailboxSender=
+- =Proc::configured(proc_id, forwarder)= — production proc with routing
+- =Proc::spawn<A: Actor>(name, actor)= — spawn root actor
+- =Proc::spawn_child<A>(parent, actor)= — spawn supervised child
+- =Proc::post(envelope, return_handle)= — route message
+- =Proc::serve(rx)= — start receiving from channel
+- =Proc::destroy_and_wait(timeout, reason)= — graceful shutdown
+
+*** Server Loop
+
+1. Initialize actor via =actor.init()=
+2. Loop: receive from unbounded work queue → dispatch → update status
+3. Handle signals (=DrainAndStop=, =Stop=, =Abort=, =ChildStopped=)
+4. On termination: =actor.cleanup()=, notify supervision coordinator
+5. Panics caught via =AssertUnwindSafe= + =catch_unwind= with backtrace capture
+
+*** Concurrency
+
+- =DashMap= for concurrent actor registration/lookup
+- =AtomicUsize= for ID allocation
+- =watch::channel= for status observation
+- =tokio::spawn= per actor with panic catching
+
+** mailbox.rs — Message Passing (4,340 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-mailbox
+:END:
+
+- Source :: [[file:hyperactor/src/mailbox.rs][hyperactor/src/mailbox.rs]]
+
+Central message-passing mechanism — typed ports, serialization, delivery, routing.
+
+*** Message Traits
+
+#+BEGIN_SRC rust
+trait Message: Send + Sync + 'static {}                          // base
+trait RemoteMessage: Message + Named + Serialize + DeserializeOwned {} // crosses process boundaries
+#+END_SRC
+
+*** Wire Format
+
+=MessageEnvelope= carries:
+- =sender: ActorId=
+- =dest: PortId=
+- =data: wirevalue::Any=
+- =headers: Flattrs=
+- =error_msg: Option<String>=
+- =ttl: u16=
+- =return_undeliverable: bool=
+
+*** Port System
+
+| Type                | Purpose                              |
+|---------------------+--------------------------------------|
+| =PortHandle<M>=     | Local handle for sending typed msgs  |
+| =OncePortHandle<M>= | One-shot send handle                 |
+| =PortReceiver<M>=   | Local receiver for typed msgs        |
+| =OncePortReceiver<M>= | One-shot receiver                  |
+| =PortSink=          | =futures::Sink= adapter for streaming |
+
+Ports are typed endpoints within a mailbox. Each port gets a unique index
+(allocated atomically). Actor ports use a high bit (=ACTOR_PORT_BIT=) to
+distinguish from user ports.
+
+*** Delivery Chain
+
+#+BEGIN_EXAMPLE
+PortRef.send()
+  → context::post()
+    → MailboxSender.post_unchecked()
+      → route (local muxer OR channel dial)
+        → destination Proc.post()
+          → MailboxMuxer
+            → OrderedSender
+              → work queue
+                → Handler::handle()
+#+END_EXAMPLE
+
+*** MailboxSender Implementations
+
+| Impl                   | Purpose                                    |
+|------------------------+--------------------------------------------|
+| =MailboxClient=        | Dial-based remote sender                   |
+| =DialMailboxRouter=    | Routes by ProcId prefix to dialed connections |
+| =MailboxMuxer=         | Routes to local actors within a proc       |
+| =PanickingMailboxSender= | Panics on send (unroutable procs)        |
+
+** channel.rs — Multi-Transport Channels (1,558 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-channel
+:END:
+
+- Source :: [[file:hyperactor/src/channel.rs][hyperactor/src/channel.rs]]
+
+*** Transport Types
+
+#+BEGIN_SRC rust
+enum ChannelTransport { Tcp(TcpMode), MetaTls(TlsMode), Tls, Local, Unix }
+enum ChannelAddr { /* variants matching transports + Alias { dial_to, bind_to } */ }
+#+END_SRC
+
+*** Key Functions
+
+- =dial<M>(addr) -> Result<ChannelTx<M>>= — connect to remote
+- =serve<M>(addr) -> Result<(ChannelAddr, ChannelRx<M>)>= — listen
+- =serve_local<M>() -> (ChannelAddr, ChannelRx<M>)= — in-process
+
+** id.rs — Identity System (1,283 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-id
+:END:
+
+- Source :: [[file:hyperactor/src/id.rs][hyperactor/src/id.rs]]
+
+Hierarchical naming with labels excluded from equality/hash comparisons.
+
+| Type     | Structure                                    | Format                             |
+|----------+----------------------------------------------+------------------------------------|
+| =Label=  | RFC 1035 (1-63 chars, lowercase alphanum+-)  | =my-label=                         |
+| =Uid=    | =Singleton(Label)= or =Instance(u64)=        | =_label= or ={hex16}=              |
+| =ProcId= | =\{ uid, label? \}=                          | identity by uid only               |
+| =ActorId= | =\{ uid, proc\_id, label? \}=               | identity by (proc\_id, uid)        |
+| =PortId= | =\{ actor\_id, port \}=                      | identity by (actor\_id, port)      |
+
+** ref_.rs — Network-Aware References (858 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-ref
+:END:
+
+- Source :: [[file:hyperactor/src/ref_.rs][hyperactor/src/ref_.rs]]
+
+| Type       | Structure                             |
+|------------+---------------------------------------|
+| =Location= | Wraps =ChannelAddr=, displays as ZMQ URL |
+| =ProcRef=  | =\{ id: ProcId, location \}=          |
+| =ActorRef= | =\{ id: ActorId, location \}=         |
+| =PortRef=  | =\{ id: PortId, location \}=          |
+
+** remote.rs — Typed Remote References (520 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-remote
+:END:
+
+- Source :: [[file:hyperactor/src/remote.rs][hyperactor/src/remote.rs]]
+
+#+BEGIN_SRC rust
+trait Accepts<M> {} // marker — Remote<T> can send M when T: Accepts<M>
+
+struct Remote<A: Named> { /* wraps ActorRef or PortRef */ }
+impl<A: Named> Remote<A> {
+    fn send<M>(&self, msg: M) where A: Accepts<M>;
+    fn narrow<M>(self) -> Remote<M>; // single-message remote
+}
+#+END_SRC
+
+** Other Modules
+
+| Module | Source | LOC | Purpose |
+|--------+--------+-----+---------|
+| =message.rs= | [[file:hyperactor/src/message.rs][message.rs]] | 469 | Bind/Unbind framework for multicast port rebinding |
+| =context.rs= | [[file:hyperactor/src/context.rs][context.rs]] | 405 | Sealed context traits (=Mailbox=, =Actor=, =MailboxExt=) |
+| =introspect.rs= | [[file:hyperactor/src/introspect.rs][introspect.rs]] | 1,100 | Non-blocking per-actor introspection (12 invariants) |
+| =host.rs= | [[file:hyperactor/src/host.rs][host.rs]] | 1,814 | Multi-proc management, =ProcManager= trait |
+| =ordering.rs= | [[file:hyperactor/src/ordering.rs][ordering.rs]] | 566 | Per-sender message ordering with reordering buffers |
+| =accum.rs= | [[file:hyperactor/src/accum.rs][accum.rs]] | 1,104 | Accumulator/reducer framework for message coalescing |
+| =actor_local.rs= | [[file:hyperactor/src/actor_local.rs][actor_local.rs]] | 1,111 | Per-actor local storage (like =thread_local!= for actors) |
+| =config.rs= | [[file:hyperactor/src/config.rs][config.rs]] | 437 | Config keys (10 GiB max frame, 30s delivery timeout, TLS) |
+| =signal_handler.rs= | [[file:hyperactor/src/signal_handler.rs][signal_handler.rs]] | 291 | SIGINT/SIGTERM cleanup with =SignalCleanupGuard= RAII |
+| =panic_handler.rs= | [[file:hyperactor/src/panic_handler.rs][panic_handler.rs]] | 232 | Task-local backtrace capture via =tokio::task_local!= |
+| =stdio_redirect.rs= | [[file:hyperactor/src/stdio_redirect.rs][stdio_redirect.rs]] | 199 | Broken pipe detection + stdio redirect to file |
+| =time.rs= | [[file:hyperactor/src/time.rs][time.rs]] | 235 | =Alarm=/=AlarmSleeper= — versionable one-shot timer |
+| =port.rs= | [[file:hyperactor/src/port.rs][port.rs]] | 130 | =Port= newtype wrapping u64, =ACTOR_PORT_BIT= detection |
+| =supervision.rs= | [[file:hyperactor/src/supervision.rs][supervision.rs]] | 154 | =ActorSupervisionEvent= — child failure propagation |
+| =checkpoint.rs= | [[file:hyperactor/src/checkpoint.rs][checkpoint.rs]] | 44 | =Checkpointable= trait (save/load) |
+| =sync/= | [[file:hyperactor/src/sync/][sync/]] | 521 | =MVar= (blocking exchange), =Flag=, =Monitor= |
+| =testing/= | [[file:hyperactor/src/testing/][testing/]] | 634 | =PingPongActor=, test ID helpers, process assertions |
+| =metrics.rs= | [[file:hyperactor/src/metrics.rs][metrics.rs]] | 105 | Static metric declarations (counters, histograms) |
+
+* hyperactor_mesh — Mesh Abstractions (~17,100 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-mesh
+:END:
+
+Adds the "mesh" concept — collections of ranked actors/procs with multicast,
+supervision, and distributed coordination.
+
+- Crate root :: [[file:hyperactor_mesh/Cargo.toml][hyperactor_mesh/Cargo.toml]]
+- Lib entry :: [[file:hyperactor_mesh/src/lib.rs][hyperactor_mesh/src/lib.rs]]
+
+** actor_mesh.rs — ActorMesh
+:PROPERTIES:
+:CUSTOM_ID: mesh-actor-mesh
+:END:
+
+- Source :: [[file:hyperactor_mesh/src/actor_mesh.rs][hyperactor_mesh/src/actor_mesh.rs]]
+
+*** Key Types
+
+- =ActorMesh<A: Referable>= — Owned. Derefs to =ActorMeshRef<A>=. Has =stop()=.
+- =ActorMeshRef<A: Referable>= — Lazily materialized paged cache of =ActorRef<A>=.
+  - =Page<A>= — =Box<[OnceLock<ActorRef<A>>]>= (page size 1024)
+  - Implements =Ranked<Item=ActorRef<A>>=, =Serialize/Deserialize=, =Hash/Eq=
+- =HealthState= — Tracks unhealthy events and crashed ranks per actor context.
+
+*** Cast Paths
+
+Two cast implementations coexist:
+- =cast_v0= — Via =CommActor= tree (efficient multicast)
+- Direct per-actor send — Fallback without =CommActor=
+
+=cast()= checks health state before sending; returns =Error::Supervision= if
+mesh is dead.
+
+** proc_mesh.rs — ProcMesh
+:PROPERTIES:
+:CUSTOM_ID: mesh-proc-mesh
+:END:
+
+- Source :: [[file:hyperactor_mesh/src/proc_mesh.rs][hyperactor_mesh/src/proc_mesh.rs]]
+
+*** Key Types
+
+| Type          | Purpose                                                         |
+|---------------+-----------------------------------------------------------------|
+| =ProcRef=     | Single proc reference: =ProcId=, =create_rank=, =ActorRef<ProcAgent>= |
+| =ProcMesh=    | Owned mesh with allocation (Allocated or Owned from HostMesh)   |
+| =ProcMeshRef= | Named, Serializable. Holds =Region=, =Arc<Vec<ProcRef>>=       |
+
+*** Key Methods
+
+- =ProcMesh::allocate()= — Takes =Box<dyn Alloc>=, inits procs, configures ProcAgents, spawns CommActors
+- =ProcMeshRef::spawn<A: RemoteSpawn>()= — Spawns typed actor mesh via =CreateOrUpdate= + =GetRankStatus= accumulator
+- =ProcMesh::stop()= — Graceful shutdown
+
+** value_mesh.rs — ValueMesh
+:PROPERTIES:
+:CUSTOM_ID: mesh-value-mesh
+:END:
+
+- Source :: [[file:hyperactor_mesh/src/value_mesh.rs][hyperactor_mesh/src/value_mesh.rs]]
+
+Rank-indexed collection with dual representation.
+
+*** Representations
+
+#+BEGIN_SRC rust
+enum Rep<T> {
+    Dense { values: Vec<T> },
+    Compressed { table: Vec<T>, runs: Vec<Run> }, // RLE encoding
+}
+struct Run { start: u64, end: u64, id: u32 }
+#+END_SRC
+
+*** Key Operations
+
+- =compress_adjacent_in_place()= — Dense → RLE
+- =merge_from_overlay()= — Right-wins merge for distributed accumulation
+- =join()= — Await all futures in mesh
+- =transpose()= — =ValueMesh<Result<T,E>>= → =Result<ValueMesh<T>, E>=
+- =build_indexed()= — Uses =MaybeUninit= with bitset occupancy + =DropGuard=
+
+** Allocator System
+:PROPERTIES:
+:CUSTOM_ID: mesh-alloc
+:END:
+
+- Source :: [[file:hyperactor_mesh/src/alloc.rs][hyperactor_mesh/src/alloc.rs]]
+- LocalAlloc :: [[file:hyperactor_mesh/src/alloc/local.rs][alloc/local.rs]]
+- ProcessAlloc :: [[file:hyperactor_mesh/src/alloc/process.rs][alloc/process.rs]]
+- RemoteProcessAlloc :: [[file:hyperactor_mesh/src/alloc/remoteprocess.rs][alloc/remoteprocess.rs]]
+
+*** Traits
+
+#+BEGIN_SRC rust
+trait Allocator: Send + Sync + 'static {
+    async fn allocate(&self, spec: AllocSpec) -> Result<Box<dyn Alloc>>;
+}
+trait Alloc: Send + 'static {
+    async fn next(&mut self) -> Option<ProcState>;
+    async fn stop(&mut self, reason: ProcStopReason);
+    fn spec(&self) -> &AllocSpec;
+    fn extent(&self) -> &Extent;
+}
+#+END_SRC
+
+*** ProcState Lifecycle
+
+=Created → Running → Stopped | Failed=
+
+| =ProcStopReason= variant | Meaning                    |
+|---------------------------+----------------------------|
+| =Stopped=                 | Graceful shutdown          |
+| =Exited(code)=            | Process exited with code   |
+| =Killed(signal)=          | Killed by signal           |
+| =Watchdog=                | Watchdog timeout           |
+| =HostWatchdog=            | Host-level watchdog        |
+| =Unknown=                 | Unknown reason             |
+
+** Communication Layer
+:PROPERTIES:
+:CUSTOM_ID: mesh-comm
+:END:
+
+- CommActor :: [[file:hyperactor_mesh/src/comm.rs][hyperactor_mesh/src/comm.rs]]
+- Multicast :: [[file:hyperactor_mesh/src/comm/multicast.rs][comm/multicast.rs]]
+- Casting utils :: [[file:hyperactor_mesh/src/casting.rs][hyperactor_mesh/src/casting.rs]]
+
+=CommActor= — System actor for efficient tree-based multicast:
+- Handles =CastMessage= (initiate), =ForwardMessage= (tree propagation)
+- Per-(ActorMeshId, sender) sequence tracking with out-of-order buffering
+- Port splitting for accumulation (streaming and once-port modes)
+
+** Bootstrap System (~3,800 LOC)
+:PROPERTIES:
+:CUSTOM_ID: mesh-bootstrap
+:END:
+
+- Source :: [[file:hyperactor_mesh/src/bootstrap.rs][hyperactor_mesh/src/bootstrap.rs]]
+
+State machine: =Starting → Running → Ready → Stopping → Stopped | Failed | Killed=
+
+- Environment variable serialization for config propagation
+- =PDEATHSIG= support (Linux) for parent-death cleanup
+- =StreamFwder= for stdout/stderr capture and forwarding
+
+** Other Mesh Modules
+
+| Module | Source | Purpose |
+|--------+--------+---------|
+| =logging.rs= | [[file:hyperactor_mesh/src/logging.rs][logging.rs]] | Log forwarding/aggregation, Levenshtein dedup (~2,400 LOC) |
+| =supervision.rs= | [[file:hyperactor_mesh/src/supervision.rs][supervision.rs]] | =MeshFailure= — actor mesh name + rank + event |
+| =mesh_controller.rs= | [[file:hyperactor_mesh/src/mesh_controller.rs][mesh_controller.rs]] | =ActorMeshController<A>= — polls states, generates supervision events |
+| =namespace.rs= | [[file:hyperactor_mesh/src/namespace.rs][namespace.rs]] | =Namespace= trait — key-value registry for mesh discovery |
+| =connect.rs= | [[file:hyperactor_mesh/src/connect.rs][connect.rs]] | =ActorConnection<C>= — duplex bytestream via actors |
+| =shared_cell.rs= | [[file:hyperactor_mesh/src/shared_cell.rs][shared_cell.rs]] | =SharedCell<T>= — Arc<PreemptibleRwLock> with take-once |
+| =global_context.rs= | [[file:hyperactor_mesh/src/global_context.rs][global_context.rs]] | Process-singleton, =context()=, =this_host()=, =this_proc()= |
+| =host_mesh.rs= | [[file:hyperactor_mesh/src/host_mesh.rs][host_mesh.rs]] | =HostMesh=/=HostMeshRef=, =HostAgent= actor |
+| =proc_agent.rs= | [[file:hyperactor_mesh/src/proc_agent.rs][proc_agent.rs]] | Per-proc lifecycle manager, orphan detection |
+| =proc_launcher.rs= | [[file:hyperactor_mesh/src/proc_launcher.rs][proc_launcher.rs]] | Native/Systemd process launcher backends |
+| =resource.rs= | [[file:hyperactor_mesh/src/resource.rs][resource.rs]] | Status enum, =RankedValues<T>=, CreateOrUpdate/Stop/GetState msgs |
+| =assign.rs= | [[file:hyperactor_mesh/src/assign.rs][assign.rs]] | =Ranks<T>= — bidirectional rank↔value map with bitmaps |
+| =shortuuid.rs= | [[file:hyperactor_mesh/src/shortuuid.rs][shortuuid.rs]] | =ShortUuid(u64)= — Flickr Base-58 (12 chars) |
+| =introspect.rs= | [[file:hyperactor_mesh/src/introspect.rs][introspect.rs]] | Mesh topology attrs, =NodePayload= API types |
+| =config.rs= | [[file:hyperactor_mesh/src/config.rs][config.rs]] | =MAX_CAST_DIMENSION_SIZE=, launcher kind, admin addr |
+| =transport.rs= | [[file:hyperactor_mesh/src/transport.rs][transport.rs]] | Default transport config (Unix/TCP/MetaTLS) |
+| =mesh.rs= | [[file:hyperactor_mesh/src/mesh.rs][mesh.rs]] | Generic =Mesh= trait (shape-based) |
+
+* Foundation Crates
+:PROPERTIES:
+:CUSTOM_ID: foundation
+:END:
+
+** ndslice — N-Dimensional Slicing (14,000 LOC)
+:PROPERTIES:
+:CUSTOM_ID: ndslice
+:END:
+
+The largest foundation crate. Mathematical core of mesh routing.
+
+- Crate root :: [[file:ndslice/Cargo.toml][ndslice/Cargo.toml]]
+- Lib entry :: [[file:ndslice/src/lib.rs][ndslice/src/lib.rs]]
+
+*** Key Types
+
+| Type             | Source | Purpose |
+|------------------+--------+---------|
+| =Slice=          | [[file:ndslice/src/slice.rs][slice.rs]] | ={offset, sizes, strides}= triple. Coordinate mapping, subviews. |
+| =Shape=          | [[file:ndslice/src/shape.rs][shape.rs]] | Labeled =Slice= with dimension names. =FromStr/Display=. |
+| =Selection=      | [[file:ndslice/src/selection.rs][selection.rs]] | Boolean algebra over mesh regions (tagless-final encoding). |
+| =ReshapedShape=  | [[file:ndslice/src/reshape.rs][reshape.rs]] | Greedy dimension factoring for hierarchical fanout routing. |
+| =Extent=         | [[file:ndslice/src/extent.rs][extent.rs]] | Coordinate space extent. |
+| =Point=          | [[file:ndslice/src/point.rs][point.rs]] | Rank + extent (coords computed lazily via =CoordIter=). |
+| =Region=         | [[file:ndslice/src/region.rs][region.rs]] | Higher-level coordinate space with Arc-shared data. |
+| =View=           | [[file:ndslice/src/view.rs][view.rs]] | =range=, =group_by=, mesh collection traits. |
+
+*** Selection Algebra
+
+#+BEGIN_SRC rust
+enum Selection {
+    True, False, All, First,
+    Range(Range<usize>),
+    Any(usize),
+    Label(String),
+    Union(Vec<Selection>),
+    Intersection(Vec<Selection>),
+}
+#+END_SRC
+
+Uses *tagless-final encoding* (=SelectionSYM= trait) — enabling multiple
+interpretations (AST, pretty-print, normalize, evaluate) from one algebra.
+
+*** Design Highlights
+
+- =Slice= validation ensures rectangular, non-overlapping strides at construction
+- =reshape_selection= recursively folds expressions through dimensional folding
+- Routing module converts selections into routing trees for mesh multicast
+- Custom =nom=-based parser and =TokenStream= parser for compile-time =sel!= macro
+- Extensive =proptest=-driven property testing
+
+** wirevalue — Type-Erased Serialization (934 LOC)
+:PROPERTIES:
+:CUSTOM_ID: wirevalue
+:END:
+
+- Crate root :: [[file:wirevalue/Cargo.toml][wirevalue/Cargo.toml]]
+- Lib entry :: [[file:wirevalue/src/lib.rs][wirevalue/src/lib.rs]]
+
+*** Key Types
+
+| Type          | Purpose                                                        |
+|---------------+----------------------------------------------------------------|
+| =Any=         | Serialized envelope: encoded bytes + typehash                  |
+| =Encoding=    | =Bincode \vert Json \vert Multipart=                           |
+| =TypeInfo=    | Runtime type registry entry (typename, typehash, dump fn, arm) |
+| =register_type!= | Macro to register types via =inventory= crate             |
+
+*** Design Highlights
+
+- =inventory= crate for linker-level type registration — no manual registry
+- Dual =LazyLock<HashMap>= indices: by typehash and by =TypeId= — O(1) lookup
+- =prefix/emplace_prefix= enables partial deserialization of bincode payloads without full roundtrip — routing optimization
+- CRC32 checksums for integrity verification
+- =JsonFmt= truncation handles multi-byte UTF-8 boundaries
+
+** typeuri — Type Naming (369 LOC)
+:PROPERTIES:
+:CUSTOM_ID: typeuri
+:END:
+
+- Crate :: [[file:typeuri/src/lib.rs][typeuri/src/lib.rs]]
+- Macros :: [[file:typeuri_macros/src/lib.rs][typeuri_macros/src/lib.rs]]
+
+*** =Named= Trait
+
+#+BEGIN_SRC rust
+trait Named {
+    fn typename() -> &'static str;
+    fn typehash() -> u64;   // CityHash
+    fn typeid() -> TypeId;
+    fn port() -> u64;
+    fn arm() -> Option<&'static str>; // enum variant name
+}
+#+END_SRC
+
+- =intern_typename!= macro — memoized =DashMap<TypeId, &'static str>= with =format!().leak()=
+- =ACTOR_PORT_BIT= — MSB flag distinguishing actor ports from type hashes
+- Blanket impls for primitives, tuples (up to 12), =Option<T>=, =Vec<T>=, =HashMap<K,V>=, =Result<T,E>=
+
+** hyperactor_config — Configuration System (4,387 LOC)
+:PROPERTIES:
+:CUSTOM_ID: hyperactor-config
+:END:
+
+- Crate :: [[file:hyperactor_config/src/lib.rs][hyperactor_config/src/lib.rs]]
+- Macros :: [[file:hyperactor_config_macros/src/lib.rs][hyperactor_config_macros/src/lib.rs]]
+
+*** Key Types
+
+| Type           | Purpose                                                        |
+|----------------+----------------------------------------------------------------|
+| =Key<T>=       | Typed config key with name, default, meta-attributes. FNV-1a hash. |
+| =Attrs=        | Heterogeneous =HashMap<&str, Box<dyn SerializableValue>>=      |
+| =Flattrs=      | Flat binary buffer for zero-copy message header transmission   |
+| =declare_attrs!= | Macro declaring keys with types, defaults, and =@meta(...)=  |
+
+*** Layered Resolution
+
+=TestOverride → Env → Runtime → File → ClientOverride → Default=
+
+- =ArcSwap= for lock-free reads of materialized config snapshot
+- =inventory= for decentralized key registration across crate boundaries
+- =AttrValue= trait with custom display/parse (=Duration= as humantime, =bool= as 0/1)
+- Test override system: per-key stacked frames with unique tokens
+
+*** Wire Format (Flattrs)
+
+#+BEGIN_EXAMPLE
+[num_entries: u16][key_hash: u64][len: u32][value_bytes]...
+#+END_EXAMPLE
+
+Optimal for 2-5 header entries. Linear scan.
+
+** algebra — Lattices & CRDTs (2,068 LOC)
+:PROPERTIES:
+:CUSTOM_ID: algebra
+:END:
+
+- Crate :: [[file:algebra/src/lib.rs][algebra/src/lib.rs]]
+
+*** Trait Hierarchy
+
+#+BEGIN_EXAMPLE
+Semigroup (associative combine)
+  → Monoid (+ empty identity)
+    → CommutativeMonoid (+ commutative)
+      → Group (+ inverse)
+        → AbelianGroup
+
+JoinSemilattice (associative + commutative + idempotent join)
+  → BoundedJoinSemilattice (+ bottom identity)
+#+END_EXAMPLE
+
+Blanket impl: =BoundedJoinSemilattice → Monoid → CommutativeMonoid=.
+
+*** Concrete Types
+
+| Type              | Lattice Structure                            |
+|-------------------+----------------------------------------------|
+| =Max<T>=          | Join = max                                   |
+| =Min<T>=          | Join = min                                   |
+| =Any=             | Boolean OR lattice                           |
+| =All=             | Boolean AND lattice                          |
+| =LatticeMap<K,V>= | Pointwise map (union of keys, join of values) |
+| =LWW<T>=          | Last-Writer-Wins CRDT with (value, ts, replica) |
+
+** serde_multipart — Zero-Copy Multipart Codec (1,562 LOC)
+:PROPERTIES:
+:CUSTOM_ID: serde-multipart
+:END:
+
+- Crate :: [[file:serde_multipart/src/lib.rs][serde_multipart/src/lib.rs]]
+
+Uses Rust's =min_specialization= so =Part= fields are extracted as side-channel
+byte buffers when serialized through the multipart codec, but serialize normally
+otherwise. Enables efficient vectored I/O.
+
+*** Wire Format
+
+#+BEGIN_EXAMPLE
+[body_len: u64 BE][body bytes][part1_len: u64 BE][part1 bytes]...
+#+END_EXAMPLE
+
+** Other Foundation Crates
+
+| Crate | Source | LOC | Purpose |
+|-------+--------+-----+---------|
+| =hyperactor_telemetry= | [[file:hyperactor_telemetry/src/lib.rs][lib.rs]] | 7,818 | OpenTelemetry OTLP, Perfetto/SQLite sinks, rate limiting |
+| =hyperactor_macros= | [[file:hyperactor_macros/src/lib.rs][lib.rs]] | 2,893 | =#[derive(Handler)]=, =#[export]=, =behavior!=, =#[derive(Bind/Unbind)]= |
+| =struct_diff_patch= | [[file:struct_diff_patch/src/lib.rs][lib.rs]] | 773 | =Diff=/=Patch= traits, =Watch<T>= reactive cell |
+| =struct_diff_patch_macros= | [[file:struct_diff_patch_macros/src/lib.rs][macros]] | 288 | =#[derive(Diff, Patch)]= |
+| =preempt_rwlock= | [[file:preempt_rwlock/src/lib.rs][lib.rs]] | 260 | Cooperative reader preemption via =tokio::sync::watch= |
+| =erased_lifetime= | [[file:erased_lifetime/src/lib.rs][lib.rs]] | 184 | Safe scoped lifetime erasure (halts on misuse, not UB) |
+| =timed_test= | [[file:timed_test/src/lib.rs][lib.rs]] | 153 | =#[async_timed_test]= — separate-thread timeout enforcement |
+
+* Application-Layer Crates
+:PROPERTIES:
+:CUSTOM_ID: application
+:END:
+
+** monarch_hyperactor — Python Bindings (16,891 LOC)
+:PROPERTIES:
+:CUSTOM_ID: monarch-hyperactor
+:END:
+
+The largest Monarch crate. Complete PyO3 interface to the hyperactor system.
+
+- Crate root :: [[file:monarch_hyperactor/Cargo.toml][monarch_hyperactor/Cargo.toml]]
+- Lib entry :: [[file:monarch_hyperactor/src/lib.rs][monarch_hyperactor/src/lib.rs]]
+- Build :: [[file:monarch_hyperactor/build.rs][build.rs]]
+
+*** Key Modules
+
+| Module | Source | LOC | Purpose |
+|--------+--------+-----+---------|
+| =actor.rs= | [[file:monarch_hyperactor/src/actor.rs][actor.rs]] | 1,640 | =PythonActor= — central actor type, dual dispatch |
+| =runtime.rs= | [[file:monarch_hyperactor/src/runtime.rs][runtime.rs]] | 412 | Singleton Tokio runtime, =signal_safe_block_on()= |
+| =proc.rs= | [[file:monarch_hyperactor/src/proc.rs][proc.rs]] | 437 | =PyProc=, =PyActorId=, =InstanceWrapper<M>= |
+| =proc_mesh.rs= | [[file:monarch_hyperactor/src/proc_mesh.rs][proc_mesh.rs]] | — | =PyProcMesh= (Owned/Ref), allocation |
+| =mailbox.rs= | [[file:monarch_hyperactor/src/mailbox.rs][mailbox.rs]] | 736 | Python port handles, refs, accumulators |
+| =pickle.rs= | [[file:monarch_hyperactor/src/pickle.rs][pickle.rs]] | 616 | Deferred pickling with tensor engine refs |
+| =bootstrap.rs= | [[file:monarch_hyperactor/src/bootstrap.rs][bootstrap.rs]] | — | =bootstrap_main()=, =run_worker_loop_forever()= |
+| =context.rs= | [[file:monarch_hyperactor/src/context.rs][context.rs]] | — | =PyInstance=, =PyContext= with cast rank |
+| =config.rs= | [[file:monarch_hyperactor/src/config.rs][config.rs]] | — | Monarch-specific config keys |
+| =code_sync/= | [[file:monarch_hyperactor/src/code_sync/][code_sync/]] | — | rsync, conda_sync, auto_reload, workspace |
+
+*** PythonActor Dispatch Modes
+
+- *Direct* — GIL-acquire per message, immediate dispatch
+- *Queue* — Enqueue to Python channel, batch processing
+
+Handles =PythonMessage= kinds: =CallMethod=, =CallMethodIndirect=, =Result=, =Exception=.
+
+*** GIL Serialization (=runtime.rs=)
+
+=signal_safe_block_on()= releases GIL and polls Python signals every 100ms on
+main thread. =monarch_with_gil()= uses =tokio::sync::Mutex= with re-entrancy
+detection via thread-local depth counter.
+
+** monarch_extension — cdylib Entry Point (2,958 LOC)
+:PROPERTIES:
+:CUSTOM_ID: monarch-extension
+:END:
+
+- Crate root :: [[file:monarch_extension/Cargo.toml][monarch_extension/Cargo.toml]]
+- Lib entry :: [[file:monarch_extension/src/lib.rs][monarch_extension/src/lib.rs]]
+- Build :: [[file:monarch_extension/build.rs][build.rs]]
+
+Single cdylib producing =_rust_bindings=. The =#[pymodule]= function =mod_init=
+registers ~30+ submodules into =monarch._rust_bindings.*=.
+
+*** Key Source Files
+
+| File | Source | Purpose |
+|------+--------+---------|
+| =convert.rs= | [[file:monarch_extension/src/convert.rs][convert.rs]] | =MessageParser= — Python type addr → Rust =WorkerMessage= (O(1) dispatch) |
+| =mesh_controller.rs= | [[file:monarch_extension/src/mesh_controller.rs][mesh_controller.rs]] | =MeshControllerActor= (954 LOC), =History= (seq-based deps) |
+| =client.rs= | [[file:monarch_extension/src/client.rs][client.rs]] | =ClientActor= pyclass, =PyException/PyError/PyFailure= hierarchy |
+| =tensor_worker.rs= | [[file:monarch_extension/src/tensor_worker.rs][tensor_worker.rs]] | Tensor worker registration |
+| =code_sync.rs= | [[file:monarch_extension/src/code_sync.rs][code_sync.rs]] | =CodeSyncMeshClient= for workspace sync |
+| =blocking.rs= | [[file:monarch_extension/src/blocking.rs][blocking.rs]] | Blocking bridge utilities |
+| =trace.rs= | [[file:monarch_extension/src/trace.rs][trace.rs]] | Tracing integration |
+
+** monarch_tensor_worker — PyTorch Worker (6,482 LOC)
+:PROPERTIES:
+:CUSTOM_ID: monarch-tensor-worker
+:END:
+
+- Crate root :: [[file:monarch_tensor_worker/Cargo.toml][monarch_tensor_worker/Cargo.toml]]
+- Lib entry :: [[file:monarch_tensor_worker/src/lib.rs][monarch_tensor_worker/src/lib.rs]]
+- Build :: [[file:monarch_tensor_worker/build.rs][build.rs]]
+
+=WorkerActor= — Operates on a single CUDA device. Uses
+=#[hyperactor::export(spawn=true, handlers=[WorkerMessage{cast=true}, AssignRankMessage{cast=true}])]=.
+
+*** Sub-Actors
+
+| Actor | Source | Purpose |
+|-------+--------+---------|
+| =StreamActor= | [[file:monarch_tensor_worker/src/stream.rs][stream.rs]] | Per-stream execution context |
+| =NcclCommActor= | [[file:monarch_tensor_worker/src/comm.rs][comm.rs]] | NCCL communicator management |
+| =DeviceMesh= | [[file:monarch_tensor_worker/src/device_mesh.rs][device_mesh.rs]] | Multi-dimensional device mesh |
+
+*** WorkerMessage Handlers (23 variants)
+
+=backend_network_init=, =call_function=, =create_stream=, =create_device_mesh=,
+=reduce=, =send_tensor=, =send_value=, =borrow_create/first_use/last_use/drop=,
+=define_recording/call_recording=, =exit=, and more.
+
+** monarch_messages — Protocol Messages (1,466 LOC)
+:PROPERTIES:
+:CUSTOM_ID: monarch-messages
+:END:
+
+- Crate root :: [[file:monarch_messages/Cargo.toml][monarch_messages/Cargo.toml]]
+- Lib entry :: [[file:monarch_messages/src/lib.rs][monarch_messages/src/lib.rs]]
+
+| Type                | Source | Variants |
+|---------------------+--------+----------|
+| =WorkerMessage=     | [[file:monarch_messages/src/worker.rs][worker.rs]] | 23 (CallFunction, Reduce, SendTensor, ...) |
+| =ControllerMessage= | [[file:monarch_messages/src/controller.rs][controller.rs]] | Status, FetchResult, RemoteFunctionFailed, ... |
+| =ClientMessage=     | [[file:monarch_messages/src/client.rs][client.rs]] | Result, Log, DebuggerMessage |
+| =DebuggerAction=    | [[file:monarch_messages/src/debugger.rs][debugger.rs]] | Paused, Attach, Detach, Read, Write |
+| =WireValue=         | [[file:monarch_messages/src/wire_value.rs][wire_value.rs]] | Int, Float, Bool, String, Tensor, Pickled, ... |
+
+** monarch_types — Shared Types (622 LOC)
+:PROPERTIES:
+:CUSTOM_ID: monarch-types
+:END:
+
+- Crate :: [[file:monarch_types/src/lib.rs][monarch_types/src/lib.rs]]
+
+| Type                 | Source | Purpose |
+|----------------------+--------+---------|
+| =PickledPyObject=    | [[file:monarch_types/src/pyobject.rs][pyobject.rs]] | Serializable pickled Python bytes |
+| =PyTree<T>=          | [[file:monarch_types/src/pytree.rs][pytree.rs]] | Rust wrapper around =torch.utils._pytree= |
+| =SerializablePyErr=  | [[file:monarch_types/src/python.rs][python.rs]] | Serializable Python error |
+| =py_global!= macro   | lib.rs | Cached Python object lookup |
+
+** monarch_rdma — RDMA Communication (8,863 LOC)
+:PROPERTIES:
+:CUSTOM_ID: monarch-rdma
+:END:
+
+- Crate :: [[file:monarch_rdma/Cargo.toml][monarch_rdma/Cargo.toml]]
+- Lib entry :: [[file:monarch_rdma/src/lib.rs][monarch_rdma/src/lib.rs]]
+
+Multiple backends: ibverbs (ConnectX/MLX5), TCP fallback, AWS EFA.
+
+| Module | Purpose |
+|--------+---------|
+| =ibverbs/= | Queue pairs, memory regions, completion queues |
+| =tcp/= | TCP fallback for non-RDMA environments |
+| =efa/= | AWS Elastic Fabric Adapter support |
+| =backend/= | Backend trait + implementations |
+
+Heavy =unsafe= FFI — raw pointer manipulation for ibverbs queue pair
+operations, memory registration, DMA buffer handling.
+
+** FFI Crates
+:PROPERTIES:
+:CUSTOM_ID: ffi
+:END:
+
+| Crate | Source | LOC | Links | Purpose |
+|-------+--------+-----+-------+---------|
+| =torch-sys2= | [[file:torch-sys2/src/lib.rs][lib.rs]] | 877 | — | PyTorch types via PyO3 (not C++ FFI) |
+| =torch-sys-cuda= | [[file:torch-sys-cuda/src/lib.rs][lib.rs]] | 1,632 | =torch_cuda= | CUDA streams + NCCL via Python |
+| =nccl-sys= | [[file:nccl-sys/src/lib.rs][lib.rs]] | 388 | =nccl= | Raw NCCL bindings via bindgen |
+| =rdmaxcel-sys= | [[file:rdmaxcel-sys/src/lib.rs][lib.rs]] | 337 | =rdmaxcel= | Raw ibverbs/MLX5/EFA bindings |
+| =monarch_cpp_static_libs= | [[file:monarch_cpp_static_libs/build.rs][build.rs]] | 298 | =monarch_cpp_static_libs= | Builds rdma-core from source |
+| =build_utils= | [[file:build_utils/src/lib.rs][lib.rs]] | 736 | — | Shared CUDA/Python discovery |
+
+** Other Application Crates
+
+| Crate | Source | LOC | Purpose |
+|-------+--------+-----+---------|
+| =monarch_distributed_telemetry= | [[file:monarch_distributed_telemetry/src/lib.rs][lib.rs]] | 1,895 | DataFusion SQL over Arrow RecordBatch |
+| =monarch_perfetto_trace= | [[file:monarch_perfetto_trace/src/lib.rs][lib.rs]] | 733 | Perfetto trace event generation |
+| =monarch_conda= | [[file:monarch_conda/src/lib.rs][lib.rs]] | 3,295 | Fast conda env sync (SHA-256, aho-corasick) |
+| =record_batch_derive= | [[file:record_batch_derive/src/lib.rs][lib.rs]] | 211 | =#[derive(RecordBatchRow)]= for Arrow |
+
+* Cross-Cutting Analysis
+:PROPERTIES:
+:CUSTOM_ID: cross-cutting
+:END:
+
+** Unsafe Code Inventory
+
+| Location | Count | Justification |
+|----------+-------+---------------|
+| =monarch_rdma/= ibverbs ops | Heavy | Inherent to RDMA FFI |
+| =nccl-sys/=, =rdmaxcel-sys/= | Heavy | Bindgen-generated FFI |
+| =value_mesh.rs= =build_indexed()= | 8 blocks | =MaybeUninit= with =DropGuard= exception safety |
+| =actor_local.rs= | 4 blocks | =Send/Sync= on pointer keys (never dereferenced) |
+| =signal_handler.rs= | 2 blocks | =libc::sigaction= query (read-only) |
+| =stdio_redirect.rs= | 5 blocks | fd manipulation via nix/libc |
+| =serde_multipart/= | Several | =min_specialization= requirements |
+| All PyO3 crates | Blanket allow | =#![allow(unsafe_op_in_unsafe_fn)]= |
+
+** Error Handling Patterns
+
+- *Handler errors*: =anyhow::Error= propagated as =ActorErrorKind::Generic=
+- *Typed errors*: =thiserror::Error= derive throughout (=ChannelError=, =MailboxError=, =mesh::Error=)
+- *Mesh errors*: 19-variant enum with =Box= wrapping of large inner types
+- *FFI errors*: =From= impls wrap bincode, serde_json, base64, allocator, channel errors
+- *Concern*: ~1,200+ =.unwrap()= in =hyperactor/src/= non-test code
+
+** Concurrency Patterns
+
+| Pattern | Usage |
+|---------+-------|
+| =DashMap= | Concurrent actor/port/type registries (5+ uses) |
+| =tokio::sync::watch= | Status observation (multi-consumer) |
+| =tokio::sync::mpsc= (unbounded) | Work queues — *no backpressure* |
+| =Arc<Mutex>= | Reducer buffers, alarm |
+| =AtomicUsize/AtomicU64= | ID allocation, counters |
+| =OnceLock/LazyLock= | Lazy singletons |
+| =CancellationToken= | Lifecycle management |
+| =ArcSwap= | Lock-free config reads |
+| Sealed trait pattern | Capability restriction |
+
+** Nightly Features (12 in hyperactor alone)
+
+- =anonymous_lifetime_in_impl_trait=
+- =assert_matches=
+- =associated_type_defaults=
+- =box_patterns=
+- =btree_cursors=
+- =error_reporter=
+- =impl_trait_in_assoc_type=
+- =never_type=
+- =panic_update_hook=
+- =type_alias_impl_trait=
+- =trait_alias=
+- =min_specialization= (in =serde_multipart=)
+
+** Notable Design Decisions
+
+1. *Tagless-final =Selection=* in ndslice — enables multiple interpretations from one algebra
+2. *=inventory= crate everywhere* — linker-level registration for types, config keys, reducers
+3. *=min_specialization= in serde_multipart* — =Part= serializes differently per backend
+4. *GIL serialization* — =tokio::sync::Mutex= with re-entrancy detection via thread-local depth
+5. *=format!().leak()=* for type name interning — bounded but technically a leak
+6. *Cooperative preemption* (=preempt_rwlock=) — readers watch for writer pressure and yield
+7. *Dual cast paths* (v0/v1) — =CommActor= tree vs direct per-actor send
+
+* Concerns & Recommendations
+:PROPERTIES:
+:CUSTOM_ID: concerns
+:END:
+
+** High Severity
+
+| Issue | Location | Notes |
+|-------+----------+-------|
+| 12 nightly features | [[file:hyperactor/Cargo.toml][hyperactor/Cargo.toml]] | Hard blocks stable Rust adoption |
+| ~1,200+ =.unwrap()= in non-test code | [[file:hyperactor/src/proc.rs][proc.rs]], [[file:hyperactor/src/mailbox.rs][mailbox.rs]] | Should be =?= or =.expect("invariant")= |
+| Unbounded work queues | [[file:hyperactor/src/proc.rs][proc.rs]] | =mpsc::unbounded_channel()= — no backpressure |
+| =std::process::exit()= in actor code | [[file:monarch_tensor_worker/src/lib.rs][tensor_worker/lib.rs]] | Bypasses Drop handlers |
+
+** Medium Severity
+
+| Issue | Location | Notes |
+|-------+----------+-------|
+| Oversized files | [[file:hyperactor/src/mailbox.rs][mailbox.rs]] (4,340), [[file:hyperactor/src/proc.rs][proc.rs]] (4,103), [[file:hyperactor_mesh/src/bootstrap.rs][bootstrap.rs]] (3,800) | Need decomposition |
+| Dual ID system | [[file:hyperactor/src/id.rs][id.rs]] vs [[file:hyperactor/src/reference.rs][reference.rs]] | Migration in-progress, cognitive overhead |
+| =PanickingMailboxSender= | [[file:hyperactor/src/proc.rs][proc.rs]] | =Proc::local()= panics on send instead of =Err= |
+| =panic!()= for deprecated paths | [[file:monarch_tensor_worker/src/lib.rs][tensor_worker/lib.rs]] | Should return =Err(anyhow!(...))= |
+| O(n×m) Levenshtein in log aggregation | [[file:hyperactor_mesh/src/logging.rs][logging.rs]] | Expensive at high volume |
+| Last-sink-wins supervision | [[file:hyperactor_mesh/src/global_context.rs][global_context.rs]] | May lose events during transitions |
+| Manual =Send/Sync= on =Rc= | [[file:hyperactor_mesh/src/assign.rs][assign.rs]] | Fragile under refactoring |
+
+** Low Severity
+
+| Issue | Location | Notes |
+|-------+----------+-------|
+| =format!().leak()= interning | [[file:typeuri/src/lib.rs][typeuri/lib.rs]] | Bounded but technically a leak |
+| =#[allow(dead_code)]= on actor.rs | [[file:hyperactor/src/actor.rs][actor.rs]] | May hide genuinely dead code |
+| =#![allow(unsafe_op_in_unsafe_fn)]= | [[file:monarch_hyperactor/src/lib.rs][monarch_hyperactor]], [[file:monarch_extension/src/lib.rs][monarch_extension]] | Blanket suppression from PyO3 |
+| Duplicated =_deprecated= methods | [[file:hyperactor_macros/src/lib.rs][hyperactor_macros]] | Generated code doubles API surface |

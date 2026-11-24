@@ -1,0 +1,40 @@
+---
+description: How to run Monarch tests (Rust, Python, container)
+globs: Cargo.toml,**/docker-compose*.yml,**/Dockerfile*,python/tests/**/*.py,dev/*.yml
+alwaysApply: false
+---
+
+# Monarch testing mechanism
+
+## Rust tests (on host)
+
+- **Requires:** `protoc` (use repo-provided binary at `.tools/protoc/bin/protoc` if not installed), Rust nightly (from `rust-toolchain`), `$HOME/.cargo/bin` in PATH.
+- **CPU-only (no CUDA/NCCL):** Exclude crates that need CUDA/NCCL/torch/rdma so the workspace builds without GPU tooling.
+
+```bash
+cd /mnt/data_infra/workspace/monarch
+PATH="$HOME/.cargo/bin:$PATH" \
+PROTOC="$(pwd)/.tools/protoc/bin/protoc" \
+USE_TENSOR_ENGINE=0 MONARCH_BUILD_MESH_ONLY=1 RUSTFLAGS="--cfg tracing_unstable" \
+cargo test --workspace \
+  --exclude nccl-sys --exclude torch-sys2 --exclude torch-sys-cuda --exclude rdmaxcel-sys \
+  --exclude monarch_rdma --exclude monarch_tensor_worker --exclude monarch_extension \
+  --exclude monarch_cpp_static_libs --exclude monarch_messages \
+  --no-fail-fast
+```
+
+- **Protoc (if missing):** Download and unpack a Linux x86_64 `protoc` release into `.tools/protoc` (e.g. from https://github.com/protocolbuffers/protobuf/releases), or copy from an Ubuntu container: `docker run --rm -v "$(pwd)/.tools:/out" ubuntu:22.04 bash -c "apt-get update -qq && apt-get install -y -qq protobuf-compiler && cp /usr/bin/protoc /out/protoc"`.
+
+## Python tests
+
+- **In container (recommended):** `pytest python/tests/ -v -m "not oss_skip"` (after `python setup.py develop` in the dev image).
+- **On host:** Needs monarch package built and pytest deps (`python/tests/requirements.txt`); often run inside the dev container.
+
+## Container-based full test
+
+- **GPU dev (root):** `docker compose -f docker-compose.dev.yml up -d` then `docker compose -f docker-compose.dev.yml exec dev monarch-test` (runs Rust + Python; image is CUDA-based, slow first build).
+- **CPU dev (dev/):** `cd dev && docker compose up -d` then enter container and run `cargo nextest run --workspace` and `pytest python/tests/ -v -m "not oss_skip"`. Build script: `./dev/launch-and-test.sh` (builds image, starts container, runs both test suites).
+
+## Excluded crates (host Rust tests)
+
+Excluded because they require CUDA/NCCL/libtorch/rdma or special tooling: `nccl-sys`, `torch-sys2`, `torch-sys-cuda`, `rdmaxcel-sys`, `monarch_rdma`, `monarch_tensor_worker`, `monarch_extension`, `monarch_cpp_static_libs`, `monarch_messages`.

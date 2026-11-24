@@ -1,0 +1,59 @@
+# Headless service + StatefulSet for Monarch workers (native K8s only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: monarch-workers
+  namespace: monarch-tests
+  labels:
+    app: monarch-worker
+spec:
+  clusterIP: None  # headless for stable pod DNS
+  selector:
+    app: monarch-worker
+  ports:
+  - name: monarch
+    port: 26600
+    targetPort: 26600
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: monarch-worker
+  namespace: monarch-tests
+spec:
+  serviceName: monarch-workers
+  replicas: 2
+  selector:
+    matchLabels:
+      app: monarch-worker
+  template:
+    metadata:
+      labels:
+        app: monarch-worker
+    spec:
+      containers:
+      - name: worker
+        image: ghcr.io/meta-pytorch/monarch:2026-01-11-alpha
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: MONARCH_PORT
+          value: "26600"
+        resources:
+          limits:
+            nvidia.com/gpu: 4
+          requests:
+            nvidia.com/gpu: 4
+        command:
+        - python
+        - -u
+        - -c
+        - |
+          import os, socket, logging
+          from monarch.actor import run_worker_loop_forever
+          logging.basicConfig(level=logging.INFO)
+          hostname = socket.getfqdn()
+          port = os.environ.get("MONARCH_PORT", "26600")
+          address = f"tcp://{hostname}:{port}"
+          logging.info(f"Starting Monarch worker at {address}")
+          run_worker_loop_forever(address=address, ca="trust_all_connections")
+      restartPolicy: Always
