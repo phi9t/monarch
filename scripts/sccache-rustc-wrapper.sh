@@ -17,6 +17,12 @@ if [ "$#" -lt 1 ]; then
     exit 2
 fi
 
+# RUSTC_WRAPPER overrides the Cargo-config rustc-wrapper guard, so this CI-only
+# shim carries the same execution-contract check. It runs only under GitHub
+# Linux CI, so require exactly that controlled domain before compiling.
+_wrapper_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+"$_wrapper_dir/rootfs/execution_contract.sh" require-github-linux
+
 # Once one invocation observes an sccache infrastructure failure, bypass
 # sccache for the rest of the job. Cargo can invoke the wrapper many times in
 # parallel; using a sentinel avoids paying the sccache startup failure cost for

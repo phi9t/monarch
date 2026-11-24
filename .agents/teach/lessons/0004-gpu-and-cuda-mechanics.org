@@ -1,0 +1,169 @@
+#+TITLE: Lesson 0004 - GPU and CUDA mechanics
+#+SUBTITLE: Synthetic CUDA_HOME, host driver binding, and exact 8-GPU visibility
+#+OPTIONS: toc:nil num:nil
+
+* Why this lesson
+The rootfs has to satisfy two different CUDA needs:
+
+- Build-time tools need something that looks like a CUDA toolkit: ~nvcc~,
+  headers, libraries, and ~CUDA_HOME~.
+- Run-time GPU code needs the host NVIDIA driver userspace to match the loaded
+  kernel driver, plus real ~/dev/nvidia*~ device nodes.
+
+Those are not the same thing. The rootfs solves them in two different places:
+~build_rootfs.sh~ builds a synthetic toolkit into the image, and
+~enter_rootfs.sh~ binds the host driver and device nodes at entry.
+
+* Build-time: synthetic CUDA_HOME
+The rootfs starts from a PyTorch CUDA runtime baseline. It has CUDA runtime
+pieces, but not a full host CUDA toolkit. ~build_rootfs.sh~ adds the missing
+compiler shape from pip wheels (~build_rootfs.sh:194-216~):
+
+#+begin_src bash
+RUN pip install --break-system-packages --no-cache-dir \
+    "nvidia-cuda-nvcc==${CUDA_NVCC_VERSION}" \
+    "nvidia-cuda-cccl==${CUDA_CCCL_VERSION}" \
+    ...
+
+RUN set -euo pipefail; \
+    site="$(python -c 'import site;print(site.getsitepackages()[0])')"; \
+    cu="$site/nvidia/cu13"; \
+    test -x "$cu/bin/nvcc" || { echo "nvcc missing at $cu/bin/nvcc" >&2; exit 1; }; \
+    test -f "$cu/include/cuda_runtime.h" || { echo "cuda headers missing" >&2; exit 1; }; \
+    ln -sfn lib "$cu/lib64"; \
+    ln -sfn "$cu" /opt/cuda-synth; \
+    /opt/cuda-synth/bin/nvcc --version
+ENV CUDA_HOME=/opt/cuda-synth CUDA_PATH=/opt/cuda-synth
+#+end_src
+
+The important detail is the ~lib64 -> lib~ symlink. PyTorch's C++ extension
+helpers and Monarch's ~setup.py~ expect the conventional toolkit layout:
+~bin/nvcc~, ~include/~, and ~lib64/~. The pip wheel layout is close, but not
+identical, so the image recipe creates the conventional shape at
+~/opt/cuda-synth~.
+
+After installing tools, the build verifies all reviewed pins so drift fails
+closed (~build_rootfs.sh:218-227~), including Python, uv, Node, npm, mdBook,
+nextest, and the CUDA nvcc version.
+
+* Run-time: host driver userspace
+The CUDA runtime inside the rootfs must talk to the host's loaded NVIDIA kernel
+driver. That is why ~enter_rootfs.sh~ does not rely only on libraries baked into
+the rootfs. It binds host driver libraries at entry (~enter_rootfs.sh:139-156~):
+
+#+begin_src bash
+HOST_LIBDIR=/usr/lib/x86_64-linux-gnu
+NVIDIA_HOST_MNT=/run/nvidia-host
+for lib in "$HOST_LIBDIR"/libcuda.so* "$HOST_LIBDIR"/libnvidia-*.so*; do
+  nvidia_binds+=(--ro-bind "$lib" "$NVIDIA_HOST_MNT/$(basename -- "$lib")")
+  have_nvidia=1
+done
+if [[ "$have_nvidia" -eq 1 ]]; then
+  bwrap_args+=(--tmpfs "$NVIDIA_HOST_MNT" "${nvidia_binds[@]}")
+fi
+#+end_src
+
+Then it prepends that mount to ~LD_LIBRARY_PATH~ alongside the synthetic toolkit
+libs (~enter_rootfs.sh:177-179~):
+
+#+begin_src bash
+--setenv LD_LIBRARY_PATH "$NVIDIA_HOST_MNT:/opt/cuda-synth/lib64"
+#+end_src
+
+Why a tmpfs at ~/run/nvidia-host~? The rootfs is mounted read-only. Binding host
+libraries directly into arbitrary target paths would fail unless every target
+file existed in the image. The writable tmpfs gives bwrap a place to create the
+driver-library bind targets while keeping the rootfs itself read-only.
+
+* Device nodes are bound separately
+Libraries are not enough. GPU execution needs device nodes. Entry binds every
+existing ~/dev/nvidia*~ and ~/dev/nvidia-caps~ node (~enter_rootfs.sh:133-137~):
+
+#+begin_src bash
+for dev in /dev/nvidia* /dev/nvidia-caps; do
+  bwrap_args+=(--dev-bind "$dev" "$dev")
+done
+#+end_src
+
+This is why the same rootfs can still be useful on CPU-only hosts: absent GPU
+devices and libraries are simply not bound. Actor-only work can still run, while
+GPU-local verifiers fail in preflight when they require real GPUs.
+
+* Visibility is a verifier contract
+The 8-GPU verifier is stricter than generic rootfs entry. It must run with
+exactly eight visible CUDA devices. ~scripts/local_8gpu_capacity.py~ encodes the
+visibility rule:
+
+- If ~CUDA_VISIBLE_DEVICES~ is unset or empty, default to
+  ~0,1,2,3,4,5,6,7~ (~local_8gpu_capacity.py:16~, ~local_8gpu_capacity.py:43-45~).
+- If it is explicit, require exactly eight non-empty comma-separated entries
+  (~local_8gpu_capacity.py:47-52~).
+
+~run_local_8gpu_capacity.sh~ calls that helper before doing build or test work,
+then exports the validated value (~run_local_8gpu_capacity.sh:40-55~).
+
+Inside the unit-level smoke, the verifier checks that the tensor engine exists,
+that Torch sees exactly eight CUDA devices, and that a local proc mesh can spawn
+eight GPU ranks and fetch shard ranks ~0..7~ (~run_local_8gpu_capacity.sh:80-130~).
+
+* The split you should remember
+When you maintain this path, separate CUDA questions into two categories:
+
+- *Does the build need a toolkit-shaped CUDA_HOME?* Then look at
+  ~contract.env~ and ~build_rootfs.sh~. Persistent fixes belong in the recipe,
+  so the digest changes.
+- *Does runtime need to see host GPUs or driver libraries?* Then look at
+  ~enter_rootfs.sh~ and the verifier's preflight. Entry changes take effect
+  immediately, but must preserve the read-only-root and explicit-env model.
+
+If you mix those categories, debugging gets noisy. A missing ~nvcc~ is not a
+driver-bind problem. A ~libcuda.so~ mismatch is not fixed by reinstalling the
+pip nvcc wheel.
+
+* Check yourself
+Answer before reading the explanation.
+
+** Q1. Where should a persistent fix for missing ~nvcc~ live?
+- a. In ~build_rootfs.sh~ or the pins in ~contract.env~.
+- b. In a host-side ~export CUDA_HOME=...~ before running ~scripts/run~.
+- c. In ~control-plane-results/~ after a verifier run.
+
+Answer: *a*. ~nvcc~ is part of the synthetic build-time toolkit assembled in
+the rootfs recipe (~build_rootfs.sh:194-216~). Host env vars are cleared at
+entry.
+
+** Q2. Why bind host NVIDIA libraries at entry instead of baking only rootfs libraries?
+- a. They must match the host's loaded NVIDIA kernel driver.
+- b. They are too large to store in the rootfs.
+- c. Python cannot import libraries from ~/usr/local~.
+
+Answer: *a*. The rootfs CUDA runtime talks to the host kernel driver. Binding
+host ~libcuda.so*~ and ~libnvidia-*.so*~ at entry keeps userspace aligned with
+that loaded driver (~enter_rootfs.sh:139-179~).
+
+** Q3. What does the 8-GPU verifier do with an explicit ~CUDA_VISIBLE_DEVICES=0,1,2~?
+- a. Expands it to eight GPUs automatically.
+- b. Rejects it before build/test work.
+- c. Runs a three-GPU capacity verifier instead.
+
+Answer: *b*. Explicit visibility must name exactly eight non-empty devices
+(~local_8gpu_capacity.py:47-52~). The capacity verifier is specifically an
+all-8-GPU verifier, not a variable-size smoke.
+
+* Practice in the repo
+When a GPU-local verifier fails, classify the symptom:
+
+- ~CUDA_HOME is unset~ or ~nvcc missing~: inspect the synthetic toolkit recipe.
+- ~torch.cuda.device_count()~ is wrong: inspect ~CUDA_VISIBLE_DEVICES~ and device
+  node binds.
+- ~libcuda.so~ or driver mismatch: inspect ~/run/nvidia-host~ binding and
+  ~LD_LIBRARY_PATH~.
+- ~has_tensor_engine() is False~: inspect the editable build path and
+  ~USE_TENSOR_ENGINE~.
+
+* Next
+Lesson 0005: how the 8-GPU capacity verifier turns those environment and build
+rules into an acceptance ladder with machine-readable artifacts and isolation
+reruns.
+
+# Sources current as of this checkout.

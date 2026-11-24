@@ -1,0 +1,184 @@
+#+TITLE: Lesson 0003 - Isolation mechanics
+#+SUBTITLE: Read-only root, cleared env, persistent caches, and the venv
+#+OPTIONS: toc:nil num:nil
+
+* Why this lesson
+The rootfs is not just "a container." For maintenance work, that phrase is too
+loose. The exact mechanics matter:
+
+- The exported rootfs is mounted read-only.
+- The checkout is mounted writable.
+- Host environment variables are cleared, then rebuilt from an allowlist.
+- Build caches are host directories mounted at stable paths.
+- The Python virtualenv lives in the checkout but uses the rootfs Python.
+
+This lesson gives you the operational model you need when a build fails and the
+temptation is to patch the host environment.
+
+* The mount model
+The central mount list is in ~scripts/rootfs/enter_rootfs.sh:112-125~:
+
+#+begin_src bash
+bwrap_args=(
+  --ro-bind "$ROOTFS" /
+  --proc /proc
+  --tmpfs /tmp
+  --dev /dev
+  --tmpfs /home
+  --dir /home/monarch
+  --bind "$REPO_ROOT" "$REPO_MNT"
+  --unshare-all
+  --share-net
+  --die-with-parent
+  --clearenv
+  --chdir "$REPO_MNT${checkout_rel:+/$checkout_rel}"
+)
+#+end_src
+
+Read this as a short contract:
+
+- ~/~ is the rootfs export and is read-only.
+- ~/workspace/monarch~ is the real checkout and is writable.
+- ~/tmp~ and ~/home~ are fresh tmpfs mounts.
+- ~/proc~ and ~/dev~ are sandbox-local views.
+- Network is shared (~--share-net~), but the process is otherwise under
+  ~--unshare-all~.
+- The starting directory is the checkout-relative directory selected by
+  ~scripts/run~.
+
+The rootfs builder pre-creates mount targets such as ~/workspace/monarch~ and
+~/run/nvidia-host~ because a read-only root cannot create them at entry time
+(~build_rootfs.sh:244-247~).
+
+* DNS is deliberately rebound
+Docker export leaves resolver state unsuitable for normal package fetches. Entry
+binds the host resolver files read-only (~enter_rootfs.sh:127-131~):
+
+#+begin_src bash
+for f in /etc/resolv.conf /etc/hosts; do
+  [[ -e "$f" ]] && bwrap_args+=(--ro-bind "$f" "$f")
+done
+#+end_src
+
+So network is not "fully offline hermetic." It is a controlled userland and
+toolchain with host DNS and shared network. That distinction matters when you
+debug ~uv~, ~pip~, or ~npm~ fetches.
+
+* The environment is rebuilt, not inherited
+The hard boundary is ~--clearenv~ (~enter_rootfs.sh:123~). After that, the script
+sets controlled values explicitly (~enter_rootfs.sh:162-179~):
+
+- ~HOME=/home/monarch~
+- ~PATH=/opt/cuda-synth/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin:...~
+- ~UV_PROJECT_ENVIRONMENT=/workspace/monarch/.venv-rootfs~
+- ~UV_CACHE_DIR~, ~CARGO_HOME~, ~npm_config_cache~, and ~XDG_CACHE_HOME~ under
+  ~scripts/rootfs/cache~
+- ~CARGO_TARGET_DIR=/workspace/monarch/target/bwrap/<recipe-digest>~
+- ~CUDA_HOME=/opt/cuda-synth~ and ~CUDA_PATH=/opt/cuda-synth~
+- ~MONARCH_IN_ROOTFS=1~ and ~MONARCH_ROOTFS_RECIPE_SHA256=<digest>~
+
+Only a small allowlist crosses the boundary: terminal settings, proxies, GPU
+selection, Rust logging/backtrace, and documented Monarch build flags
+(~enter_rootfs.sh:181-192~). ~CUDA_VISIBLE_DEVICES~ gets special handling so an
+explicit empty value can hide all GPUs for negative tests
+(~enter_rootfs.sh:194-198~).
+
+Then ~scripts/run~ defensively unsets host toolchain and linker variables again
+when it is already inside the rootfs (~scripts/run:43-52~). This closes the
+"called scripts/run from an already-entered shell" case.
+
+* Caches persist without writing the rootfs
+The rootfs itself stays read-only, but builds still need caches. Entry creates
+host-side cache directories under ~scripts/rootfs/cache/~ and points tools at
+them (~enter_rootfs.sh:100-108~, ~enter_rootfs.sh:162-170~).
+
+The most important one is Cargo target output:
+
+#+begin_src bash
+CARGO_TARGET_DIR_HOST="$REPO_ROOT/target/bwrap/$RECIPE_SHA256"
+#+end_src
+
+That path is digest-scoped. If the rootfs recipe changes, Cargo artifacts move
+to a different target directory. This is a cheap way to keep native artifacts
+from silently spanning incompatible rootfs/toolchain identities.
+
+* The venv is inside the checkout, but belongs to the rootfs
+~activate_environment.sh~ creates ~.venv-rootfs~ with rootfs Python 3.12 and
+system site packages (~activate_environment.sh:22-31~):
+
+#+begin_src bash
+monarch_require_rootfs "$MONARCH_ACTIVATE_REPO_ROOT" python uv cargo || return $?
+
+VIRTUAL_ENV="$MONARCH_ACTIVATE_REPO_ROOT/.venv-rootfs"
+if [[ ! -x "$VIRTUAL_ENV/bin/python" ]]; then
+  uv venv --python 3.12 --system-site-packages "$VIRTUAL_ENV" >&2
+fi
+
+export VIRTUAL_ENV
+export PATH="$VIRTUAL_ENV/bin:$PATH"
+unset PYTHONHOME
+#+end_src
+
+This explains the common PyO3 failure mode: bare-host ~cargo~ is not equivalent
+to in-rootfs ~cargo~. The Rust extension links against Python. The rootfs venv
+gives ~cargo~ the interpreter/link context that the build expects, and the guard
+also verifies controlled tool paths before activation.
+
+* A useful debugging rule
+When a local build/test behaves differently on the host and under ~scripts/run~,
+do not first ask "which env var do I export?" Ask:
+
+- Is the command running through the gateway?
+- Does the required tool resolve to the controlled path?
+- Is the dependency installed in ~.venv-rootfs~, not the host venv?
+- Is the artifact under a digest-scoped target/cache path?
+- Is the rootfs stale relative to the recipe?
+
+That sequence follows the code. Host-side env surgery is usually treating the
+symptom from the wrong execution domain.
+
+* Check yourself
+Answer before reading the explanation.
+
+** Q1. Where should a normal build write compiled Cargo output under the rootfs?
+- a. Inside the read-only rootfs under ~/target~.
+- b. In ~target/bwrap/<recipe-digest>~ under the checkout.
+- c. In the host user's global Cargo target dir.
+
+Answer: *b*. ~enter_rootfs.sh~ sets ~CARGO_TARGET_DIR~ to
+~/workspace/monarch/target/bwrap/<recipe-digest>~ (~enter_rootfs.sh:168~), with
+the host directory created at ~enter_rootfs.sh:105-106~.
+
+** Q2. Why is setting ~CC=/usr/bin/gcc~ on the host not the normal fix for a rootfs build?
+- a. The rootfs clears host env vars and provides its own controlled toolchain.
+- b. GCC is never used by Rust builds.
+- c. ~scripts/run~ ignores all Rust compilation.
+
+Answer: *a*. Entry uses ~--clearenv~, then sets a controlled environment
+(~enter_rootfs.sh:123~, ~enter_rootfs.sh:162-192~). ~scripts/run~ also unsets
+compiler/linker leak variables before activation (~scripts/run:43-52~).
+
+** Q3. Why does ~.venv-rootfs~ live in the checkout instead of inside ~/~?
+- a. Because the rootfs is mounted read-only and persistent project state belongs in the checkout.
+- b. Because bwrap cannot run Python from ~/usr/bin~.
+- c. Because Docker export deletes all virtualenvs.
+
+Answer: *a*. The rootfs is ~--ro-bind~ mounted at ~/~, while the checkout is
+mounted writable at ~/workspace/monarch~ (~enter_rootfs.sh:112-119~). The venv
+is checkout-local but created by the rootfs Python (~activate_environment.sh:24-31~).
+
+* Practice in the repo
+Run this mentally before editing a local script:
+
+- If it needs Python packages, it should see ~VIRTUAL_ENV=.venv-rootfs~.
+- If it needs Cargo, it should see ~/opt/cargo/bin/cargo~ and a digest-scoped
+  ~CARGO_TARGET_DIR~.
+- If it needs CUDA headers or ~nvcc~, it should use ~/opt/cuda-synth~.
+- If it needs host env hacks to pass, it probably bypassed the intended rootfs
+  path or the rootfs recipe is missing a real dependency.
+
+* Next
+Lesson 0004: GPU and CUDA mechanics - why the rootfs carries a synthetic CUDA
+toolkit but binds the host NVIDIA driver userspace at entry.
+
+# Sources current as of this checkout.

@@ -47,3 +47,25 @@ disabled_tests.txt
 
 # whittle
 .whittle.json
+
+# Local teaching workspace (agent-authored lessons/reference/notes)
+.agents/teach/
+
+# Hermetic control-plane rootfs (scripts/rootfs/)
+scripts/rootfs/rootfs/
+scripts/rootfs/rootfs/**
+scripts/rootfs/.rootfs.stage.*
+scripts/rootfs/*.tar
+scripts/rootfs/cache/
+scripts/rootfs/cache/**
+scripts/rootfs/tests/__pycache__/
+scripts/**/__pycache__/
+.venv-rootfs/
+.venv-rootfs/**
+control-plane-results/
+glm52-serving-results/
+glm52-benchmark-results/
+ginkgo/local-env/qwen3-sglang.yaml
+.scratch/glm52-local-serving/cache/
+.scratch/glm52-local-serving/run/
+.scratch/glm52-local-serving/tmp/

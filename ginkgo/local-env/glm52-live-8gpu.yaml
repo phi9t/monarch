@@ -1,0 +1,7 @@
+schema_version: 1
+roots:
+  repo: /home/operator/workspace/monarch/.worktrees/glm52-gpu-workload
+  cache: /var/tmp/monarch-glm52-local-serving-cache
+  temp: /var/tmp/monarch-glm52-local-serving-tmp
+rootfs:
+  monarch-default: /home/operator/workspace/monarch/.worktrees/glm52-gpu-workload/scripts/rootfs/rootfs

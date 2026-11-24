@@ -1,0 +1,138 @@
+#+TITLE: Lesson 0001 — The recipe digest is the rootfs's identity
+#+SUBTITLE: ~7 min · Monarch hermetic rootfs teaching workspace
+#+OPTIONS: toc:nil num:nil
+
+* Why this lesson
+To change the rootfs safely you need to know which edits count as a "new
+rootfs" and force a rebuild, and which silently don't. The answer is one
+sha256. Learn it and you can bump a tool pin with confidence.
+
+This serves the mission directly: extend and maintain the rootfs without fear.
+Fear here comes from one specific failure — editing the rootfs and having your
+change silently ignored because the sandbox wasn't rebuilt. The recipe digest
+is the mechanism that prevents that, so it's the first thing to internalize.
+
+* The idea in one sentence
+A rootfs's identity is a hash of exactly three files. If the hash your checkout
+computes differs from the hash stamped inside the built rootfs, the rootfs is
+stale and is rebuilt on the next ~scripts/run~.
+
+* The three files
+From ~scripts/rootfs/execution_contract.sh:39-45~:
+
+#+begin_src bash
+monarch_rootfs_recipe_sha256() {
+  local repo_root="$1"
+  (
+    cd "$repo_root" || return 1
+    sha256sum scripts/rootfs/contract.env \
+              scripts/rootfs/build_rootfs.sh \
+              rust-toolchain
+  ) | sha256sum | awk '{print $1}'
+}
+#+end_src
+
+That's it. The digest hashes:
+
+- ~contract.env~ — the reviewed pins (base image, uv, Node, npm, mdBook,
+  nextest, nvcc versions, schema, arch).
+- ~build_rootfs.sh~ — the builder itself (the inline Dockerfile and export
+  logic).
+- ~rust-toolchain~ — the pinned Rust channel.
+
+Two subtleties worth holding onto:
+
+- It is a *hash of hashes*: ~sha256sum~ over the three files, piped into
+  ~sha256sum~ again.
+- The files are named by *relative* path (after ~cd "$repo_root"~), so the
+  digest is location-independent — the same commit in a different directory
+  yields the same identity.
+
+* How it becomes the stamped identity
+At build time the digest is written into the image at
+~/etc/monarch-rootfs-contract~ (~build_rootfs.sh:231-242~) as a line:
+
+#+begin_src text
+MONARCH_ROOTFS_RECIPE_SHA256=<digest>
+#+end_src
+
+On entry, ~monarch_rootfs_contract_current~ recomputes the digest from your
+working tree and greps for an exact match in the stamped file
+(~execution_contract.sh:131-136~):
+
+#+begin_src bash
+expected="$(monarch_rootfs_recipe_sha256 "$repo_root")" || return 1
+grep -qx "MONARCH_ROOTFS_RECIPE_SHA256=$expected" \
+  "$rootfs$MONARCH_ROOTFS_CONTRACT_PATH"
+#+end_src
+
+If it doesn't match, ~enter_rootfs.sh:84-95~ prints
+~== rootfs … is stale; rebuilding ==~ and rebuilds before entering.
+
+* The win
+*To change the rootfs, edit one of the three recipe files.* Bumping Node? Edit
+the pin in ~contract.env~. The digest changes, the next ~scripts/run~ rebuilds,
+and the new rootfs is stamped with the new identity. You never manually rebuild
+or clear a cache.
+
+* The trap this prevents
+Suppose you ~docker exec~ into a running build and ~apt install~ a tool, or
+hand-edit a file inside ~scripts/rootfs/rootfs/~. None of the three recipe files
+changed, so the digest is unchanged, so ~scripts/run~ sees the rootfs as current
+and never rebuilds. Your change evaporates on the next clean build and — worse —
+isn't reproducible for anyone else. Persistent changes must flow through
+~contract.env~ or ~build_rootfs.sh~.
+
+* Check yourself
+Answer before reading the explanation under each question.
+
+** Q1. You bump the pinned mdBook version, editing only the value in ~contract.env~. What happens on your next ~scripts/run mdbook build~?
+- a. Nothing rebuilds; you must run ~build_rootfs.sh --rebuild~ by hand first.
+- b. The digest changes, the rootfs is detected stale, and it auto-rebuilds
+  before running.
+- c. It errors, because ~contract.env~ is not one of the recipe files.
+
+Answer: *b*. Editing ~contract.env~ changes the recipe digest (it is one of the
+three hashed files). On entry the stamped digest no longer matches, so
+~enter_rootfs.sh~ rebuilds automatically. No manual step
+(~execution_contract.sh:43~, ~enter_rootfs.sh:84-95~).
+
+** Q2. Which edit does NOT change the recipe digest?
+- a. Changing the pinned Rust channel in ~rust-toolchain~.
+- b. Adding an ~apt-get install~ line to the Dockerfile in ~build_rootfs.sh~.
+- c. Editing ~enter_rootfs.sh~ to bind an extra host directory.
+
+Answer: *c*. The digest hashes exactly ~contract.env~, ~build_rootfs.sh~, and
+~rust-toolchain~ (~execution_contract.sh:43~). ~enter_rootfs.sh~ is not in that
+set, so changing how the rootfs is *entered* (binds, env) takes effect
+immediately without a rebuild, while changing what the rootfs *contains*
+correctly forces one. That asymmetry is intentional: entry is cheap and
+per-run; contents are baked and identity-bearing.
+
+** Q3. Why is the digest a hash of hashes over relative filenames?
+- a. So the identity is location-independent — the same three files yield the
+  same digest regardless of where the checkout lives.
+- b. So the digest is faster to compute on large repos.
+- c. So ~grep -qx~ can match a partial line.
+
+Answer: *a*. The comment at ~execution_contract.sh:37-38~ says it outright: hash
+"by relative name so the digest is location-independent." Two checkouts of the
+same commit in different directories produce the same rootfs identity, so a
+prebuilt rootfs is portable and the staleness check is meaningful across
+machines.
+
+* Recommended primary source
+Read the guard library end to end — it's short and it's the source of truth:
+~scripts/rootfs/execution_contract.sh~ (start at ~monarch_rootfs_recipe_sha256~,
+line 39). Higher-trust than any external bwrap/docker doc because it *is* the
+behavior.
+
+* Next
+See [[file:../reference/rootfs-glossary.org][the reference: glossary & invariants]].
+Planned Lesson 0002: the guard & execution domains — why ~scripts/run~ is the
+only door in.
+
+Stuck or curious? I'm your teacher — ask me to prove any claim against the
+source, or to go deeper on staleness, the stamped contract, or the next lesson.
+
+# Sources current as of HEAD 136f8887.

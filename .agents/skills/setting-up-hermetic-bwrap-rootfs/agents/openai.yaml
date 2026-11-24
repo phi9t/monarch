@@ -1,0 +1,4 @@
+interface:
+  display_name: "Set up bwrap rootfs"
+  short_description: "Build, relocate, and validate a hermetic bwrap rootfs"
+  default_prompt: "Set up and validate the hermetic bwrap rootfs"
