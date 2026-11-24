@@ -1,0 +1,13 @@
+schema_version: 1
+profile: sandbox-only
+description: Validate rootfs selection, directory projection, tools, imports, and bwrap plan translation without launching a model server.
+requires_gpu: false
+launches_serving_process: false
+evidence_class: sandbox-readiness
+required_actions:
+  - host_capability_survey
+  - local_environment_resolution
+  - rootfs_selection
+  - host_directory_creation
+  - rootfs_projection_check
+  - dependency_import_probe

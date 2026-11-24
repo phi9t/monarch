@@ -1,0 +1,115 @@
+#+TITLE: Reference — The Monarch hermetic rootfs
+#+SUBTITLE: Glossary, invariants, file map · quick lookup
+#+OPTIONS: toc:nil num:nil
+
+Compressed for quick reference while extending or maintaining the rootfs. Every
+claim cites a file:line in this checkout.
+
+* File map
+Everything lives under ~scripts/rootfs/~ plus the one-line gateway
+~scripts/run~. All are in the *host-bootstrap* execution domain (they run on the
+host to build or enter the sandbox), declared in
+~execution-domains.toml:22-30~.
+
+- ~scripts/run~ — the sole gateway. Re-execs any command inside the rootfs,
+  mapping the caller's directory to the checkout-relative dir. No args means an
+  interactive shell.
+- ~scripts/rootfs/contract.env~ — reviewed *recipe data*: base image digest,
+  tool pins (uv, Node, npm, mdBook, nextest, nvcc, setuptools), schema, arch.
+  The knobs you edit to change what's in the rootfs.
+- ~scripts/rootfs/build_rootfs.sh~ — docker-builds the baseline image from
+  ~contract.env~ pins, then ~docker export~s it to a flattened directory.
+  Stamps ~/etc/monarch-rootfs-contract~.
+- ~scripts/rootfs/enter_rootfs.sh~ — ~bwrap~ entry: read-only root, writable
+  checkout, cleared env, GPU + host-driver binds. Auto-builds on first use or
+  stale recipe (~enter_rootfs.sh:84-95~).
+- ~scripts/rootfs/execution_contract.sh~ — the shared library: recipe digest,
+  rootfs validity, domain classification, the guard diagnostic. Single source of
+  truth for "is this a valid rootfs?"
+- ~scripts/rootfs/activate_environment.sh~ — sourced inside the rootfs; creates
+  and activates ~.venv-rootfs~ with system site-packages. Never installs project
+  deps.
+- ~scripts/rootfs/run_in_rootfs.sh~ — build-then-delegate helper.
+- ~scripts/rootfs/execution-domains.toml~ — the reviewed inventory of which
+  entrypoint belongs to which domain; audited by ~audit_entrypoints.py~.
+
+* Glossary
+** Recipe digest
+The authoritative *identity* of a rootfs. A sha256-of-sha256s over exactly three
+files, by relative name so it is location-independent
+(~execution_contract.sh:39-45~):
+
+#+begin_src bash
+sha256sum scripts/rootfs/contract.env \
+          scripts/rootfs/build_rootfs.sh \
+          rust-toolchain | sha256sum
+#+end_src
+
+Stamped into the image at ~/etc/monarch-rootfs-contract~ as
+~MONARCH_ROOTFS_RECIPE_SHA256=…~ (~build_rootfs.sh:231-242~). Change any of those
+three files and the built rootfs is now *stale*.
+
+** Staleness / rebuild
+On entry ~monarch_rootfs_contract_current~ compares the stamped digest against
+the freshly computed one (~execution_contract.sh:131-136~). Mismatch (or missing
+~bin/bash~) triggers an auto-rebuild (~enter_rootfs.sh:84-95~).
+
+** Execution domain
+Every executable entrypoint belongs to exactly one of eight domains
+(~execution-domains.toml:12-20~). *rootfs-development* must run inside the
+rootfs; *host-bootstrap* runs on the host to build/enter it; the rest
+(github-linux, darwin, controlled-ci, meta-internal, remote-orchestration,
+controlled-test-fixture) are exempt because they name a separate execution
+context that does not nest the local bwrap.
+
+** The guard
+~monarch_require_rootfs~ calls ~monarch_in_valid_rootfs~; on failure it routes
+through ~monarch_contract_error~, which prints the canonical redirect
+(~execution_contract.sh:138-149~):
+
+- ~error: Monarch development commands must run inside the hermetic bwrap rootfs~
+- ~run instead: scripts/run <command>~
+
+** Controlled uid map
+A valid rootfs runs in an unprivileged user namespace whose
+~/proc/self/uid_map~ is a single identity mapping of length 1. A nested userns
+(crash-recovery worker) writes an empty map — also controlled. A host map
+(length 2^32) or multi-line map is not (~execution_contract.sh:66-72~).
+
+* Hermeticity invariants
+- *Read-only root.* Mounted ~--ro-bind … /~. Only the checkout, dedicated
+  caches, ephemeral ~/home~, ~/tmp~, ~/proc~, ~/dev~, and GPU device nodes are
+  writable (~enter_rootfs.sh:112-125~). Mount points bwrap binds over must be
+  pre-created in the image (~build_rootfs.sh:247~) because a read-only root
+  cannot ~mkdir~ at entry.
+- *Cleared env.* ~--clearenv~ then an explicit allowlist. Host compiler / Python
+  / Cargo / linker variables never cross the boundary (~enter_rootfs.sh:123,
+  162-192~). This is why toolchain hacks (~CC~, ~LIBCLANG_PATH~) are both
+  unnecessary and impossible to leak.
+- *PyO3 needs the venv.* Rust links libpython, so ~cargo~ must run with the
+  rootfs venv active. A bare-host ~cargo~ yields ~could not find native static
+  library python3.12~. ~scripts/run~ sources ~activate_environment.sh~, which
+  exports ~VIRTUAL_ENV~ and ~PATH~ (~activate_environment.sh:24-31~).
+- *Driver/runtime match.* The in-rootfs CUDA runtime (pip ~nvidia-cu13~ wheels)
+  links against the *host* NVIDIA driver userspace, read-only bound into
+  ~/run/nvidia-host~ and exposed via ~LD_LIBRARY_PATH~
+  (~enter_rootfs.sh:139-179~), so the userspace version matches the loaded
+  kernel module.
+- *Synthetic CUDA_HOME.* There is no real CUDA toolkit.
+  ~build_rootfs.sh:200-216~ assembles ~/opt/cuda-synth~ from the
+  ~nvidia-cuda-nvcc~ wheel so ~setup.py get_cuda_home()~ and torch
+  ~cpp_extension~ find a real ~bin/nvcc~, ~include/~, ~lib64/~.
+- *Atomic export.* The docker export goes to a temp stage dir and is ~mv~'d into
+  place; an interrupted build never leaves a half-populated rootfs
+  (~build_rootfs.sh:253-280~).
+
+* Pitfalls
+- Editing rootfs contents without touching any of the three recipe-digest files
+  means the digest does not change and entry will not rebuild. Persistent
+  changes must flow through ~contract.env~ / ~build_rootfs.sh~.
+- ~docker export~ leaves ~/etc/resolv.conf~ empty; the host's resolver is bound
+  in for network access during builds (~enter_rootfs.sh:127-131~). Forget this
+  and in-rootfs ~uv~/~pip~ fetches hang.
+
+# This is a living reference. Ask your teacher to expand any entry.
+# Sources current as of HEAD 136f8887.

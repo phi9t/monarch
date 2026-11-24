@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Monarch (single machine)"
+  short_description: "Build and run Monarch on one host via the bwrap rootfs"
+  default_prompt: "Run Monarch on this machine using the bwrap rootfs"

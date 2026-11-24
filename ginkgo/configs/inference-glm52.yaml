@@ -1,0 +1,78 @@
+schema_version: 1
+run_group: ginkgo-inference-glm52
+fail_fast: true
+allow_fallback: false
+ports:
+  mode: strict_run_owned_range
+  bind_host: 127.0.0.1
+  range_start: 19000
+  range_end: 19200
+  disallowed_ports: [8000, 8080, 18080]
+components:
+  sglang_backend:
+    enabled: true
+    declared_ref: repo://ginkgo/configs/sglang-glm52.yaml
+    required_records:
+      venv: repo://glm52-serving-results/prepare-venv/sglang-venv.json
+      model_cache: repo://glm52-serving-results/prepare-model/model-cache.json
+  dynamo_frontend:
+    enabled: true
+    kind: local_dynamo_sglang
+    execution_domain: host_controlled
+    bind_host: 127.0.0.1
+    upstream_ref: component://sglang_backend/openai_base_url
+    model_name_ref: component://sglang_backend/served_model_name
+    config_root: repo://ginkgo/configs/dynamo
+    logs_root: run://logs/dynamo
+    startup_timeout_seconds: 300
+    topology:
+      mode: local_frontend_worker
+      package: ai-dynamo
+      version: "1.4.0"
+      discovery_backend: file
+      request_plane: tcp
+      namespace: ginkgo-glm52
+      file_kv_root: run://components/dynamo/file-kv
+      host_control_venv: cache://ginkgo/venvs/dynamo
+      rootfs_cache_projection: /workspace/monarch/scripts/rootfs/cache/ginkgo
+      packages:
+        - ai-dynamo==1.4.0
+        - ai-dynamo-runtime==1.4.0
+        - sglang==0.5.17
+        - blake3
+      rootfs_tools:
+        - uv
+      frontend:
+        module: dynamo.frontend
+        chat_processor: sglang
+      worker:
+        module: dynamo.sglang
+        component: backend
+        endpoint: generate
+        endpoint_types: chat,completions
+  responses_adapter:
+    enabled: true
+    execution_domain: host_controlled
+    bind_host: 127.0.0.1
+    upstream_ref: component://dynamo_frontend/openai_base_url
+    model_name_ref: component://sglang_backend/served_model_name
+    logs_root: run://logs/responses-adapter
+    startup_timeout_seconds: 120
+probes:
+  sglang:
+    models_required: true
+    chat_required: true
+  dynamo:
+    models_required: true
+    chat_required: true
+  responses:
+    models_required: true
+    nonstream_required: true
+    stream_required: true
+    tool_call_required: true
+repeatability:
+  cycles: 3
+teardown:
+  process_group_required: true
+  port_closed_required: true
+  orphan_scan_required: true

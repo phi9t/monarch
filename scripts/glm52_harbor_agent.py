@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib import request as urllib_request
+
+
+AGENT_VERSION = "glm52-harbor-agent-v1"
+
+
+class HarborAgentError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _FallbackModelInfo:
+    name: str
+    provider: str | None = None
+
+
+@dataclass(frozen=True)
+class _FallbackAgentInfo:
+    name: str
+    version: str
+    model_info: Any | None = None
+
+
+@dataclass(init=False)
+class GLM52HarborAgent:
+    responses_base_url: str
+    model: str = "zai-org/GLM-5.2"
+    local_host_route: str = "host.docker.internal"
+    responses_timeout_seconds: int = 120
+    stream: bool = True
+    decoding_profile: dict[str, Any]
+    extra_env: dict[str, str]
+    logs_dir: Path | None = None
+
+    def __init__(
+        self,
+        *,
+        responses_base_url: str,
+        model: str | None = None,
+        model_name: str | None = None,
+        local_host_route: str = "host.docker.internal",
+        responses_timeout_seconds: int = 120,
+        stream: bool = True,
+        decoding_profile: dict[str, Any] | None = None,
+        logs_dir: Path | str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        selected_model = (
+            model
+            if model is not None
+            else model_name
+            if model_name is not None
+            else "zai-org/GLM-5.2"
+        )
+        object.__setattr__(self, "responses_base_url", responses_base_url)
+        object.__setattr__(self, "model", selected_model)
+        object.__setattr__(self, "local_host_route", local_host_route)
+        object.__setattr__(self, "responses_timeout_seconds", responses_timeout_seconds)
+        object.__setattr__(self, "stream", stream)
+        object.__setattr__(
+            self,
+            "decoding_profile",
+            {} if decoding_profile is None else dict(decoding_profile),
+        )
+        object.__setattr__(self, "extra_env", {})
+        object.__setattr__(self, "logs_dir", None if logs_dir is None else Path(logs_dir))
+
+    @staticmethod
+    def name() -> str:
+        return "glm52-responses"
+
+    def version(self) -> str:
+        return AGENT_VERSION
+
+    @classmethod
+    def import_path(cls) -> str:
+        return f"{cls.__module__}:{cls.__name__}"
+
+    async def setup(self, *, environment: Any) -> None:
+        return None
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        tools = [_terminal_tool()]
+        response = await _post_responses_request_with_context(
+            self,
+            context,
+            stage="initial_request",
+            request=self.build_responses_request(
+                task_instruction=instruction,
+                observation="No prior observation.",
+                tools=tools,
+            ),
+        )
+
+        for _ in range(16):
+            function_calls = [
+                item
+                for item in response.get("output", [])
+                if item.get("type") == "function_call"
+            ]
+            inline_function_calls = _inline_function_calls_from_response(response)
+            function_calls.extend(inline_function_calls)
+            if not function_calls:
+                _populate_context_from_response(context, response)
+                return
+
+            outputs = []
+            for item in function_calls:
+                outputs.append(
+                    await _execute_function_call(
+                        item,
+                        environment=environment,
+                    )
+                )
+
+            response_id = response.get("id")
+            if not isinstance(response_id, str) or not response_id:
+                raise HarborAgentError("response with function_call requires id")
+            request_input = outputs
+            if inline_function_calls:
+                request_input = [*inline_function_calls, *outputs]
+            response = await _post_responses_request_with_context(
+                self,
+                context,
+                stage="tool_result",
+                request=self._with_decoding_profile(
+                    {
+                        "model": self.model,
+                        "input": request_input,
+                        "previous_response_id": response_id,
+                        "tools": [_harbor_tool_to_responses_tool(tool) for tool in tools],
+                        "tool_choice": "auto",
+                        "stream": self.stream,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
+                ),
+            )
+
+        raise HarborAgentError("responses tool loop exceeded maximum iterations")
+
+    def populate_context_post_run(self, context: Any) -> None:
+        return None
+
+    def to_agent_info(self) -> Any:
+        model_provider, model_name = _parse_model_provider_name(self.model)
+        agent_info_cls, model_info_cls = _harbor_agent_info_types()
+        return agent_info_cls(
+            name=self.name(),
+            version=self.version(),
+            model_info=model_info_cls(
+                name=model_name,
+                provider=model_provider,
+            ),
+        )
+
+    def build_responses_request(
+        self,
+        *,
+        task_instruction: str,
+        observation: str,
+        tools: list[dict[str, Any]],
+        previous_response_id: str | None = None,
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "instructions": (
+                "You are running a terminal benchmark task through Harbor. "
+                "Use the available tools to inspect, edit, test, and then answer."
+            ),
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"TASK:\n{task_instruction}\n\n"
+                                f"OBSERVATION:\n{observation}"
+                            ),
+                        }
+                    ],
+                }
+            ],
+            "tools": [_harbor_tool_to_responses_tool(tool) for tool in tools],
+            "tool_choice": "auto",
+            "stream": self.stream,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if previous_response_id is not None:
+            request["previous_response_id"] = previous_response_id
+        return self._with_decoding_profile(request)
+
+    def _with_decoding_profile(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not self.decoding_profile:
+            return request
+        for source, target in (
+            ("temperature", "temperature"),
+            ("top_p", "top_p"),
+            ("max_output_tokens", "max_output_tokens"),
+        ):
+            value = self.decoding_profile.get(source)
+            if value is not None:
+                request[target] = value
+        glm_thinking = self.decoding_profile.get("glm_thinking")
+        if glm_thinking is not None:
+            chat_template_kwargs = dict(request.get("chat_template_kwargs") or {})
+            chat_template_kwargs["enable_thinking"] = glm_thinking == "enabled"
+            request["chat_template_kwargs"] = chat_template_kwargs
+        return request
+
+
+def _harbor_agent_info_types() -> tuple[type[Any], type[Any]]:
+    try:
+        from harbor.models.trial.result import AgentInfo, ModelInfo  # type: ignore[import-not-found]
+    except ImportError:
+        return _FallbackAgentInfo, _FallbackModelInfo
+    return AgentInfo, ModelInfo
+
+
+def _terminal_tool() -> dict[str, Any]:
+    return {
+        "name": "terminal_run",
+        "description": "Run a terminal command in the Harbor environment.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "cwd": {"type": "string"},
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+                "timeout_sec": {"type": "integer"},
+                "user": {"type": ["string", "integer"]},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _parse_model_provider_name(model: str) -> tuple[str | None, str]:
+    if "/" not in model:
+        return None, model
+    provider, name = model.split("/", maxsplit=1)
+    return provider, name
+
+
+def _harbor_tool_to_responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        raise HarborAgentError("Harbor tool requires a name")
+    parameters = tool.get("parameters", {"type": "object", "properties": {}})
+    if not isinstance(parameters, dict):
+        raise HarborAgentError(f"Harbor tool {name} has non-object parameters")
+    description = tool.get("description", "")
+    if not isinstance(description, str):
+        raise HarborAgentError(f"Harbor tool {name} has non-string description")
+    return {
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": parameters,
+    }
+
+
+def responses_function_call_to_harbor_action(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("type") != "function_call":
+        raise HarborAgentError(f"expected function_call item, got {item.get('type')!r}")
+    name = item.get("name")
+    call_id = item.get("call_id")
+    arguments = item.get("arguments", "{}")
+    if not isinstance(name, str) or not name:
+        raise HarborAgentError("function_call requires name")
+    if not isinstance(call_id, str) or not call_id:
+        raise HarborAgentError("function_call requires call_id")
+    if not isinstance(arguments, str):
+        raise HarborAgentError("function_call arguments must be a JSON string")
+    try:
+        decoded_arguments = json.loads(arguments)
+    except json.JSONDecodeError as error:
+        raise HarborAgentError(f"invalid function_call arguments: {error}") from error
+    if not isinstance(decoded_arguments, dict):
+        raise HarborAgentError("function_call arguments must decode to an object")
+    return {
+        "type": "tool_action",
+        "tool": name,
+        "call_id": call_id,
+        "arguments": decoded_arguments,
+    }
+
+
+def _inline_function_calls_from_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+    text = _extract_final_message(response)
+    if not text:
+        return []
+    calls = []
+    for index, match in enumerate(
+        re.finditer(r"<tool_call>(.*?)</tool_call>", text, flags=re.DOTALL),
+        start=1,
+    ):
+        body = match.group(1).strip()
+        name_match = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)", body)
+        if name_match is None:
+            raise HarborAgentError("inline tool_call requires tool name")
+        arguments: dict[str, Any] = {}
+        for arg_match in re.finditer(
+            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+            body,
+            flags=re.DOTALL,
+        ):
+            key = arg_match.group(1).strip()
+            value = arg_match.group(2)
+            if not key:
+                raise HarborAgentError("inline tool_call arg_key must be non-empty")
+            arguments[key] = _inline_argument_value(key, value)
+        if not arguments:
+            raise HarborAgentError("inline tool_call requires at least one argument")
+        calls.append(
+            {
+                "type": "function_call",
+                "call_id": f"inline_call_{index}",
+                "name": name_match.group(1),
+                "arguments": json.dumps(arguments, sort_keys=True),
+            }
+        )
+    return calls
+
+
+def _inline_argument_value(key: str, value: str) -> Any:
+    if key == "timeout_sec":
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return value
+
+
+async def _execute_function_call(item: dict[str, Any], *, environment: Any) -> dict[str, Any]:
+    action = responses_function_call_to_harbor_action(item)
+    tool_name = action["tool"]
+    if tool_name not in {"terminal_run", "bash", "shell"}:
+        raise HarborAgentError(f"unsupported function_call tool: {tool_name}")
+
+    arguments = action["arguments"]
+    command = arguments.get("command", arguments.get("cmd"))
+    if not isinstance(command, str) or not command:
+        raise HarborAgentError(f"{tool_name} requires command")
+
+    result = await environment.exec(
+        command,
+        cwd=_optional_str(arguments, "cwd"),
+        env=_optional_env(arguments),
+        timeout_sec=_optional_int(arguments, "timeout_sec"),
+        user=arguments.get("user"),
+    )
+    return {
+        "type": "function_call_output",
+        "call_id": action["call_id"],
+        "output": json.dumps(
+            {
+                "stdout": getattr(result, "stdout", None),
+                "stderr": getattr(result, "stderr", None),
+                "return_code": getattr(result, "return_code"),
+            },
+            sort_keys=True,
+        ),
+    }
+
+
+def _optional_str(arguments: dict[str, Any], key: str) -> str | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HarborAgentError(f"{key} must be a string")
+    return value
+
+
+def _optional_int(arguments: dict[str, Any], key: str) -> int | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise HarborAgentError(f"{key} must be an integer")
+    return value
+
+
+def _optional_env(arguments: dict[str, Any]) -> dict[str, str] | None:
+    value = arguments.get("env")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise HarborAgentError("env must be an object with string values")
+    return value
+
+
+def _populate_context_from_response(context: Any, response: dict[str, Any]) -> None:
+    usage = response.get("usage") or {}
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+    if isinstance(input_tokens, int):
+        context.n_input_tokens = input_tokens
+    if isinstance(output_tokens, int):
+        context.n_output_tokens = output_tokens
+
+    metadata = getattr(context, "metadata", None)
+    if metadata is None:
+        metadata = {}
+        context.metadata = metadata
+    metadata["final_response_id"] = response.get("id")
+    metadata["final_message"] = _extract_final_message(response)
+    metadata["usage"] = usage
+
+
+def _extract_final_message(response: dict[str, Any]) -> str | None:
+    texts: list[str] = []
+    for item in response.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            text = content.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    if not texts:
+        return None
+    return "\n".join(texts)
+
+
+async def _post_responses_request_with_context(
+    agent: GLM52HarborAgent,
+    context: Any,
+    *,
+    stage: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = getattr(context, "metadata", None)
+    if metadata is None:
+        metadata = {}
+        context.metadata = metadata
+    in_flight = _responses_request_summary(
+        agent=agent,
+        stage=stage,
+        request=request,
+    )
+    metadata["inflight_responses_request"] = in_flight
+    start = time.monotonic()
+    try:
+        response = await _post_responses_request(agent, request)
+    finally:
+        in_flight["elapsed_seconds"] = time.monotonic() - start
+    return response
+
+
+def _responses_request_summary(
+    *,
+    agent: GLM52HarborAgent,
+    stage: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "endpoint": agent.responses_base_url.rstrip("/") + "/responses",
+        "timeout_seconds": agent.responses_timeout_seconds,
+        "stream": bool(request.get("stream")),
+        "input_items": _request_input_item_count(request.get("input")),
+        "tools": _request_tool_names(request.get("tools")),
+        "decoding_profile": dict(agent.decoding_profile),
+        "elapsed_seconds": 0.0,
+    }
+
+
+def _request_input_item_count(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    if value is None:
+        return 0
+    return 1
+
+
+def _request_tool_names(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            names.append(item["name"])
+    return names
+
+
+async def _post_responses_request(
+    agent: GLM52HarborAgent,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_post_responses_request_sync, agent, request)
+
+
+def _post_responses_request_sync(
+    agent: GLM52HarborAgent,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    endpoint = agent.responses_base_url.rstrip("/") + "/responses"
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("RESPONSES_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
+    with urllib_request.urlopen(req, timeout=agent.responses_timeout_seconds) as response:
+        raw = response.read().decode("utf-8")
+        content_type = response.headers.get("Content-Type", "")
+    if "text/event-stream" in content_type or raw.lstrip().startswith("data:"):
+        decoded = _responses_object_from_sse(raw)
+    else:
+        decoded = json.loads(raw)
+    if not isinstance(decoded, dict):
+        raise HarborAgentError("responses endpoint returned a non-object payload")
+    return decoded
+
+
+def _responses_object_from_sse(raw: str) -> dict[str, Any]:
+    events = _responses_sse_events(raw)
+    completed: dict[str, Any] | None = None
+    for event in events:
+        event_type = event.get("type")
+        if event_type == "error":
+            raise HarborAgentError(f"responses stream error: {_responses_error_message(event.get('error'))}")
+        if event_type == "response.completed":
+            response = event.get("response")
+            if isinstance(response, dict):
+                completed = response
+    if completed is None:
+        completed = _responses_object_from_done_stream(events)
+    if completed is None:
+        raise HarborAgentError("responses stream ended without response.completed")
+    return completed
+
+
+def _responses_object_from_done_stream(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not events or events[-1].get("type") != "done":
+        return None
+    response_id: str | None = None
+    model: str | None = None
+    output_by_index: dict[int, dict[str, Any]] = {}
+    for event in events:
+        response = event.get("response")
+        if isinstance(response, dict):
+            if isinstance(response.get("id"), str):
+                response_id = response["id"]
+            if isinstance(response.get("model"), str):
+                model = response["model"]
+        if event.get("type") != "response.output_item.done":
+            continue
+        output_index = event.get("output_index")
+        item = event.get("item")
+        if isinstance(output_index, int) and isinstance(item, dict):
+            output_by_index[output_index] = item
+    if not output_by_index:
+        return None
+    return {
+        "id": response_id or "resp_stream",
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model or "unknown",
+        "status": "completed",
+        "output": [
+            item
+            for _, item in sorted(output_by_index.items(), key=lambda pair: pair[0])
+        ],
+    }
+
+
+def _responses_sse_events(raw: str) -> list[dict[str, Any]]:
+    events = []
+    data_lines: list[str] = []
+    for line in raw.splitlines():
+        if line == "":
+            if data_lines:
+                events.append(_decode_responses_sse_data("\n".join(data_lines)))
+                data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line.removeprefix("data:").lstrip())
+    if data_lines:
+        events.append(_decode_responses_sse_data("\n".join(data_lines)))
+    return events
+
+
+def _decode_responses_sse_data(data: str) -> dict[str, Any]:
+    if data == "[DONE]":
+        return {"type": "done"}
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError as error:
+        raise HarborAgentError(f"invalid responses stream event: {error}") from error
+    if not isinstance(event, dict):
+        raise HarborAgentError("responses stream event must be an object")
+    return event
+
+
+def _responses_error_message(error: Any) -> str:
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str):
+            return message
+    return str(error)
+
+
+def write_trial_artifact(
+    artifact_dir: Path,
+    *,
+    task_id: str,
+    trial_id: str,
+    model_id: str,
+    responses_base_url: str,
+    local_host_route: str,
+    environment_provider: str,
+    events: list[dict[str, Any]],
+) -> Path:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "agent_version": AGENT_VERSION,
+        "task_id": task_id,
+        "trial_id": trial_id,
+        "model_id": model_id,
+        "responses_base_url": responses_base_url,
+        "local_host_route": local_host_route,
+        "environment_provider": environment_provider,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "events": events,
+    }
+    path = artifact_dir / f"{trial_id}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path

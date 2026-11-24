@@ -22,6 +22,8 @@ from monarch._src.spmd.host_mesh import (
     host_mesh_from_store,
 )
 
+pytestmark = pytest.mark.control_plane
+
 
 def _pid_alive(pid: int) -> bool:
     try:

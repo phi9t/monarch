@@ -1,0 +1,16 @@
+schema_version: 1
+profile: serving-smoke-dense
+description: Launch Qwen/Qwen3-0.6B through SGLang to prove lightweight serving, inference probes, artifacts, and clean teardown.
+requires_gpu: true
+launches_serving_process: true
+evidence_class: sglang-serving-readiness
+declared_config: repo://ginkgo/configs/smoke-qwen3-dense.yaml
+required_actions:
+  - host_capability_survey
+  - rootfs_projection_check
+  - dependency_contract_verification
+  - optimized_kernel_verification
+  - model_cache_smoke_preparation
+  - materialized_command_validation
+  - sglang_launch_probe_teardown
+  - repeatability_check

@@ -9,6 +9,14 @@
 from importlib import import_module as _import_module
 from typing import TYPE_CHECKING
 
+# Refuse to import Monarch from a standalone source checkout outside a
+# controlled execution domain, before loading any native code. Installed wheels
+# and the internal tree have no execution-contract validator, so this is a
+# no-op for them.
+from monarch._rootfs_contract import require_source_import as _require_source_import
+
+_require_source_import(__file__)
+
 # Import before monarch to pre-load torch DSOs as, in exploded wheel flows,
 # our RPATHs won't correctly find them.
 try:

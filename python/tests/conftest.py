@@ -6,11 +6,26 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import platform
+import sys
+
+# Guard test collection before plugin registration, Monarch import, or CUDA
+# detection. A standalone source checkout must run its tests inside a controlled
+# execution domain; installed/fbsource trees have no validator and pass through.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_contract_spec = importlib.util.spec_from_file_location(
+    "monarch._rootfs_contract",
+    os.path.join(_REPO_ROOT, "python", "monarch", "_rootfs_contract.py"),
+)
+if _contract_spec is not None and _contract_spec.loader is not None:
+    _contract = importlib.util.module_from_spec(_contract_spec)
+    sys.modules[_contract_spec.name] = _contract
+    _contract_spec.loader.exec_module(_contract)
+    _contract.require_checkout(_REPO_ROOT)
 
 pytest_plugins = ["crash_recovery_plugin"]
-import sys
 from pathlib import Path
 
 import pytest

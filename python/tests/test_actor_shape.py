@@ -12,6 +12,8 @@ import pytest
 from monarch._rust_bindings.monarch_hyperactor.shape import Shape, Slice
 from monarch._src.actor.shape import ShapeExt
 
+pytestmark = pytest.mark.control_plane
+
 
 class TestShapeSlicing(TestCase):
     def test_shape_at_removes_dimension(self) -> None:

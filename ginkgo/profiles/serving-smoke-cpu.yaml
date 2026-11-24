@@ -1,0 +1,16 @@
+schema_version: 1
+profile: serving-smoke-cpu
+description: Launch Qwen/Qwen3-0.6B through CPU SGLang to prove the governed bwrap serving path without host GPU projection.
+requires_gpu: false
+launches_serving_process: true
+evidence_class: sglang-cpu-serving-readiness
+declared_config: repo://ginkgo/configs/smoke-qwen3-cpu.yaml
+required_actions:
+  - host_capability_survey
+  - rootfs_projection_check
+  - dependency_contract_verification
+  - model_cache_smoke_preparation
+  - materialized_command_validation
+  - sglang_launch_probe_teardown
+  - cpu_no_cuda_projection_check
+  - repeatability_check
