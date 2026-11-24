@@ -1,0 +1,168 @@
+schema_version: 1
+model: zai-org/GLM-5.2
+suites:
+  - id: needle-smoke
+    profile: long-context-smoke
+    dataset_revision: fixture-needle-smoke-v1
+    harness_revision: monarch-glm52-fixture-v1
+    prompt_template: needle-smoke-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 256
+      glm_thinking: disabled
+    metric: exact_match
+    dataset_source:
+      type: local_path
+      path: .scratch/glm52-local-serving/benchmark-spec.md
+      revision: fixture-needle-smoke-v1
+    harness_source:
+      type: local_path
+      path: scripts/glm52_benchmark_verifier.py
+      revision: monarch-glm52-fixture-v1
+  - id: humaneval
+    profile: coding-benchmark
+    dataset_revision: openai/openai_humaneval@7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544
+    harness_revision: evalplus@26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+    prompt_template: humaneval-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 2048
+      glm_thinking: disabled
+    metric: pass@1
+    dataset_source:
+      type: huggingface
+      repo_id: openai/openai_humaneval
+      repo_type: dataset
+      revision: 7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544
+    harness_source:
+      type: git
+      url: https://github.com/evalplus/evalplus.git
+      revision: 26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+  - id: mbpp
+    profile: coding-benchmark
+    dataset_revision: google-research-datasets/mbpp@4bb6404fdc6cacfda99d4ac4205087b89d32030c
+    harness_revision: evalplus@26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+    prompt_template: mbpp-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 2048
+      glm_thinking: disabled
+    metric: pass@1
+    dataset_source:
+      type: huggingface
+      repo_id: google-research-datasets/mbpp
+      repo_type: dataset
+      revision: 4bb6404fdc6cacfda99d4ac4205087b89d32030c
+    harness_source:
+      type: git
+      url: https://github.com/evalplus/evalplus.git
+      revision: 26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+  - id: terminal-bench-2
+    profile: terminal-agent
+    dataset_revision: terminal-bench-2@d28711d0da2675d0bb1d56de45ae5df6082438a3
+    harness_revision: harbor@9dd349f28b969268aef419e910e1998149b612a5
+    prompt_template: terminal-bench-2-v1
+    execution_backend: harbor_local_docker
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 4096
+      glm_thinking: disabled
+    metric: task_success
+    dataset_source:
+      type: git
+      url: https://github.com/laude-institute/terminal-bench.git
+      revision: d28711d0da2675d0bb1d56de45ae5df6082438a3
+    harness_source:
+      type: git
+      url: https://github.com/harbor-framework/harbor.git
+      revision: 9dd349f28b969268aef419e910e1998149b612a5
+  - id: swe-bench-verified
+    profile: terminal-agent
+    dataset_revision: SWE-bench/SWE-bench_Verified@78f471bf655a3137b2e8a75af1501690ec009ec3
+    harness_revision: swebench@4e6126978a16bdfebc6538db8f28cacc2c8b77dc
+    prompt_template: swe-bench-verified-v1
+    execution_backend: harbor_local_docker
+    decoding_profile:
+      temperature: 0.2
+      top_p: 0.95
+      max_output_tokens: 4096
+      glm_thinking: disabled
+    metric: resolved_instances
+    dataset_source:
+      type: huggingface_or_swebench
+      dataset: SWE-bench/SWE-bench_Verified
+      repo_type: dataset
+      revision: 78f471bf655a3137b2e8a75af1501690ec009ec3
+    harness_source:
+      type: git
+      url: https://github.com/SWE-bench/SWE-bench.git
+      revision: 4e6126978a16bdfebc6538db8f28cacc2c8b77dc
+  - id: ruler
+    profile: long-context
+    dataset_revision: ruler@c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a
+    harness_revision: lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b
+    prompt_template: ruler-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 1024
+      glm_thinking: disabled
+    metric: exact_match
+    dataset_source:
+      type: git
+      url: https://github.com/NVIDIA/RULER.git
+      revision: c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a
+    harness_source:
+      type: git
+      url: https://github.com/EleutherAI/lm-evaluation-harness.git
+      revision: 8a07e1110d060de48cfc7a9a7987b7659060b60b
+  - id: gsm8k
+    profile: math-reasoning-thinking-disabled
+    dataset_revision: openai/gsm8k@740312add88f781978c0658806c59bc2815b9866
+    harness_revision: lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b
+    prompt_template: gsm8k-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 2048
+      glm_thinking: disabled
+    metric: exact_match
+    dataset_source:
+      type: huggingface
+      repo_id: openai/gsm8k
+      repo_type: dataset
+      revision: 740312add88f781978c0658806c59bc2815b9866
+    harness_source:
+      type: git
+      url: https://github.com/EleutherAI/lm-evaluation-harness.git
+      revision: 8a07e1110d060de48cfc7a9a7987b7659060b60b
+  - id: aime
+    profile: math-reasoning-thinking-enabled
+    dataset_revision: Maxwell-Jia/AIME_2024@8d88b2876a82a080e2f172cc9b25d0d9d2cb4792
+    harness_revision: lm-evaluation-harness@8a07e1110d060de48cfc7a9a7987b7659060b60b
+    prompt_template: aime-v1
+    execution_backend: bwrap_rootfs
+    decoding_profile:
+      temperature: 0
+      top_p: 1
+      max_output_tokens: 4096
+      glm_thinking: enabled
+    metric: exact_match
+    dataset_source:
+      type: huggingface
+      repo_id: Maxwell-Jia/AIME_2024
+      repo_type: dataset
+      revision: 8d88b2876a82a080e2f172cc9b25d0d9d2cb4792
+    harness_source:
+      type: git
+      url: https://github.com/EleutherAI/lm-evaluation-harness.git
+      revision: 8a07e1110d060de48cfc7a9a7987b7659060b60b

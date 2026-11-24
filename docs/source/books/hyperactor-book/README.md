@@ -19,60 +19,22 @@ This is the development documentation for the hyperactor system, built using [`m
 
 ## Running the Book
 
-### On the **Server**
-
-To run the book on a remote server (e.g., `devgpu004`):
+Build or serve the book through `scripts/run`, the sole Linux-local gateway into
+the hermetic bwrap rootfs, which carries the pinned `mdbook`. Run from the repo
+root:
 
 ```bash
-x2ssh devgpu004.rva5.facebook.com
-tmux new -s mdbook
-cd ~/fbsource/fbcode/monarch/docs/source/books/hyperactor-book
-mdbook serve
-```
-Then detach with Ctrl+b, then d.
+# One-off build (output under book/)
+scripts/run mdbook build docs/source/books/hyperactor-book
 
-### On the **Client**
-
-To access the remote book from your local browser:
-```bash
-autossh -M 0 -N -L 3000:localhost:3000 devgpu004.rva5.facebook.com
+# Live-reloading server on http://localhost:3000
+scripts/run mdbook serve docs/source/books/hyperactor-book
 ```
-Then open http://localhost:3000 in your browser.
 
-**Note**: If you don’t have autossh installed, you can install it with:
-```bash
-brew install autossh
-```
+Then open http://localhost:3000 in your browser. The server auto-reloads on
+edits; stop it with Ctrl+C.
 
 ### Notes
 
 - The source is located in src/, with structure defined in SUMMARY.md.
-- The book will auto-reload in the browser on edits.
-
-## Cleaning Up
-
-To shut down the book server:
-
-### Option 1: Reattach and stop
-
-```bash
-x2ssh devgpu004.rva5.facebook.com
-tmux attach -t mdbook
-```
-Inside the session:
-- Press Ctrl+C to stop mdbook serve
-- Then type exit to close the shell and terminate the tmux session
-
-### Option 2: Kill the session directly
-
-If you don’t want to reattach, you can kill the session from a new shell:
-```bash
-x2ssh devgpu004.rva5.facebook.com
-tmux kill-session -t mdbook
-```
-
-### Optional: View active tmux sessions
-```bash
-tmux ls
-```
-Use this to check whether the mdbook session is still running.
+- The book auto-reloads in the browser on edits.

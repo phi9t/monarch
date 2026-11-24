@@ -12,6 +12,7 @@ import signal
 import time
 from typing import Any, Callable, cast, Coroutine, Iterable, Type, TYPE_CHECKING
 
+import pytest
 from monarch._rust_bindings.monarch_hyperactor.actor import (
     MethodSpecifier,
     PythonMessageKind,
@@ -28,6 +29,8 @@ from monarch._rust_bindings.monarch_hyperactor.shape import Extent
 from monarch._src.actor.host_mesh import HostMesh, this_host
 from monarch._src.actor.pickle import flatten, unflatten
 from monarch.actor import context
+
+pytestmark = pytest.mark.control_plane
 
 
 if TYPE_CHECKING:

@@ -1,0 +1,222 @@
+#+TITLE: Lesson 0005 - Writing capacity verifiers
+#+SUBTITLE: The Local Run Ladder, Contract Artifacts, and failure classification
+#+OPTIONS: toc:nil num:nil
+
+* Why this lesson
+You now know the rootfs identity, guard, isolation model, and GPU mechanics.
+This lesson turns those pieces into verifier design.
+
+The 8-GPU verifier is not just "run some tests." It is a staged acceptance
+program:
+
+- Enter a controlled rootfs domain.
+- Prove the environment shape.
+- Build with the rootfs toolchain.
+- Run a unit-level capability smoke.
+- Run integration suites.
+- Classify known suite-ordering fragility with isolation evidence.
+
+That staged shape is the Local Run Ladder. Use it when you write the next
+capacity verifier.
+
+* The verifier owns rootfs entry
+~scripts/run_local_8gpu_capacity.sh~ re-execs through the canonical gateway if
+it is not already inside a valid rootfs (~run_local_8gpu_capacity.sh:29-38~):
+
+#+begin_src bash
+if ! "$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs >/dev/null 2>&1; then
+  log "environment: rootfs entry"
+  echo "entering hermetic bwrap rootfs via scripts/run"
+  exec "$REPO_ROOT/scripts/run" /workspace/monarch/scripts/run_local_8gpu_capacity.sh "$@"
+fi
+"$REPO_ROOT/scripts/rootfs/execution_contract.sh" require-rootfs python uv cargo >/dev/null
+#+end_src
+
+Two details matter when you write similar scripts:
+
+- Re-exec through ~scripts/run~, not ad hoc ~enter_rootfs.sh~ calls.
+- Pass the in-rootfs path ~/workspace/monarch/scripts/...~, not an absolute host
+  path that does not exist inside the sandbox.
+
+The control-plane runner follows the same pattern
+(~run_local_control_plane.sh:39-46~).
+
+* Stage 1: Environment
+The capacity verifier first normalizes and validates CUDA visibility
+(~run_local_8gpu_capacity.sh:40-55~). The helper enforces exactly eight visible
+devices: unset/empty defaults to ~0,1,2,3,4,5,6,7~, and explicit values must
+name eight non-empty entries (~local_8gpu_capacity.py:16~, ~local_8gpu_capacity.py:43-52~).
+
+Then it asserts rootfs basics: ~uv~ exists, ~CUDA_HOME~ is set, and it is inside
+the hermetic rootfs (~run_local_8gpu_capacity.sh:57-63~). If ~.venv-rootfs~ is
+missing, it creates it with rootfs Python 3.12 and system site packages
+(~run_local_8gpu_capacity.sh:65-75~).
+
+The lesson: environment checks should fail before build/test work. Do not let a
+long verifier discover at minute 40 that ~CUDA_VISIBLE_DEVICES~ named only three
+devices.
+
+* Stage 2: Build
+The verifier synchronizes the test environment and installs Monarch editable
+using the rootfs-pinned tools (~run_local_8gpu_capacity.sh:76-79~):
+
+#+begin_src bash
+log "build: editable tensor-engine install"
+echo "synchronizing locked dependencies and installing monarch editable"
+"$REPO_ROOT/scripts/rootfs/sync_test_environment.sh"
+#+end_src
+
+The lesson: a verifier that depends on native code should own the build state it
+needs. It should not assume some previous shell already installed the extension
+correctly.
+
+* Stage 3: Unit-level smoke
+Before running broad integration suites, the verifier proves the single
+capability it is about: local 8-GPU tensor-engine capacity.
+
+The smoke checks:
+
+- ~has_tensor_engine()~ is true.
+- ~torch.cuda.device_count() == 8~.
+- ~this_host().spawn_procs(per_host={\"gpus\": 8})~ initializes.
+- ~fetch_shard~ returns rank shards ~[0, 1, 2, 3, 4, 5, 6, 7]~.
+- The proc mesh is stopped in cleanup.
+
+All of that is in ~run_local_8gpu_capacity.sh:80-130~.
+
+The lesson: a good capacity verifier has a small direct proof of capacity before
+it delegates to larger suites. That proof should be narrow enough that failure
+points at the capacity under test, not at a random integration failure.
+
+* Stage 4: Integration
+The verifier then runs the local control-plane suites over the eight visible
+GPUs (~run_local_8gpu_capacity.sh:133-147~). Before doing that, it records a
+nanosecond start time and removes the primary JUnit paths
+(~run_local_8gpu_capacity.sh:133-139~):
+
+#+begin_src bash
+integration_started_ns="$(date +%s%N)"
+python_junit="$REPO_ROOT/control-plane-results/control-plane-python.xml"
+rust_junit="$REPO_ROOT/target/nextest/ci/junit.xml"
+rm -f -- "$python_junit" "$rust_junit"
+#+end_src
+
+Freshness matters. If a verifier accepts a stale report from a prior run, it is
+not a verifier. The helper enforces freshness by comparing artifact mtime
+against ~not_before_ns~ (~local_8gpu_capacity.py:98-105~).
+
+The integration runner emits the two main artifacts:
+
+- Python JUnit: ~control-plane-results/control-plane-python.xml~
+  (~run_local_control_plane.sh:261-268~).
+- Rust nextest JUnit: ~target/nextest/ci/junit.xml~
+  (~run_local_control_plane.sh:271-280~, ~run_local_control_plane.sh:306-308~).
+
+* Stage 5: Failure classification
+If the control-plane suites pass, the verifier exits 0
+(~run_local_8gpu_capacity.sh:149-154~). If they fail, the verifier does not
+blindly accept or reject. It classifies.
+
+First, Rust must be green. The verifier parses the fresh nextest JUnit and only
+continues classification when ~rust_status == pass~ and the Python JUnit exists
+(~run_local_8gpu_capacity.sh:156-170~).
+
+Then it extracts failed Python pytest node IDs from the fresh Python JUnit
+(~run_local_8gpu_capacity.sh:167-180~, ~local_8gpu_capacity.py:77-95~), reruns
+each failed node in isolation, and records the results in
+~control-plane-results/control-plane-python-isolation.txt~
+(~run_local_8gpu_capacity.sh:182-197~).
+
+Acceptance rule:
+
+- Rust integration must pass.
+- Python full-run failures are acceptable only if every failed Python node
+  passes in isolation in the same rootfs.
+- If any isolation rerun fails, the verifier exits with the integration failure.
+
+The success path is explicit (~run_local_8gpu_capacity.sh:200-207~):
+
+#+begin_src bash
+echo "8-gpu tensor-engine smoke : PASS"
+echo "rust control-plane        : PASS"
+echo "python control-plane      : full-run failures passed in isolation"
+echo "isolation log            : $isolation_log"
+exit 0
+#+end_src
+
+This is not sweeping failures away. It is attaching evidence to a known class:
+Suite-Ordering Fragility. The evidence is the isolated rerun log in the same
+rootfs, against the exact failed nodes from the fresh JUnit.
+
+* What makes an artifact contractual
+An output is a Contract Artifact when acceptance depends on it. In this verifier,
+the artifacts are:
+
+- ~control-plane-results/control-plane-python.xml~
+- ~control-plane-results/control-plane-python-isolation.txt~ when classification
+  runs
+- ~target/nextest/ci/junit.xml~
+
+Build logs, caches, and incidental console output may be useful, but they are
+not the acceptance contract. A future verifier should make the same distinction:
+which files decide pass/fail, and how do you reject stale ones?
+
+* Design checklist for the next verifier
+Use this when you write a new local capacity verifier:
+
+- *Domain*: re-exec through ~scripts/run~ if outside rootfs; require the tools
+  you need via ~execution_contract.sh require-rootfs ...~.
+- *Environment*: validate the resources the verifier claims to cover before
+  build/test work.
+- *Build*: own the editable install or build step required for the capacity.
+- *Unit smoke*: prove the capacity directly with a small, specific check.
+- *Integration*: run broader suites only after the smoke passes.
+- *Artifacts*: delete stale primary reports before running; require reports to
+  be newer than the integration start time.
+- *Classification*: only classify a known fragile suite; record the failed-node
+  extraction and the identical isolation environment.
+- *Exit code*: exit 0 only when the ladder's acceptance rule passes.
+
+* Check yourself
+Answer before reading the explanation.
+
+** Q1. Why does the verifier remove JUnit files before integration?
+- a. To force fresh Contract Artifacts and avoid accepting stale reports.
+- b. To make pytest run faster.
+- c. To disable nextest output.
+
+Answer: *a*. It removes the Python and Rust JUnit paths before the integration
+run (~run_local_8gpu_capacity.sh:133-139~), then helper parsing rejects artifacts
+older than the run start (~local_8gpu_capacity.py:98-105~).
+
+** Q2. When can Python full-run failures be accepted?
+- a. Whenever Rust passed.
+- b. Only when every failed Python node from fresh JUnit passes in isolation in the same rootfs.
+- c. Whenever the failure count is below ten.
+
+Answer: *b*. The verifier extracts failed node IDs, reruns each one, and exits 0
+only if all isolation reruns pass (~run_local_8gpu_capacity.sh:167-207~).
+
+** Q3. Why run an 8-GPU tensor-engine smoke before the control-plane suites?
+- a. To prove the verifier's central capacity directly before broad integration.
+- b. To warm up pytest's cache.
+- c. To avoid building Monarch editable.
+
+Answer: *a*. The smoke checks tensor engine presence, exactly eight visible
+CUDA devices, local proc mesh spawn, and rank shard values
+(~run_local_8gpu_capacity.sh:80-130~). It gives a narrow failure surface for the
+capacity under test.
+
+* Course close
+You now have the rootfs maintenance model:
+
+- Identity: the recipe digest defines when contents changed.
+- Entry: ~scripts/run~ and the guard define valid local execution.
+- Isolation: read-only root plus controlled env prevents host drift.
+- CUDA: synthetic toolkit for builds, host driver binds for runtime.
+- Verification: the Local Run Ladder turns those constraints into acceptance.
+
+The next time you change the rootfs or write a verifier, use these five lenses
+before touching code.
+
+# Sources current as of this checkout.

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Thin compatibility adapter. Insula owns the governed local bwrap-rootfs
+# protocol; keep this shell entrypoint small so human, automation, and CI-style
+# local runs cross the same schema-backed module.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m ginkgo.insula.cli monarch-run "$@"

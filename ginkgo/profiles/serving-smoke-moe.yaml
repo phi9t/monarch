@@ -1,0 +1,19 @@
+schema_version: 1
+profile: serving-smoke-moe
+description: Launch the smallest supported Qwen3 MoE profile through SGLang when host capacity is explicitly sufficient.
+requires_gpu: true
+launches_serving_process: true
+evidence_class: sglang-moe-serving-readiness
+declared_config: repo://ginkgo/configs/smoke-qwen3-moe.yaml
+required_budget:
+  disk_gb: 80
+  gpu_count: 4
+  timeout_seconds: 1800
+required_actions:
+  - host_capability_survey
+  - rootfs_projection_check
+  - dependency_contract_verification
+  - optimized_kernel_verification
+  - model_cache_smoke_preparation
+  - materialized_command_validation
+  - sglang_launch_probe_teardown
