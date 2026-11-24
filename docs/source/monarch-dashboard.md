@@ -33,7 +33,7 @@ baggage crews. Both accept `--dashboard`.
 **Terminal 1** — start the example with the dashboard enabled:
 
 ```bash
-python python/examples/dining_philosophers.py --dashboard
+scripts/run python python/examples/dining_philosophers.py --dashboard
 ```
 
 The example prints the dashboard URL on startup:

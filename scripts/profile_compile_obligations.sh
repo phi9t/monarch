@@ -48,14 +48,17 @@
 set -euo pipefail
 
 MONARCH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Profiling drives real rustc builds, so it must run inside a controlled domain
+# before creating profile directories or invoking Cargo.
+"$MONARCH/scripts/rootfs/execution_contract.sh" require-controlled
 PROFILES_DIR="${PROFILES_DIR:-${TMPDIR:-/tmp}/monarch_compile_profiles}"
 mkdir -p "$PROFILES_DIR"
 cd "$MONARCH"
 
-# Rust builds here link against Python (PyO3); activate the venv if present.
+# Rust builds here link against Python (PyO3); activate the rootfs venv if present.
 # shellcheck disable=SC1091
-if [ -f .venv/bin/activate ]; then
-  source .venv/bin/activate 2>/dev/null || true
+if [ -f .venv-rootfs/bin/activate ]; then
+  source .venv-rootfs/bin/activate 2>/dev/null || true
 fi
 
 crate_root() { # echo the lib.rs path for a workspace crate (dir usually == name)
