@@ -10,8 +10,6 @@
 //! which provides CUDA-specific PyTorch functionality. It depends on the base
 //! torch-sys crate for core PyTorch integration.
 
-#![feature(exit_status_error)]
-
 #[cfg(target_os = "macos")]
 fn main() {
     build_utils::set_python_rpath();

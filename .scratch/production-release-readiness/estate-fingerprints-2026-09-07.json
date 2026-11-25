@@ -1,0 +1,553 @@
+{
+  "schema_version": "1.0",
+  "observed_at": "2026-09-07T22:15:15Z",
+  "scope": "local-only pre-reconstruction recovery manifest",
+  "self_exclusion": {
+    "path": ".scratch/production-release-readiness/estate-fingerprints-2026-09-07.json",
+    "reason": "hashing this file would require rewriting it; the final Git-dirty count is 52: 51 covered paths plus this self-excluded manifest"
+  },
+  "recovery_worktrees": [
+    {
+      "symbolic_reference": "worktree:root",
+      "worktree_path": "repository root",
+      "branch": "feature/unified-control-plane-substrate",
+      "head": "4046eb9e750b7711007f7b776de22039192ea27a"
+    },
+    {
+      "symbolic_reference": "worktree:active-work-tracker",
+      "worktree_path": ".worktrees/active-work-tracker",
+      "branch": "codex/active-work-tracker",
+      "head": "2d9a3e102853f3bb2e465e46bd6b0aff1f9d33cf"
+    },
+    {
+      "symbolic_reference": "worktree:glm52-gpu-workload",
+      "worktree_path": ".worktrees/glm52-gpu-workload",
+      "branch": "glm52-gpu-workload",
+      "head": "46acdaf44333db54541cb6be6244628cfff0fd4a"
+    }
+  ],
+  "dirty_path_count": 51,
+  "dirty_paths": [
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": ".kata.toml",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "c7bc63345de0032a2d874fc331e58049e547ba97d26837d6109f7eaa4bd0f4b5",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": ".scratch/active-work-tracker/issues/01-kata-rollout.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "d4388263e7f21b486b7ef59f7052b07f6c5b258593197abc29155a6e786800e0",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "AGENTS.md",
+      "state": "modified",
+      "content_state": "present",
+      "content_sha256": "2c880b1dc40b7df5618662f8cdd41e84fc8f7476118ec80ccfb4b4c8ba37efc1",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "docs/agents/active-work.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "2aa6ea45b48ae081b2fd5027a021f8964305399a9fc9374e4a2bc8d799eb87ec",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "docs/agents/agentic-engineering.md",
+      "state": "modified",
+      "content_state": "present",
+      "content_sha256": "581c388925e506dbd1674c97cd44bb1a8a26161ccbdfbb36ab8ed9cf8c6c5637",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "docs/agents/agentic-workflow-repos.json",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "82300bc524be8ea8cfbfd0e922e0738931f14ddd164af7b8f53da265ff3f166e",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "docs/agents/issue-tracker.md",
+      "state": "modified",
+      "content_state": "present",
+      "content_sha256": "8c6590454228a0973f1f65a63d2ff446f0db2ecc526d779b880ad6aaa963b07a",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "docs/agents/skill-orchestration.md",
+      "state": "modified",
+      "content_state": "present",
+      "content_sha256": "801861c3bc6947cf0c67fd2c52dc43ec7c1f7bebf2b3b75233e2f3420e4ee8d0",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:active-work-tracker",
+      "path": "tools/active_work.py",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "6847cdc69972b1fd93b80c0e2e81ad720046889cc3e756a795e5067d4b36da61",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": ".scratch/glm52-live-8gpu-full-run/issues/01-clean-8gpu-preflight.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "da2b2b1d37990c02e2fdeef3fd31c5940be54c8acd2cc124fb5fad2772d38596",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": ".scratch/glm52-live-8gpu-full-run/issues/02-parent-repeatability-live-run.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "38a579d694ca54e9b23178166c95c8495cfb4da82eda945390e04042e378b392",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": ".scratch/glm52-live-8gpu-full-run/issues/03-blocker-triage-and-one-variable-retry.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "bb8c816ee39f32940e9874fef5729b2439fda5ffbe9537830c4fdb3c6466b965",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": ".scratch/glm52-live-8gpu-full-run/issues/04-parent-manifest-audit.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "230f8bb1e182eb054da8cc105aecaa3de5f6ebd3a21eb37fe6345ebd7885f259",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": ".scratch/glm52-live-8gpu-full-run/issues/05-benchmark-gate-smoke.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "7807872ca0314cde50aa2e24c87f972a4253481dc8811274d64a5c950011f5f3",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": ".scratch/glm52-live-8gpu-full-run/spec.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "d0c82ffc48eae9e4de86181141db17a5d8c11ff98479423d876fbea5a351bf1a",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/__pycache__/__init__.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "37c46651616eb06b3ad82e4b16164f55a7bbe55adcefae2a89a6ba15e0a32fcb",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/__pycache__/__init__.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "258c40a0755b2208ba788998c48d3b59df416354fe62a1f4b0df83ae53f62b4b",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/__pycache__/local_run.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "c7a87769dbf3926c4288c0e8ce35b751b819c0793c5ef7d9006cb05cf26d5492",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/__init__.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "4089db7a634c174568d9dd79488f146ab6aeb686150c2e11628438e9805c3fc2",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/__init__.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "62b726493ac0a0ff9726ddea6367870e355c46474249602e1e267aea62fa99f7",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/artifacts.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "b7d3765e7dee64c203277e23e272ad609480e751e1082c2a956ebabfe4c799f3",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/artifacts.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "b4a5bae96304bcd7347f8913907160861527ae1f4260b7715bcd062c22006349",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/bwrap_plan.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "4854f45efa5c5989ccc260f16f2d932339b0e9295eb96766c483c943101c653c",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/bwrap_plan.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "80f316c1de919fa6430b689057ef788cf42f0e5a66f1d33a8576dd470d39a134",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/cli.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "b4645c1e0c7f650ab435af9d9d076be31cbfa4684ccab38dda15834308707448",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/cli.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "ad11e169a6005c4576bcf75551b3891b2a11727c6d00aa4b897530d5160491ad",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/compatibility.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "1d40a171c96408730c4f0043a4c2496c55a9a614cba9622e7fddb2dfde6a2a8e",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/compatibility.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "8777f48491b240ea7d6cfdced397d83d58ba9f36d764c1828defe5b90e3e4eb0",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/executor.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "a32f704e944d9980814d9ea8046e1002a4e791dac39a1874bfa50f1ab2683b49",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/executor.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "3594fe477d23701a8efd2e7be52e15cf8863dd444195ef93cf9f4bd457493a79",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/local_environment.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "b8376bb536460560960fc52eeef6edccf8d1563f28471336f3dcf366cfd033af",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/local_environment.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "3a2e4ac1ebd6f860aea894befdfb02005578aeec57edad40f7733e4aba2a4b52",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/materialize.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "d13586e8601a2714e15de71b406caf6a9c9fbb5394bc72a668bf0c56f73f7d3b",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/materialize.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "437968e1122986c7ec0fdee94e799dd8a6a8867326ca2658058d1200b25c91af",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/refs.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "68460c8e1be81d72989db94bde4787c69500e2e1f7db679cf52a2164ccb3edb7",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/refs.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "d5b85175e4535f60fbf3d4253de405d7aca6e1cdbbdb0588e38aadd1a95b7da1",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/rootfs_lifecycle.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "2ceefa68fe5a06e7a6d2bafa609db2abd7414fa532b7fd60d3f987da4df48435",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/schema.cpython-311.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "3cecb6f3ea9d417d7c4f3c9c0eacc7a82513a7a989c049afefbbb1229735b45d",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/insula/__pycache__/schema.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "04664a1b33c9d42bd680ba0df87e548570e819cb336a5842951c6418ad53d1d8",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/local-env/glm52-live-8gpu.yaml",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "14f2891c2a0e6c989eb96aecc37194c8d447bc9e0a5df2ae73574d8e50183c81",
+      "disposition": "retain-local"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:glm52-gpu-workload",
+      "path": "ginkgo/scripts/__pycache__/run_qwen3_sglang_smoke.cpython-312.pyc",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "58134eff85a507265f5c3f011f68f17e9014999c7e2de869feb524118c21b3a4",
+      "disposition": "reject"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/estate-ledger.json",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "84ed5b257f04494721c2e84916b197cf590987d8ee8501c30667dc5710807f09",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/01-inventory-and-disposition.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "61627089c581395e314208bfcdaa6cad5f3ea4de9f690f053425cb0d47e2b228",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/02-prove-native-rootfs-adaptation.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "ba12c073ff6457c816825f9863ef2ecc1f8fb3143162d1c9e727c10eb1f615c7",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/03-run-native-rootfs-suites.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "d0c074191eaf7e2f945d1082c8aab45f9c469f01bc36b9008f60b3e9b679f4aa",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/04-qualify-b200-control-plane.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "92e98fa40f1748ac942ed8cfd691cea3db2677edba980d572e1145a7341554f7",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/05-sanitize-publication-history.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "fabf277e42b49ff2a1450f99b2b4cc11b29951f057aeb1e763029983c04f879d",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/06-assemble-local-mainline-candidate.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "88a5c362d2ce0d77b96437696f5c22ba2d127c31a84337e5c84ea9474d09632b",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/issues/07-freeze-b200-qualification-contract.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "668ef5ad3e76e94abe0ae4e64e8abcac9ae69b95201e705b9837ffbe4b121956",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/research/local-estate-and-provenance-2026-09-07.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "d67157ead87494d6c5185bcca16c7d99de1c7d637dc8155513851a954a9c44b1",
+      "disposition": "integrate"
+    },
+    {
+      "symbolic_recovery_reference": "worktree:root",
+      "path": ".scratch/production-release-readiness/spec.md",
+      "state": "untracked",
+      "content_state": "present",
+      "content_sha256": "5f4feb15261daaa7c096ac000fd5ae77f817fce2276548a0f3102aa30dddf8cd",
+      "disposition": "integrate"
+    }
+  ],
+  "generated_evidence_classes": [
+    {
+      "path": "control-plane-results",
+      "class": "small contract receipt directory",
+      "content_state": "present",
+      "file_count": 2,
+      "size_bytes": 101113,
+      "fingerprint_kind": "content",
+      "fingerprint_sha256": "a4fcbe44b1dfcd085f54918e08f7d5aa05d0ca272de8d3918fef22d69a92498b",
+      "disposition": "reject"
+    },
+    {
+      "path": "substrate-results",
+      "class": "small tracer and placement receipt directory",
+      "content_state": "present",
+      "file_count": 4,
+      "size_bytes": 4583,
+      "fingerprint_kind": "content",
+      "fingerprint_sha256": "e6816a03050baed88c8aced1f37b8cae96550324217368d3e1960aaab56978b6",
+      "disposition": "reject"
+    },
+    {
+      "path": "glm52-serving-results",
+      "class": "large serving evidence directory",
+      "content_state": "present",
+      "file_count": 64697,
+      "size_bytes": 5508623030,
+      "fingerprint_kind": "metadata",
+      "fingerprint_sha256": "e44a93fab376dfd2fb096b4d1e149e78b3949fe64362a0b4e955759aed4f31eb",
+      "disposition": "retain-local"
+    },
+    {
+      "path": "glm52-benchmark-results",
+      "class": "large benchmark evidence directory",
+      "content_state": "present",
+      "file_count": 771,
+      "size_bytes": 1620253,
+      "fingerprint_kind": "metadata",
+      "fingerprint_sha256": "9752169e44f59f5a260479b855b12530edf15aa042bdd2e1fd4d5be68565a930",
+      "disposition": "retain-local"
+    },
+    {
+      "path": ".scratch",
+      "class": "remaining local scratch estate",
+      "content_state": "present",
+      "file_count": 493425,
+      "size_bytes": 76430228610,
+      "fingerprint_kind": "metadata",
+      "fingerprint_sha256": "1d05e612cac29678df58111481bf026581f596bc7f0fa1c248da6cfa5b1a929c",
+      "disposition": "retain-local"
+    },
+    {
+      "path": "scripts/rootfs/rootfs",
+      "class": "Hermetic Rootfs filesystem",
+      "content_state": "present",
+      "file_count": 60666,
+      "size_bytes": 10561875714,
+      "fingerprint_kind": "metadata",
+      "fingerprint_sha256": "f0eca6adaa6daa486f9e07799d1eabfbbbc4cc48697e4fd982d88d1807e0be74",
+      "disposition": "reject"
+    },
+    {
+      "path": ".venv",
+      "class": "local Python environment",
+      "content_state": "present",
+      "file_count": 20121,
+      "size_bytes": 5035857461,
+      "fingerprint_kind": "metadata",
+      "fingerprint_sha256": "10863260924044289db052759c217a36259b6f7361a729d09830a8c1bcb2b37a",
+      "disposition": "reject"
+    },
+    {
+      "path": ".venv-rootfs",
+      "class": "Hermetic Rootfs Python environment",
+      "content_state": "present",
+      "file_count": 23934,
+      "size_bytes": 5065346734,
+      "fingerprint_kind": "metadata",
+      "fingerprint_sha256": "c3a43f7a80cdd5d81a7fb876047d0bbc79a3ad86a7ef374263070fa4e126b767",
+      "disposition": "reject"
+    },
+    {
+      "path": "target",
+      "class": "compiled build output",
+      "content_state": "present",
+      "file_count": 3,
+      "size_bytes": 228789,
+      "fingerprint_kind": "content",
+      "fingerprint_sha256": "bbd468cb0a84877b1fbce747b80d91501e19c07c004dc860c2998257a75d8cf8",
+      "disposition": "reject"
+    },
+    {
+      "path_class": "future build/, dist/, wheels, archives, and images",
+      "class": "future publication output",
+      "content_state": "not-observed",
+      "file_count": 0,
+      "size_bytes": 0,
+      "fingerprint_kind": "none",
+      "fingerprint_sha256": null,
+      "disposition": "reject"
+    }
+  ],
+  "fingerprint_algorithms": {
+    "host_walker": "host-side read-only Python; Path.rglob('*') entries satisfying is_file(); class-relative POSIX paths sorted by Python string order",
+    "content": "SHA-256 of NUL-joined content records with exactly one final NUL for a non-empty stream: <file SHA-256><two spaces><relative path>",
+    "metadata": "SHA-256 of NUL-joined metadata records with exactly one final NUL for a non-empty stream: f<tab><decimal size><tab><relative path>; records are not retained",
+    "scratch_exclusion": "only production-release-readiness/estate-fingerprints-2026-09-07.json"
+  },
+  "limitations": [
+    "Metadata fingerprints detect changes to the recorded file set, sizes, or paths but do not prove file content.",
+    "Content fingerprints prove only the bytes present at the observation time and do not provide a backup.",
+    "The manifest is local-only and is not publication evidence or deletion authority."
+  ]
+}

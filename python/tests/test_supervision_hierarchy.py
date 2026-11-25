@@ -12,9 +12,12 @@ from threading import Event
 from typing import Callable, Optional, TypeVar
 
 import monarch.actor
+import pytest
 from isolate_in_subprocess import isolate_in_subprocess
 from monarch._rust_bindings.monarch_hyperactor.supervision import MeshFailure
 from monarch.actor import Actor, endpoint, this_host
+
+pytestmark = pytest.mark.control_plane
 
 
 T = TypeVar("T")

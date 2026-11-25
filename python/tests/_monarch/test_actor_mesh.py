@@ -35,6 +35,8 @@ from monarch._rust_bindings.monarch_hyperactor.proc_mesh import ProcMesh
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask, Shared
 from monarch._src.actor.actor_mesh import Context, context, Instance
 
+pytestmark = pytest.mark.control_plane
+
 
 def _to_frozen_buffer(data: bytes) -> FrozenBuffer:
     """Helper to convert bytes to FrozenBuffer."""

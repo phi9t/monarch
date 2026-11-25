@@ -1,0 +1,72 @@
+schema_version: 1
+run_group: ginkgo-smoke-qwen3-moe
+fail_fast: true
+allow_fallback: false
+port_policy:
+  mode: strict_run_owned_range
+  bind_host: 127.0.0.1
+  range_start: 19000
+  range_end: 19100
+  disallowed_ports: [8000, 8080, 18080]
+model:
+  id: Qwen/Qwen3-30B-A3B
+  path: Qwen/Qwen3-30B-A3B
+  served_model_name: Qwen/Qwen3-30B-A3B
+  expected_model_ids: [Qwen/Qwen3-30B-A3B]
+runtime:
+  kind: sglang_openai
+  device: cuda
+  cuda_visible_devices: "0"
+  tensor_parallel_size: 1
+  dtype: bfloat16
+  context_length: 32768
+  kv_cache_dtype: bfloat16
+  mem_fraction_static: 0.88
+  max_total_tokens: 4096
+  max_running_requests: 1
+  cpu_offload_gb: 0
+  extra_args:
+    - --log-requests
+    - --log-requests-level
+    - "1"
+    - --show-time-cost
+    - --enable-request-time-stats-logging
+    - --skip-server-warmup
+    - --moe-runner-backend
+    - triton
+sandbox:
+  kind: bwrap_rootfs
+  rootfs_ref: rootfs://monarch-default
+  cwd: /workspace/monarch
+  network: host_loopback_required
+  gpu: required
+  sglang:
+    venv_path: /cache/glm52/venvs/sglang
+    hf_home: /cache/glm52/hf-home
+    cache: /cache/glm52/sglang
+    telemetry_root: /run/glm52/telemetry
+observability:
+  debug_mode: false
+  leave_running_on_failure: false
+  log_level: info
+  crash_dump_folder: /run/glm52/crash-dumps
+  telemetry:
+    local_artifacts: true
+    remote_export: false
+local_paths:
+  results_root: repo://glm52-serving-results
+  scratch_root: repo://.scratch/glm52-local-serving
+  cache_root: cache://ginkgo
+  temp_root: temp://ginkgo
+probes:
+  startup_timeout_seconds: 900
+  chat_timeout_seconds: 300
+  models_required: true
+  chat_required: true
+  prompt: "Say OK."
+  max_new_tokens: 2
+  throughput_max_new_tokens: 16
+  chat_template_kwargs:
+    enable_thinking: false
+repeatability:
+  cycles: 1

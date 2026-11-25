@@ -1,0 +1,7 @@
+schema_version: 1
+roots:
+  repo: <absolute-path-to-monarch-checkout>
+  cache: <absolute-path-to-external-glm52-cache>
+  temp: <absolute-path-to-external-glm52-temp>
+rootfs:
+  monarch-default: <absolute-path-to-external-bwrap-rootfs>

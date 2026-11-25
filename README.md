@@ -86,7 +86,7 @@ brew install uv
   (e.g., `pytorch-cu130`, or `pytorch-cpu`)
 - Or use `--extra-index-url` when running uv:
   ```sh
-  uv sync --extra-index-url https://download.pytorch.org/whl/cu130
+  scripts/run uv sync --extra-index-url https://download.pytorch.org/whl/cu130
   ```
 
 #### Understanding Tensor Engine
@@ -104,7 +104,7 @@ version of Monarch (actors only, no torch dependency), set
 By default, Monarch builds with tensor_engine enabled. To build without it:
 
 ```sh
-USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
 ```
 
 **Note**: Building without tensor_engine means you won't have access to the
@@ -124,13 +124,50 @@ explicit opt-out when you want the CPU tensor engine on a GPU-capable host.
 
 ```sh
 # Force a CPU-only tensor engine (no CUDA/ROCm/RDMA libraries required)
-MONARCH_GPU_PLATFORM=none uv sync
+scripts/run env MONARCH_GPU_PLATFORM=none uv sync
 
 # Force CUDA on a host that also has ROCm
-MONARCH_GPU_PLATFORM=cuda uv sync
+scripts/run env MONARCH_GPU_PLATFORM=cuda uv sync
 ```
 
 #### Build Dependencies by Platform
+
+##### On Linux (canonical: the hermetic bwrap rootfs)
+
+On Linux, the canonical source build runs inside a hermetic bubblewrap (bwrap)
+rootfs through `scripts/run`, the sole gateway for Linux-local development, build,
+test, and docs commands. The rootfs carries a validated PyTorch-CUDA baseline
+(Ubuntu glibc 2.39, system gcc/clang, Python 3.12, torch 2.13.0+cu132) and pinned
+Rust, so no host toolchain provisioning is required; `scripts/run` re-execs into
+the sandbox, activates its virtual environment, and preserves your command's
+arguments and exit status. `enter_rootfs.sh` auto-builds the rootfs on first use.
+
+```sh
+# Clone
+git clone https://github.com/meta-pytorch/monarch.git
+cd monarch
+
+# Install in development mode with all dependencies (auto-builds the rootfs)
+scripts/run uv sync
+
+# Or install without tensor_engine (CPU-only)
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
+
+# Verify installation
+scripts/run uv run python -c "from monarch import actor; print('Monarch installed successfully')"
+
+# Rebuild (e.g., after changing Rust code)
+scripts/run uv pip install -e .
+```
+
+Building `bwrap`, `docker`, and the NVIDIA driver userspace on the host is the
+only Linux-local work outside this gateway; it is host bootstrap. See
+`.agents/skills/run-monarch-single-machine/` for the full rootfs workflow.
+
+The per-distribution blocks below provision a host toolchain directly. They are
+kept for reference and for hosts that cannot run bwrap, but on Linux the rootfs
+path above is authoritative; run the `uv`, `cargo`, and `pytest` steps through
+`scripts/run` regardless of how the host toolchain was installed.
 
 ##### On Fedora distributions
 
@@ -157,16 +194,16 @@ git clone https://github.com/meta-pytorch/monarch.git
 cd monarch
 
 # Install in development mode with all dependencies
-uv sync
+scripts/run uv sync
 
 # Or install without tensor_engine
-USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
 
 # Verify installation
-uv run python -c "from monarch import actor; print('Monarch installed successfully')"
+scripts/run uv run python -c "from monarch import actor; print('Monarch installed successfully')"
 
 # Rebuild (e.g., after changing Rust code)
-USE_TENSOR_ENGINE=0 uv pip install -e .
+scripts/run env USE_TENSOR_ENGINE=0 uv pip install -e .
 ```
 
 ##### On Ubuntu distributions
@@ -196,63 +233,63 @@ git clone https://github.com/meta-pytorch/monarch.git
 cd monarch
 
 # Install in development mode with all dependencies
-uv sync
+scripts/run uv sync
 
 # Or install without tensor_engine (CPU-only)
-USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
 
 # Verify installation
-uv run python -c "from monarch import actor; print('Monarch installed successfully')"
+scripts/run uv run python -c "from monarch import actor; print('Monarch installed successfully')"
 
 # Rebuild (e.g., after changing Rust code)
-USE_TENSOR_ENGINE=0 uv pip install -e .
+scripts/run env USE_TENSOR_ENGINE=0 uv pip install -e .
 ```
 
 ##### On non-CUDA machines
 
-You can also build Monarch on non-CUDA machines (e.g., macOS laptops) for
-CPU-only usage. The tensor engine itself works on CPU; only the GPU-specific
-bits (NCCL, RDMA, rdmaxcel) are skipped. Auto-detection handles hosts with no
-CUDA or ROCm installed. If your host does have a GPU toolchain installed but
-you want the CPU tensor engine anyway, set `MONARCH_GPU_PLATFORM=none`.
+You can also build Monarch for CPU-only usage. The tensor engine itself works on
+CPU; only the GPU-specific bits (NCCL, RDMA, rdmaxcel) are skipped.
+Auto-detection handles hosts with no CUDA or ROCm installed. If your host does
+have a GPU toolchain installed but you want the CPU tensor engine anyway, set
+`MONARCH_GPU_PLATFORM=none`.
+
+On Linux, use the canonical `scripts/run` gateway; it auto-detects the absence of
+a GPU and builds the CPU tensor engine:
 
 ```sh
-# Install nightly rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup toolchain install nightly
-rustup default nightly
-
-# Clone and sync dependencies
+# Clone and build the CPU tensor engine (auto-detects no GPU)
 git clone https://github.com/meta-pytorch/monarch.git
 cd monarch
-
-# Build the CPU tensor engine (auto-detects no GPU)
-uv sync
+scripts/run uv sync
 
 # Or, to skip the tensor engine entirely (actors only, no torch required)
-USE_TENSOR_ENGINE=0 uv sync
+scripts/run env USE_TENSOR_ENGINE=0 uv sync
 
 # Verify installation
-uv run python -c "from monarch import actor; print('Monarch installed successfully')"
+scripts/run uv run python -c "from monarch import actor; print('Monarch installed successfully')"
 ```
+
+**macOS** is a separate execution domain and does not use the bwrap gateway
+(bwrap is Linux-only). On a macOS laptop, install the nightly Rust toolchain and
+`uv`, then run `uv sync` (or `USE_TENSOR_ENGINE=0 uv sync`) directly in the
+checkout; the tensor engine builds on CPU with no GPU-specific pieces.
 
 #### Alternative: Using pip
 
-If you prefer to use pip instead of uv:
+If you prefer pip instead of uv on Linux, still route the build through the
+`scripts/run` gateway so it runs inside the rootfs:
 
 ```sh
 # After installing system dependencies (see above)
 
-# Install build dependencies
-
 # Build and install Monarch
-pip install .
+scripts/run pip install .
 
 # Or for development
-pip install -e .
+scripts/run pip install -e .
 
 # Without tensor_engine
-USE_TENSOR_ENGINE=0 pip install -e .
+scripts/run env USE_TENSOR_ENGINE=0 pip install -e .
 ```
 
 ### Building a Docker Image from Source
@@ -264,11 +301,11 @@ code.
 
 ```bash
 # Make sure to build for python 3.12 since the pytorch base image uses that python version
-uv python pin 3.12
+scripts/run uv python pin 3.12
 # Build the binary distribution, outputs to "dist/" directory.
 # --no-build-isolation allows using cached rust builds which speeds up subsequent
 # iterations.
-uv build --no-build-isolation --wheel
+scripts/run uv build --no-build-isolation --wheel
 
 # With docker:
 # Build and tag a docker image with your build of monarch. You can update the
@@ -317,25 +354,16 @@ and Python tests are run with `pytest`.
 ### Rust tests
 
 **Important:** Monarch's Rust code uses PyO3 to interface with Python, which
-means the Rust binaries need to link against Python libraries. Before running
-Rust tests, you need to have a Python environment activated (conda, venv, or
-uv):
+means the Rust binaries need to link against Python libraries. The `scripts/run`
+gateway activates the rootfs Python environment before running the tests:
 
 ```sh
-# If using uv (recommended)
-uv sync  # This creates and activates a virtual environment
-uv run cargo nextest run  # Run tests within the uv environment
-
-# Or if using conda
-conda activate monarchenv
-cargo nextest run
-
-# Or if using venv
-source .venv/bin/activate
-cargo nextest run
+scripts/run uv sync            # build the extension inside the rootfs
+scripts/run uv run cargo nextest run
 ```
 
-Without an active Python environment, you'll get Python linking errors like:
+Without an active Python environment, a bare-host `cargo` run gives Python
+linking errors like:
 
 ```
 error: could not find native static library `python3.12`, perhaps an -L flag is missing?
@@ -348,7 +376,7 @@ error: could not find native static library `python3.12`, perhaps an -L flag is 
 # between every test.
 # Here we install it from source, but you can instead use a pre-built binary described
 # here: https://nexte.st/docs/installation/pre-built-binaries/
-cargo install cargo-nextest --locked
+scripts/run cargo install cargo-nextest --locked
 ```
 
 cargo-nextest supports all of the filtering flags of "cargo test".
@@ -357,14 +385,10 @@ cargo-nextest supports all of the filtering flags of "cargo test".
 
 ```sh
 # Install test dependencies (if not already installed via uv sync)
-uv sync --extra test
+scripts/run uv sync --extra test
 
-# Run unit tests with uv
-uv run pytest python/tests/ -v -m "not oss_skip"
-
-# Or if using pip
-pip install -e '.[test]'
-pytest python/tests/ -v -m "not oss_skip"
+# Run unit tests
+scripts/run uv run pytest python/tests/ -v -m "not oss_skip"
 ```
 
 ## Disabling flaky CI tests
@@ -410,8 +434,8 @@ For example, to run all tests locally regardless of open issues:
 ```sh
 echo -n "" > disabled_tests.txt
 echo "all()" > .config/nextest-filter.txt
-uv run python scripts/fetch_disabled_tests.py   # will skip both writes
-uv run pytest python/tests/ -v -m "not oss_skip"
+scripts/run uv run python scripts/fetch_disabled_tests.py   # will skip both writes
+scripts/run uv run pytest python/tests/ -v -m "not oss_skip"
 ```
 
 ## License

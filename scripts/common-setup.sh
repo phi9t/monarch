@@ -9,6 +9,11 @@
 
 set -ex
 
+# This CI setup runs its real work only on GitHub Linux runners. Refuse
+# elsewhere before installing conda, toolchains, or dependencies.
+_common_setup_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+"$_common_setup_repo_root/scripts/rootfs/execution_contract.sh" require-github-linux
+
 # Ensure conda is available. Checks common locations first, then
 # installs Miniconda if conda is not found anywhere.
 initialize_conda() {

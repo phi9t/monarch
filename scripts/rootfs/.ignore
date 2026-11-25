@@ -1,0 +1,4 @@
+# Generated rootfs exports and managed caches are not source. Keep source
+# inventories bounded when scripts/rootfs is used as the ripgrep search root.
+rootfs/**
+cache/**
